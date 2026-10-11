@@ -15,7 +15,6 @@ __pycache__
 
 .ipynb_checkpoints
 *.ipynb
-*.sh
 *.err
 *.png
 *.csv

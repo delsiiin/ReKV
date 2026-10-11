@@ -1,6 +1,5 @@
 import warnings
 import random
-import json
 import os
 import math
 import argparse
@@ -18,6 +17,7 @@ import logzero
 from logzero import logger
 
 from model import llava_onevision_rekv, video_llava_rekv, longva_rekv
+from video_qa.sampling import load_samples, nonnegative_int, split_samples
 
 
 MODELS = {
@@ -80,9 +80,7 @@ class BaseVQA:
         self.record = {(self.retrieve_size, self.chunk_size): []}
 
     def split_list(self, lst, n):
-        """Split a list into n (roughly) equal-sized chunks"""
-        chunk_size = math.ceil(len(lst) / n)  # integer division
-        return [lst[i : i + chunk_size] for i in range(0, len(lst), chunk_size)]
+        return split_samples(lst, n)
 
     def get_chunk(self, lst, n, k):
         chunks = self.split_list(lst, n)
@@ -182,6 +180,8 @@ def work(QA_CLASS):
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample_fps", type=float, default=1)
     parser.add_argument("--num_chunks", type=int, default=1)
+    parser.add_argument("--max_samples", type=nonnegative_int, default=0,
+                        help="Maximum video samples before chunking; 0 uses the full dataset.")
     parser.add_argument("--chunk_idx", type=int, default=0)
     parser.add_argument("--save_dir", type=str, required=True)
     parser.add_argument("--anno_path", type=str, required=True)
@@ -202,6 +202,13 @@ def work(QA_CLASS):
     random.seed(2024)
     logger.info('seed: 2024')
 
+    # Select globally before chunking, and validate before loading the model.
+    anno = load_samples(args.anno_path, args.max_samples)
+    if not 1 <= args.num_chunks <= len(anno):
+        parser.error("num_chunks must be between 1 and the number of selected samples")
+    if not 0 <= args.chunk_idx < args.num_chunks:
+        parser.error("chunk_idx must be between 0 and num_chunks - 1")
+
     # VideoQA model
     model_path = MODELS[args.model]['model_path']
     load_func = MODELS[args.model]['load_func']
@@ -212,9 +219,6 @@ def work(QA_CLASS):
         topk=args.retrieve_size,
         chunk_size=args.retrieve_chunk_size,
     )
-
-    # Load ground truth file
-    anno = json.load(open(args.anno_path))
 
     retrieve_analyzer = QA_CLASS(
         anno=anno,

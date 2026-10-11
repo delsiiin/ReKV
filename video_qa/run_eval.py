@@ -3,6 +3,8 @@ import argparse
 import subprocess
 import multiprocessing
 
+from video_qa.sampling import load_samples, nonnegative_int
+
 
 def exec(cmd, sub=False, device=None):
     print(f'exec: {cmd}')
@@ -16,9 +18,26 @@ def exec(cmd, sub=False, device=None):
         subprocess.run(cmd, env=my_env)
 
 
+def get_eval_settings(args, dataset, anno_path):
+    save_dir = f"results/{args.model}/{dataset}/{args.retrieve_size}-{args.sample_fps}"
+    if args.max_samples:
+        save_dir += f"/samples_{args.max_samples}"
+    # Scoring existing results must not require the source annotations.
+    if args.only_eval:
+        return args.num_chunks, save_dir
+    if args.num_chunks < 1:
+        raise ValueError("num_chunks must be positive")
+    samples = load_samples(anno_path, args.max_samples)
+    if not samples:
+        raise ValueError(f"No samples found in {anno_path}")
+    num_chunks = min(args.num_chunks, len(samples))
+    print(f"Selected {len(samples)} video samples across {num_chunks} chunks")
+    return num_chunks, save_dir
+
+
 def eval_mlvu(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/mlvu/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/mlvu/dev_debug_mc.json"
+    num_chunks, save_dir = get_eval_settings(args, "mlvu", anno_path)
     solver = "rekv_offline_vqa"
     if not args.only_eval:
         # QA
@@ -30,8 +49,9 @@ def eval_mlvu(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/mlvu/dev_debug_mc.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -50,8 +70,8 @@ def eval_mlvu(args):
     exec(f"python video_qa/eval/eval_multiple_choice.py --save_dir {save_dir}")
 
 def eval_qaego4d(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/qaego4d/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/qaego4d/test_mc.json"
+    num_chunks, save_dir = get_eval_settings(args, "qaego4d", anno_path)
     solver = "rekv_offline_vqa"
     if not args.only_eval:
         # QA
@@ -63,8 +83,9 @@ def eval_qaego4d(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/qaego4d/test_mc.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -83,8 +104,8 @@ def eval_qaego4d(args):
     exec(f"python video_qa/eval/eval_multiple_choice.py --save_dir {save_dir}")
 
 def eval_egoschema(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/egoschema/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/egoschema/full.json"
+    num_chunks, save_dir = get_eval_settings(args, "egoschema", anno_path)
     solver = "rekv_offline_vqa"
     if not args.only_eval:
         # QA
@@ -96,8 +117,9 @@ def eval_egoschema(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/egoschema/full.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -116,8 +138,8 @@ def eval_egoschema(args):
     exec(f"python video_qa/eval/eval_egoschema.py --save_dir {save_dir}")
 
 def eval_activitynet_qa(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/activitynet_qa/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/activitynet_qa/test.json"
+    num_chunks, save_dir = get_eval_settings(args, "activitynet_qa", anno_path)
     solver = "rekv_offline_vqa"
     if not args.only_eval:
         # QA
@@ -129,8 +151,9 @@ def eval_activitynet_qa(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/activitynet_qa/test.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -150,8 +173,8 @@ def eval_activitynet_qa(args):
     exec(f"python video_qa/eval/eval_open_ended.py --pred_path {save_dir}/results.csv --output_dir {save_dir}/tmp --output_json {save_dir}/results.json")
 
 def eval_rvs_ego(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/rvs_ego/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/rvs/ego/ego4d_oe.json"
+    num_chunks, save_dir = get_eval_settings(args, "rvs_ego", anno_path)
     solver = "rekv_stream_vqa"
     if not args.only_eval:
         # QA
@@ -163,8 +186,9 @@ def eval_rvs_ego(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/rvs/ego/ego4d_oe.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -184,8 +208,8 @@ def eval_rvs_ego(args):
     exec(f"python video_qa/eval/eval_open_ended.py --pred_path {save_dir}/results.csv --output_dir {save_dir}/tmp --output_json {save_dir}/results.json")
 
 def eval_rvs_movie(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/rvs_movie/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/rvs/movie/movienet_oe.json"
+    num_chunks, save_dir = get_eval_settings(args, "rvs_movie", anno_path)
     solver = "rekv_stream_vqa"
     if not args.only_eval:
         # QA
@@ -197,8 +221,9 @@ def eval_rvs_movie(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/rvs/movie/movienet_oe.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -218,8 +243,8 @@ def eval_rvs_movie(args):
     exec(f"python video_qa/eval/eval_open_ended.py --pred_path {save_dir}/results.csv --output_dir {save_dir}/tmp --output_json {save_dir}/results.json")
 
 def eval_cgbench(args):
-    num_chunks = args.num_chunks
-    save_dir = f"results/{args.model}/cgbench/{args.retrieve_size}-{args.sample_fps}"
+    anno_path = "data/cgbench/full_mc.json"
+    num_chunks, save_dir = get_eval_settings(args, "cgbench", anno_path)
     solver = "rekv_offline_vqa"
     if not args.only_eval:
         # QA
@@ -231,8 +256,9 @@ def eval_cgbench(args):
                     "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
-                    "--anno_path", "data/cgbench/full_mc.json",
+                    "--anno_path", anno_path,
                     "--debug", args.debug,
+                    "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
             p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
@@ -256,6 +282,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="llava_ov_7b", choices=['llava_ov_0.5b', 'llava_ov_7b', 'llava_ov_72b', 'video_llava_7b', 'longva_7b'])
     parser.add_argument("--dataset", type=str, default=None, choices=['mlvu', 'qaego4d', 'egoschema', 'activitynet_qa', 'rvs_ego', 'rvs_movie', 'cgbench'])
     parser.add_argument("--num_chunks", type=int, default=1)
+    parser.add_argument("--max_samples", type=nonnegative_int, default=0,
+                        help="Maximum video samples across all chunks; 0 uses the full dataset.")
     parser.add_argument("--only_eval", action="store_true")
     parser.add_argument("--sample_fps", type=float, default=1)
     parser.add_argument("--n_local", type=int, default=15000)
