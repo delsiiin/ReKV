@@ -30,7 +30,7 @@ class Abstract_ReKV:
         pass
 
     def _encode_video_chunk(self, video_chunk):
-        pixel_values_videos = self.processor.video_processor(video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
+        pixel_values_videos = self.processor.video_processor(videos=video_chunk, do_sample_frames=False, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*196, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
 

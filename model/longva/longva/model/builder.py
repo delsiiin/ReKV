@@ -28,12 +28,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     kwargs["device_map"] = device_map
 
     if load_8bit:
-        kwargs["load_in_8bit"] = True
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
     elif load_4bit:
-        kwargs["load_in_4bit"] = True
         kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
     else:
-        kwargs["torch_dtype"] = torch.float16
+        kwargs["dtype"] = torch.float16
 
     if customized_config is not None:
         kwargs["config"] = customized_config
@@ -238,7 +237,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             from peft import PeftModel
 
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            model = AutoModelForCausalLM.from_pretrained(model_base, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
+            model = AutoModelForCausalLM.from_pretrained(model_base, dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
             print(f"Merging weights")

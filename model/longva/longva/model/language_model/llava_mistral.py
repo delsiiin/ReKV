@@ -29,10 +29,10 @@ from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 class LlavaMistralConfig(MistralConfig):
     model_type = "llava_mistral"
-    temperature: float = 0.0  # reset to 0.0, previously 0.9 for Vicuna
+    temperature: float = 1.0  # Greedy decoding is selected by do_sample=False.
     max_new_tokens: int = 1024
     do_sample: bool = False
-    top_p: Optional[float] = None
+    top_p: float = 1.0
 
 
 class LlavaMistralModel(LlavaMetaModel, MistralModel):
@@ -49,7 +49,6 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         super(MistralForCausalLM, self).__init__(config)
 
         config.model_type = "llava_mistral"
-        config.rope_scaling = None
 
         self.model = LlavaMistralModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -74,10 +73,11 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         cache_position=None,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, image_sizes)
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, image_sizes=image_sizes)
 
         return super().forward(
             input_ids=input_ids,
@@ -90,6 +90,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            **kwargs,
         )
 
     @torch.no_grad()

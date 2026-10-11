@@ -1,0 +1,17 @@
+accelerate==1.13.0
+datasets==4.8.4
+numpy==2.2.6
+safetensors==0.7.0
+tokenizers==0.22.2
+# torch==2.10.0
+# torchaudio==2.10.0
+# torchvision==0.25.0
+tqdm==4.67.3
+transformers==5.5.4
+# flash-attn==2.8.3
+matplotlib
+seaborn
+rouge_score
+jieba
+rouge
+fuzzywuzzy

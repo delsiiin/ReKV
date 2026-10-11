@@ -38,7 +38,16 @@ class CLIPVisionTower(nn.Module):
             return
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        # The outer LongVA loader constructs modules on meta in Transformers 5.
+        # A separate pretrained vision checkpoint must load on a real device.
+        with torch.device("cpu"):
+            self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        # The outer loader recreates non-persistent buffers, including CLIP's
+        # position_ids. Let CLIP initialize them again after that recreation;
+        # the loaded parameter tensors retain their own initialization flags.
+        for module in self.vision_tower.modules():
+            if module._non_persistent_buffers_set:
+                module._is_hf_initialized = False
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True

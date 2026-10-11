@@ -39,7 +39,7 @@ def rekv_attention_forward(
         h_k = h_k.view(batch_size, len_k, num_heads_kv, dim_head).permute(0, 2, 1, 3).contiguous()   # (batch, num_heads_kv, len_k, dim_head)
         h_v = h_v.view(batch_size, len_k, num_heads_kv, dim_head).permute(0, 2, 1, 3).contiguous()   # (batch, num_heads_kv, len_k, dim_head)
 
-        if position_bias._cos_cached is not None and position_bias._cos_cached.device != h_q.device:
+        if position_bias.inv_freq.device != h_q.device:
             position_bias = copy.deepcopy(position_bias)
             if position_bias.inv_freq.device != h_q.device:
                 position_bias.inv_freq = position_bias.inv_freq.to(h_q.device)

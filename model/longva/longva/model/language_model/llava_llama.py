@@ -34,10 +34,10 @@ from longva.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
-    temperature: float = 0.0  # reset to 0.0, previously 0.9 for Vicuna
+    temperature: float = 1.0  # Greedy decoding is selected by do_sample=False.
     max_new_tokens: int = 1024
     do_sample: bool = False
-    top_p: Optional[float] = None
+    top_p: float = 1.0
     # rope_scaling: Optional[dict] = {}
 
 
@@ -83,6 +83,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         dpo_forward: Optional[bool] = None,
         cache_position=None,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -99,6 +100,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                **kwargs,
             )
 
             hidden_states = outputs[0]
@@ -117,6 +119,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                **kwargs,
             )
 
     @torch.no_grad()

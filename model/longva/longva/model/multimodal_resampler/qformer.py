@@ -22,7 +22,8 @@ from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
-from transformers.file_utils import (
+from transformers.generation import GenerationMixin
+from transformers.utils import (
     ModelOutput,
 )
 from transformers.modeling_outputs import (
@@ -36,10 +37,9 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from transformers.modeling_utils import (
-    PreTrainedModel,
+from transformers.modeling_utils import PreTrainedModel
+from transformers.pytorch_utils import (
     apply_chunking_to_forward,
-    find_pruneable_heads_and_indices,
     prune_linear_layer,
 )
 from transformers.utils import logging
@@ -260,12 +260,14 @@ class BertAttention(nn.Module):
     def prune_heads(self, heads):
         if len(heads) == 0:
             return
-        heads, index = find_pruneable_heads_and_indices(
-            heads,
-            self.self.num_attention_heads,
-            self.self.attention_head_size,
-            self.pruned_heads,
-        )
+        # Transformers 5 removed the head-index helper. Account for heads
+        # removed in earlier calls before selecting the remaining channels.
+        heads = set(heads) - self.pruned_heads
+        mask = torch.ones(self.self.num_attention_heads, self.self.attention_head_size, dtype=torch.bool)
+        for head in heads:
+            shifted_head = head - sum(previous < head for previous in self.pruned_heads)
+            mask[shifted_head] = False
+        index = torch.arange(mask.numel())[mask.flatten()]
 
         # Prune linear layers
         self.self.query = prune_linear_layer(self.self.query, index)
@@ -599,6 +601,19 @@ class BertPreTrainedModel(PreTrainedModel):
     base_model_prefix = "bert"
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
+    def get_head_mask(self, head_mask, num_hidden_layers):
+        # QFormer still supports explicit head masks; this helper was removed
+        # from Transformers' base model in v5.
+        if head_mask is None:
+            return [None] * num_hidden_layers
+        if head_mask.dim() == 1:
+            head_mask = head_mask[None, None, :, None, None].expand(num_hidden_layers, -1, -1, -1, -1)
+        elif head_mask.dim() == 2:
+            head_mask = head_mask[:, None, :, None, None]
+        if head_mask.dim() != 5:
+            raise ValueError("head_mask must have 1, 2, or 5 dimensions")
+        return head_mask.to(dtype=self.dtype)
+
     def _init_weights(self, module):
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -632,7 +647,7 @@ class BertModel(BertPreTrainedModel):
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
-        self.init_weights()
+        self.post_init()
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
@@ -764,7 +779,7 @@ class BertModel(BertPreTrainedModel):
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         # use_cache = use_cache if use_cache is not None else self.config.use_cache
 
@@ -862,10 +877,20 @@ class BertModel(BertPreTrainedModel):
         )
 
 
-class BertLMHeadModel(BertPreTrainedModel):
+class BertLMHeadModel(BertPreTrainedModel, GenerationMixin):
+
+    _tied_weights_keys = {
+        "cls.predictions.decoder.weight": "bert.embeddings.word_embeddings.weight",
+        "cls.predictions.decoder.bias": "cls.predictions.bias",
+    }
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls):
+        # This vendored QFormer manages its query-prefix cache itself.
+        return False
 
     def __init__(self, config):
         super().__init__(config)
@@ -873,7 +898,7 @@ class BertLMHeadModel(BertPreTrainedModel):
         self.bert = BertModel(config, add_pooling_layer=False)
         self.cls = BertOnlyMLMHead(config)
 
-        self.init_weights()
+        self.post_init()
 
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
@@ -932,7 +957,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             >>> outputs = model(**inputs)
             >>> prediction_logits = outputs.logits
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         if labels is not None:
             use_cache = False
         if past_key_values is not None:
@@ -989,7 +1014,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             cross_attentions=outputs.cross_attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, query_embeds, past=None, attention_mask=None, **model_kwargs):
+    def prepare_inputs_for_generation(self, input_ids, query_embeds, past_key_values=None, attention_mask=None, **model_kwargs):
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
@@ -997,14 +1022,15 @@ class BertLMHeadModel(BertPreTrainedModel):
         attention_mask = torch.cat([query_mask, attention_mask], dim=-1)
 
         # cut decoder_input_ids if past is used
-        if past is not None:
+        if past_key_values is not None:
             input_ids = input_ids[:, -1:]
 
         return {
             "input_ids": input_ids,
             "query_embeds": query_embeds,
             "attention_mask": attention_mask,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
+            "use_cache": model_kwargs.get("use_cache", True),
             "encoder_hidden_states": model_kwargs.get("encoder_hidden_states", None),
             "encoder_attention_mask": model_kwargs.get("encoder_attention_mask", None),
             "is_decoder": True,
@@ -1019,6 +1045,8 @@ class BertLMHeadModel(BertPreTrainedModel):
 
 class BertForMaskedLM(BertPreTrainedModel):
 
+    _tied_weights_keys = BertLMHeadModel._tied_weights_keys
+
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
@@ -1028,7 +1056,7 @@ class BertForMaskedLM(BertPreTrainedModel):
         self.bert = BertModel(config, add_pooling_layer=False)
         self.cls = BertOnlyMLMHead(config)
 
-        self.init_weights()
+        self.post_init()
 
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
@@ -1059,7 +1087,7 @@ class BertForMaskedLM(BertPreTrainedModel):
             (masked), the loss is only computed for the tokens with labels in ``[0, ..., config.vocab_size]``
         """
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         outputs = self.bert(
             input_ids,

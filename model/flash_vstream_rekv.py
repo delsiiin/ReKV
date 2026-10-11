@@ -173,7 +173,7 @@ def load_model(model_path='/home/shangzhedi/shangzhedi/Flash-VStream-Base/checkp
         model_path, 
         device_map="auto",
         low_cpu_mem_usage=True, 
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         n_frame_tokens=n_frame_tokens,
         init_prompt_ids=init_prompt_ids,
         n_local=n_local,

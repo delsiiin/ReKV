@@ -17,21 +17,17 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
             prompt += 'Best option: ('
         return prompt
 
+    @property
+    def language_model(self):
+        return self.model.language_model
+
     def _get_video_features(self, pixel_values_videos):
-        batch_size, frames, channels, height, width = pixel_values_videos.shape
-        pixel_values_videos = pixel_values_videos.view(batch_size * frames, channels, height, width)
-        video_features = self.vision_tower(pixel_values_videos, output_hidden_states=True)
-        selected_video_feature = video_features.hidden_states[self.config.vision_feature_layer]
-
-        if self.config.vision_feature_select_strategy == "default":
-            selected_video_feature = selected_video_feature[:, 1:]
-        elif self.config.vision_feature_select_strategy == "full":
-            selected_video_feature = selected_video_feature
-        video_features = self.multi_modal_projector(selected_video_feature)
-
-        video_features = self.apply_pooling(video_features)
-        video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*196, D)
-        return video_features
+        return self.model.get_video_features(
+            pixel_values=pixel_values_videos,
+            vision_feature_layer=self.config.vision_feature_layer,
+            vision_feature_select_strategy=self.config.vision_feature_select_strategy,
+            return_dict=True,
+        ).pooler_output
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
@@ -67,7 +63,7 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
                 inputs_embeds = self.get_input_embeddings()(input_ids)
                 out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
                 past_key_values = out.past_key_values
-                logits = out.logits
+                logits = self.lm_head(out.last_hidden_state)
             else:  # decoding
                 out = self.language_model(
                     input_ids=torch.as_tensor(
@@ -77,7 +73,7 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
                     use_cache=True,
                     past_key_values=past_key_values,
                 )
-                logits = out.logits
+                logits = self.lm_head(out.last_hidden_state)
                 past_key_values = out.past_key_values
 
             last_token_logits = logits[0, -1, :]
@@ -129,7 +125,7 @@ def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
         model_path, 
         device_map="auto",
         low_cpu_mem_usage=True, 
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         processor=processor,
         n_frame_tokens=n_frame_tokens,
         init_prompt_ids=init_prompt_ids,
@@ -137,7 +133,7 @@ def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
         topk=topk,
         chunk_size=chunk_size,
     )
-    model.language_model = patch_hf(model.language_model, **inf_llm_config)
+    patch_hf(model.language_model, **inf_llm_config)
     
     for k, v in inf_llm_config.items():
         logger.info(f'{k}: {v}')

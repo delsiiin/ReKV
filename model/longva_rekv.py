@@ -11,7 +11,7 @@ from model.abstract_rekv import Abstract_ReKV
 class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
     def __init__(self, config, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
         LlavaQwenForCausalLM.__init__(self, config)
-        processor = self.get_model().get_vision_tower().image_processor
+        processor = getattr(self.get_model().get_vision_tower(), "image_processor", None)
         Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
 
     def get_prompt(self, query, mc=False):
@@ -130,7 +130,7 @@ def load_model(model_path='model_zoo/LongVA-7B',
         model_path, 
         device_map="auto",
         low_cpu_mem_usage=True, 
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         n_frame_tokens=n_frame_tokens,
         init_prompt_ids=init_prompt_ids,
         n_local=n_local,
@@ -142,6 +142,7 @@ def load_model(model_path='model_zoo/LongVA-7B',
         vision_tower.load_model(device_map="auto")
     processor = vision_tower.image_processor
     processor.tokenizer = tokenizer
+    model.processor = processor
 
     model = patch_hf(model, **inf_llm_config)
     model.language_model = model.model

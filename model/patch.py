@@ -1,178 +1,122 @@
 import torch
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+from transformers import LlamaModel, MistralModel, Qwen2Model
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from model.attention import RotaryEmbeddingESM, rekv_attention_forward
 
 
 def huggingface_forward(forward):
+    """Bridge the Transformers 5 attention API to ReKV's per-layer caches."""
     def hf_forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask = None,
-        position_ids = None,
-        past_key_value = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        position_embeddings=None,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=None,
+        use_cache=True,
         **kwargs,
     ):
-        assert not output_attentions
-        ret = forward(
+        # Native decoder layers return only hidden states in Transformers 5.
+        # Keep the updated ReKV cache in a shared list for this forward call.
+        output, cache = forward(
             self, hidden_states, hidden_states,
-            position_ids, use_cache, past_key_value,
-            self.q_proj, self.k_proj, self.v_proj, self.o_proj, 
-            self.head_dim, self.num_heads, self.num_key_value_heads
+            position_ids, use_cache, past_key_values[self.layer_idx],
+            self.q_proj, self.k_proj, self.v_proj, self.o_proj,
+            self.head_dim, self.config.num_attention_heads,
+            self.config.num_key_value_heads,
         )
-        if use_cache:
-            o, pkv = ret
-        else:
-            o = ret
-            pkv = None
-
-        return o, None, pkv
+        past_key_values[self.layer_idx] = cache
+        return output, None
 
     return hf_forward
 
 
-def patch_hf(
-    model,
-    attn_kwargs: dict = {},
-    base = None, 
-    distance_scale = None,
-    **kwargs
-):
-    attn_kwargs.update(kwargs)
-    # This approach lacks scalability and will be refactored.
-    from transformers import LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Qwen2Model
-    from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel, BaseModelOutputWithPast
+def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, **kwargs):
+    attn_kwargs = {**(attn_kwargs or {}), **kwargs}
+    decoder = model if isinstance(model, (LlamaModel, MistralModel, Qwen2Model)) else getattr(model, "model", None)
+    if not isinstance(decoder, (LlamaModel, MistralModel, Qwen2Model)):
+        raise ValueError(f"Only supports llama, mistral and qwen2 models, not {model.__class__.__name__}.")
 
     def model_forward(
         self,
-        input_ids: torch.LongTensor = None,
-        attention_mask = None,
-        position_ids = None,
-        past_key_values = None,
-        inputs_embeds = None,
-        use_cache = None,
-        output_attentions = None,
-        output_hidden_states = None,
-        return_dict = None,
-        *args,
-        **kwargs
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
-
+        use_cache = self.config.use_cache if use_cache is None else use_cache
+        output_attentions = self.config.output_attentions if output_attentions is None else output_attentions
+        output_hidden_states = self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
+        return_dict = self.config.return_dict if return_dict is None else return_dict
+        if not use_cache:
+            raise ValueError("ReKV requires use_cache=True.")
+        if output_attentions:
+            raise ValueError("ReKV does not return attention weights.")
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Specify exactly one of input_ids and inputs_embeds.")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-            if hasattr(self, "config") and hasattr(self.config, "scale_emb"):
-                inputs_embeds = inputs_embeds * self.config.scale_emb
 
-        if use_cache:
-            pkv = tuple()
-
+        if past_key_values is None:
+            caches = [None] * len(self.layers)
+        elif isinstance(past_key_values, (tuple, list)) and len(past_key_values) == len(self.layers):
+            caches = list(past_key_values)
         else:
-            pkv = None
+            raise ValueError("ReKV expects one ContextManager or (key, value) pair per decoder layer.")
 
         hidden_states = inputs_embeds
-
-        # decoder layers
         all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-
-        for i, decoder_layer in enumerate(self.layers):
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
-            layer_outputs = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=self.position_bias,
-                past_key_value=past_key_values[i] if past_key_values is not None else None,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
+                past_key_values=caches,
+                use_cache=True,
             )
 
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                _cache = layer_outputs[2 if output_attentions else 1]
-                pkv = pkv + (_cache,)
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
         hidden_states = self.norm(hidden_states)
-
-        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, pkv, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=pkv,
+            past_key_values=tuple(caches),
             hidden_states=all_hidden_states,
-            attentions=all_self_attns,
         )
+        return output if return_dict else output.to_tuple()
 
-    forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
-
-    if isinstance(model, LlamaForCausalLM):
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    elif isinstance(model, MistralForCausalLM):
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    elif isinstance(model, Qwen2ForCausalLM) or isinstance(model, Qwen2Model):
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    elif model.__class__.__name__ == "MiniCPMForCausalLM":
-        Attention = model.model.layers[0].self_attn.__class__
-        Model = model.model.__class__
-    else:
-        raise ValueError(f"Only supports llama, mistral and qwen2 models, not {model.__class__.__name__}.")
-
-    hf_rope = model.model.layers[0].self_attn.rotary_emb 
-    if isinstance(hf_rope, Qwen2RotaryEmbedding):
-        base = hf_rope.base
-        distance_scale = 1.0
-        dim = hf_rope.dim
-    else:
-        base = hf_rope.config.rope_theta
-        distance_scale = distance_scale if distance_scale is not None else 1.0
-        partial_rotary_factor = hf_rope.config.partial_rotary_factor if hasattr(hf_rope.config, "partial_rotary_factor") else 1.0
-        dim = int((hf_rope.config.hidden_size // hf_rope.config.num_attention_heads) * partial_rotary_factor)
+    # RoPE is now owned by the decoder, and its settings live in rope_parameters.
+    config = decoder.config
+    rope_parameters = config.rope_parameters
+    head_dim = decoder.layers[0].self_attn.head_dim
+    dim = int(head_dim * rope_parameters.get("partial_rotary_factor", 1.0))
     rope = RotaryEmbeddingESM(
         dim,
-        base,
-        distance_scale
+        rope_parameters["rope_theta"] if base is None else base,
+        1.0 if distance_scale is None else distance_scale,
+        device=decoder.rotary_emb.inv_freq.device,
     )
-    model.model.position_bias = rope
+    if base is None:
+        # Preserve the checkpoint's frequencies (including static RoPE scaling).
+        rope.inv_freq.copy_(decoder.rotary_emb.inv_freq)
+    decoder.position_bias = rope
 
-    def set_forward(m):
-        if isinstance(m, Attention):
-            m._old_forward = m.forward
-            m.forward = forward.__get__(m, Attention)
-
-    model.apply(set_forward)
-
-    model.model._old_forward = model.model.forward
-    model.model.forward = model_forward.__get__(model.model, Model)
-
+    forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
+    for layer in decoder.layers:
+        attention = layer.self_attn
+        if not hasattr(attention, "_old_forward"):
+            attention._old_forward = attention.forward
+        attention.forward = forward.__get__(attention, type(attention))
+    if not hasattr(decoder, "_old_forward"):
+        decoder._old_forward = decoder.forward
+    decoder.forward = model_forward.__get__(decoder, type(decoder))
     return model

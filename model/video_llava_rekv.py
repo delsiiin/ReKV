@@ -10,7 +10,6 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
     def __init__(self, config, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
         VideoLlavaForConditionalGeneration.__init__(self, config)
         Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
-        self.processor.video_processor = self.processor.image_processor
 
     def get_prompt(self, query, mc=False):
         prompt =  f"\n{query} ASSISTANT:"
@@ -18,19 +17,21 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
             prompt += ' Best option: ('
         return prompt
 
+    @property
+    def language_model(self):
+        return self.model.language_model
+
     def _get_video_features(self, pixel_values_videos):
-        batch_size, frames, channels, height, width = pixel_values_videos.shape  # (B, Nv, 3, H, W)
-        _, video_features, _ = self._get_vision_features(
+        batch_size, frames = pixel_values_videos.shape[:2]
+        features = self.model.get_video_features(
             pixel_values_videos=pixel_values_videos,
             vision_feature_layer=self.config.vision_feature_layer,
-            vision_feature_select_strategy=self.config.vision_feature_select_strategy
-        )  # (Nv, 257, D)
-        video_features = self.multi_modal_projector(video_features)  # (Nv, 257, D)
-        video_features = video_features.reshape(batch_size, frames * video_features.shape[1], -1)  # (B, Nv*257, D)
-        return video_features
-    
+            return_dict=True,
+        ).pooler_output
+        return features.reshape(batch_size, frames * features.shape[1], -1)
+
     def _encode_video_chunk(self, video_chunk):
-        pixel_values_videos = self.processor.video_processor(images=None, videos=video_chunk, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
+        pixel_values_videos = self.processor.video_processor(videos=video_chunk, do_sample_frames=False, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
         video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*257, D)
         assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
 
@@ -75,7 +76,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
                 inputs_embeds = self.get_input_embeddings()(input_ids)
                 out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
                 past_key_values = out.past_key_values
-                logits = out.logits
+                logits = self.lm_head(out.last_hidden_state)
             else:  # decoding
                 out = self.language_model(
                     input_ids=torch.as_tensor(
@@ -85,7 +86,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
                     use_cache=True,
                     past_key_values=past_key_values,
                 )
-                logits = out.logits
+                logits = self.lm_head(out.last_hidden_state)
                 past_key_values = out.past_key_values
 
             last_token_logits = logits[0, -1, :]
@@ -136,7 +137,7 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
         model_path, 
         device_map="auto",
         low_cpu_mem_usage=True, 
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         processor=processor,
         n_frame_tokens=n_frame_tokens,
         init_prompt_ids=init_prompt_ids,
@@ -144,7 +145,7 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
         topk=topk,
         chunk_size=chunk_size,
     )
-    model.language_model = patch_hf(model.language_model, **inf_llm_config)
+    patch_hf(model.language_model, **inf_llm_config)
     
     for k, v in inf_llm_config.items():
         logger.info(f'{k}: {v}')
