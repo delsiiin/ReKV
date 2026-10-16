@@ -23,4 +23,4 @@ python -m video_qa.run_eval \
     --dataset ${dataset} \
     --sample_fps 0.5 \
     --n_local 15000 \
-    --retrieve_size 64 --debug "true"
+    --retrieve_size 64

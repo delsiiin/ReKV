@@ -36,11 +36,11 @@ def shrink_string_correctly(text):
 
 class GPTService:
     def __init__(self):
-        self.model_name = "gpt-3.5-turbo-0613"
-        self.max_tokens = 300
+        self.model_name = "deepseek-flash"
+        self.max_tokens = 2048
         self.client = openai.OpenAI(
-            base_url="",  # TODO
-            api_key="",  # TODO
+            base_url="https://api.deepseek.com",  # TODO
+            api_key="sk-42d37923fe644dbd87e4da4d341634f5",  # TODO
         )
 
     def _gpt_response(self, user_prompt):
