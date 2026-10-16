@@ -26,6 +26,7 @@ ssh -L 8765:127.0.0.1:8765 user@server
 页面支持：切换 RVS 分组和视频、查看全部问题与原始标注、设置最大帧数 / 采样 FPS /
 起始时间、生成或取消计算、切换观察层、查看逐帧图片 / mass / 熵和 token 热力图、
 在原图上定位 token、比较 attention mass 分布、生成所选问题的模型回答、
+查看逐帧 K/V 在 token × channel 上的 magnitude 三维曲面与热力图、
 下载完整 JSON 和当前层帧统计 CSV。首次打开需点击「生成观察数据」；之后切换样本
 默认自动计算，可关闭自动计算选项。参数变更后需点击生成按钮。
 
@@ -68,6 +69,33 @@ patch 网格仅覆盖预处理图像左上 378×378 像素；右侧和底部剩�
 - 图片空间分布：默认按原始 token mass 着色，所有帧共用所选层的最大视频 token mass
   作为线性色阶上限；可切换为帧内条件概率并在当前帧内缩放，或关闭叠加 / 调整透明度。
   观察窗口 token 显示灰色，不混入历史评分或帧内熵。
+
+## 逐帧 K/V magnitude
+
+完成观察输入的 prefill 后、追加回答 token 之前，保存原生 Transformers KV cache：
+Key 为 **post-RoPE**，Value 为原始缓存值；保留所有原生 KV heads，不按 GQA 重复展开，
+不平均层或 head。每帧保存完整视频 token，包括处于末尾观察窗口中的 token，
+不包含初始化提示词、问题或生成的回答 token。
+
+本地 7B 模型的每个切片为 196 token × 128 channel，提供 28 层、4 个 KV head。
+“逐帧 Key / Value magnitude”面板与所选视频帧联动；其层/head 独立选择，均从 0 编号。
+两张三维曲面的横轴为帧内 token、纵轴为 channel、高度为 `abs(K[t,c])` / `abs(V[t,c])`。
+默认各自使用标尺，可勾选共用标尺；俯仰角和方位角可切换。
+曲面由本地 Matplotlib 生成独立 PNG，使用全部 token/channel 网格，**不做降采样或截断**。
+首次切换某个视角需几秒绘图，之后从本地缓存读取；不重新运行模型。
+
+对应的二维热力图保留全部元素：横向 token 从左到右，纵向 channel 从上到下。
+悬停查看同一位置的 `|K|` / `|V|`，点击或使用方向键可以联动原图中的 token 空间位置。
+面板还显示最大值、平均绝对值和 P99。颜色仅用于展示，不改变数值；magnitude 不是 attention mass。
+PNG 可直接下载；“K/V 数据”下载当前帧/层/head 的 NPZ，包含**有符号**的
+`key`、`value`（形状 `[token, channel]`）、全局 `token_positions` 和层/帧/head 编号。
+
+快照按层保存为 `kv/layer-XXX.npy`，布局为 `[key_value, frame, kv_head, token, channel]`，
+第一维 0=Key、1=Value。FP16 原样保存；BF16 转为可精确表示其数值的 FP32。
+JSON 的 `kv_snapshot` 记录维度、dtype、采集阶段、磁盘数据大小和切片 API。
+后端通过 mmap 读取当前帧/head，浏览器按需取数据。
+7B FP16 模型约每帧占用 10.7 MiB（8 帧约 85.8 MiB）；快照保存在已有结果缓存目录。
+旧版本结果不含 K/V 快照，更新服务后重新生成即可。
 
 ## 模型回答
 
@@ -123,7 +151,7 @@ GQA 根据 query head 对应的 KV head 展开后统计；所有 attention heads
 
 结果保存到 `results/rvs_observation/<fingerprint>/`：每帧 JPEG 与 `result.json`。
 JSON 包含完整样本、输入参数、采样策略、token 布局、每层及全部层平均的重要性、
-帧统计、空间映射、模型回答、模型路径 / dtype / 层数 / head 数、软件版本及耗时。
+帧统计、空间映射、模型回答、K/V 快照元数据、模型路径 / dtype / 层数 / head 数、软件版本及耗时。
 缓存指纹包含参数、数据 / checkpoint 文件路径大小和修改时间、观察代码及关键依赖版本。
 相同配置复用结果。服务只运行一个 GPU 计算任务，另允许少量排队任务；切换样本时取消旧任务。
 取消在阶段或层边界生效，首次模型加载期间需等待加载结束。模型在服务进程内复用，

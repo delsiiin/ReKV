@@ -12,7 +12,9 @@ import re
 import threading
 import time
 import traceback
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
+
+import numpy as np
 
 from observation.data import RVSDataset, decode_frames
 
@@ -59,6 +61,7 @@ class ObservationService:
         self.cache = Path(args.cache_dir).resolve()
         self.cache.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.plot_lock = threading.Lock()
         self.jobs, self.events = {}, {}
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='observation')
         self.engine = None
@@ -147,8 +150,9 @@ class ObservationService:
             check_cancel()
             if self.engine is None:
                 self.engine = ObservationEngine(self.args.model_path, self.args.device, self.args.dtype)
-            result = self.engine.observe(images, frames, record, params, progress, check_cancel)
-            result.update(schema_version=2, job_id=job_id, sample=record, parameters=params,
+            result = self.engine.observe(images, frames, record, params, progress, check_cancel, artifact_dir=directory)
+            result['kv_snapshot']['api_base'] = f'/api/kv/{job_id}'
+            result.update(schema_version=3, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'
@@ -175,6 +179,17 @@ class ObservationService:
         for event in self.events.values():
             event.set()
         self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def kv_data(self, job_id, layer, frame, head):
+        from observation.kv import read_kv_slice
+        directory = self.cache / job_id
+        if not (directory / 'result.json').is_file():
+            raise ValueError('K/V snapshot is not ready; finish generating observation data first')
+        result = json.loads((directory / 'result.json').read_text())
+        if 'kv_snapshot' not in result:
+            raise ValueError('This result has no K/V snapshot; regenerate it with the updated server')
+        pair = read_kv_slice(directory / 'kv', result['kv_snapshot'], layer, frame, head)
+        return result, pair
 
 
 def handler_for(service):
@@ -203,7 +218,8 @@ def handler_for(service):
                     self.wfile.write(chunk)
 
         def do_GET(self):
-            path = unquote(urlparse(self.path).path)
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
             try:
                 if path == '/api/config':
                     return self.send_json(dict(model_path=str(Path(service.args.model_path).resolve()),
@@ -215,6 +231,41 @@ def handler_for(service):
                     return self.send_json(service.dataset.get(path.removeprefix('/api/samples/')))
                 if path.startswith('/api/jobs/'):
                     return self.send_json(service.get_job(path.removeprefix('/api/jobs/')))
+                match = re.fullmatch(r'/api/kv/([a-f0-9]{24})/(\d+)/(\d+)/(\d+)/(data\.json|surface\.png|tensor\.npz)', path)
+                if match:
+                    from observation.kv import magnitude_payload, render_kv_surface
+                    job_id, layer, frame, head, filename = match.groups()
+                    layer, frame, head = int(layer), int(frame), int(head)
+                    result, pair = service.kv_data(job_id, layer, frame, head)
+                    token_start = result['frames'][frame]['token_start']
+                    if filename == 'data.json':
+                        return self.send_json(magnitude_payload(pair, layer, frame, head, token_start))
+                    if filename == 'tensor.npz':
+                        import io
+                        output = io.BytesIO()
+                        np.savez_compressed(output, key=pair[0], value=pair[1],
+                                            token_positions=np.arange(token_start, token_start + pair.shape[1]),
+                                            layer=layer, frame=frame, kv_head=head, key_position='post-RoPE')
+                        content = output.getvalue()
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/octet-stream')
+                        self.send_header('Content-Disposition', f'attachment; filename="kv-layer{layer}-frame{frame}-head{head}.npz"')
+                        self.send_header('Content-Length', str(len(content)))
+                        self.end_headers()
+                        self.wfile.write(content)
+                        return
+                    query = parse_qs(parsed.query)
+                    elevation, azimuth = int(query.get('elevation', ['30'])[0]), int(query.get('azimuth', ['-60'])[0])
+                    shared = int(query.get('shared', ['0'])[0])
+                    if elevation not in range(15, 76, 15) or azimuth not in range(-180, 181, 15) or shared not in (0, 1):
+                        raise ValueError('Invalid K/V surface view parameters')
+                    target = service.cache / job_id / 'kv' / 'plots' / f'l{layer}-f{frame}-h{head}-e{elevation}-a{azimuth}-s{shared}.png'
+                    with service.plot_lock:
+                        if not target.is_file():
+                            render_kv_surface(pair, target, model_name=Path(result['model']['path']).name,
+                                              layer=layer, head=head, frame=frame, elevation=elevation,
+                                              azimuth=azimuth, shared_scale=bool(shared))
+                    return self.send_file(target, 'image/png')
                 match = re.fullmatch(r'/artifacts/([a-f0-9]{24})/(result\.json|frame-\d{4}\.jpg)', path)
                 if match:
                     filename = match[2]
@@ -222,6 +273,7 @@ def handler_for(service):
                                           'application/json; charset=utf-8' if filename.endswith('.json') else 'image/jpeg')
                 static = {'/': ('index.html', 'text/html; charset=utf-8'),
                           '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
+                          '/kv.js': ('kv.js', 'application/javascript; charset=utf-8'),
                           '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if path in static:
                     filename, mime = static[path]
@@ -229,8 +281,13 @@ def handler_for(service):
                 self.send_json({'error': 'Not found'}, 404)
             except (ValueError, KeyError) as error:
                 self.send_json({'error': str(error)}, 404)
+            except FileNotFoundError as error:
+                self.send_json({'error': str(error)}, 404)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as error:
+                traceback.print_exc()
+                self.send_json({'error': f'{type(error).__name__}: {error}'}, 500)
 
         def do_POST(self):
             try:

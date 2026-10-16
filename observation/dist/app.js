@@ -31,6 +31,7 @@ async function cancelPrevious() {
   }
 }
 function clearResults() {
+  window.kvViewer.reset();
   state.result = null;
   state.selected = 0;
   state.selectedToken = 0;
@@ -162,7 +163,8 @@ function renderResult(url, cached) {
   $('inputMetadata').textContent = JSON.stringify({parameters: result.parameters, sampling: result.sampling, model: result.model,
     token_layout: {prompt_tokens: result.sequence.prompt_tokens, video_tokens: result.sequence.video_tokens,
       total_tokens: result.sequence.total_tokens, window: [result.sequence.window_start, result.sequence.window_end]}, method: result.method,
-    spatial: {...result.spatial, cells: `${result.spatial.cells.length} cells; full coordinates in JSON`}, answer: result.answer}, null, 2);
+    spatial: {...result.spatial, cells: `${result.spatial.cells.length} cells; full coordinates in JSON`},
+    answer: result.answer, kv_snapshot: result.kv_snapshot}, null, 2);
   $('layer').replaceChildren(node('option', '', '全部层平均'));
   $('layer').options[0].value = 'all';
   result.views.slice(1).forEach(view => {
@@ -175,6 +177,7 @@ function renderResult(url, cached) {
   $('resultLabel').textContent = `${result.model.layers} 层 · ${result.model.heads} heads · ${cached ? '本地缓存' : `${fmt(result.total_elapsed_seconds, 1)} 秒`}`;
   $('runtime').textContent = `torch ${result.model.versions.torch} / transformers ${result.model.versions.transformers}`;
   renderAnswer();
+  window.kvViewer.configure(result);
   renderView();
 }
 function renderAnswer() {
@@ -224,6 +227,7 @@ function selectFrame(index, scroll = false, tokenIndex = null) {
   state.selectedToken = tokenIndex ?? 0;
   document.querySelectorAll('.frame-card').forEach(card => card.classList.toggle('selected', Number(card.dataset.index) === index));
   renderCharts(); renderMassDistribution(); renderDetail();
+  window.kvViewer.selectFrame(index, state.selectedToken);
   if (scroll) $('detailPanel').scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 function svgNode(tag, attributes, text) {
@@ -237,26 +241,32 @@ function renderCharts() {
   const frames = state.result.frames, n = frames.length, width = 900;
   const svg = svgNode('svg', {viewBox: `0 0 ${width} 295`, role: 'img', 'aria-label': '逐帧 attention mass 与归一化条件熵'});
   const x = i => n === 1 ? 470 : 65 + i / (n - 1) * 790;
-  [{key: 'mass', top: 34, bottom: 111, color: '#087f80', label: 'ATTENTION MASS', max: Math.max(...view.frames.map(f => f.mass), 0.000001)},
-   {key: 'normalized_entropy', top: 167, bottom: 244, color: '#d77a3a', label: 'NORMALIZED CONDITIONAL ENTROPY', max: 1}].forEach(chart => {
+  [{key: 'mass', top: 34, bottom: 111, color: '#087f80', label: 'ATTENTION MASS', min: 0, max: Math.max(...view.frames.map(f => f.mass), 0.000001)},
+   {key: 'normalized_entropy', top: 167, bottom: 244, color: '#d77a3a', label: 'NORMALIZED CONDITIONAL ENTROPY', min: .8, max: 1}].forEach(chart => {
+    const yFor = value => chart.bottom - (value - chart.min) / (chart.max - chart.min) * (chart.bottom - chart.top);
+    const clipId = `chart-clip-${chart.key}`;
+    const defs = svgNode('defs', {}), clip = svgNode('clipPath', {id: clipId});
+    clip.append(svgNode('rect', {x: 59, y: chart.top, width: 802, height: chart.bottom - chart.top}));
+    defs.append(clip); svg.append(defs);
     svg.append(svgNode('text', {x: 65, y: chart.top - 16}, chart.label));
     for (const fraction of [0, .5, 1]) {
       const y = chart.bottom - fraction * (chart.bottom - chart.top);
       svg.append(svgNode('line', {x1: 65, x2: 855, y1: y, y2: y, stroke: '#e6ecef', 'stroke-dasharray': '3 4'}));
-      svg.append(svgNode('text', {x: 55, y: y + 4, 'text-anchor': 'end'}, chart.key === 'mass' ? pct(fraction * chart.max) : fmt(fraction, 1)));
+      const tick = chart.min + fraction * (chart.max - chart.min);
+      svg.append(svgNode('text', {x: 55, y: y + 4, 'text-anchor': 'end'}, chart.key === 'mass' ? pct(tick) : fmt(tick, 1)));
     }
     let path = '', connected = false;
     view.frames.forEach((frame, index) => {
       const value = frame[chart.key];
       if (value == null) { connected = false; return; }
-      const y = chart.bottom - value / chart.max * (chart.bottom - chart.top);
+      const y = yFor(value);
       path += `${connected ? 'L' : 'M'}${x(index)},${y} `; connected = true;
     });
-    svg.append(svgNode('path', {d: path, fill: 'none', stroke: chart.color, 'stroke-width': 2}));
+    svg.append(svgNode('path', {d: path, fill: 'none', stroke: chart.color, 'stroke-width': 2, 'clip-path': `url(#${clipId})`}));
     svg.append(svgNode('line', {x1: x(state.selected), x2: x(state.selected), y1: chart.top, y2: chart.bottom, stroke: '#99b1ba', 'stroke-dasharray': '2 4'}));
     view.frames.forEach((frame, index) => {
-      const value = frame[chart.key]; if (value == null) return;
-      const circle = svgNode('circle', {cx: x(index), cy: chart.bottom - value / chart.max * (chart.bottom - chart.top), r: index === state.selected ? 5.5 : 3.5, fill: chart.color, tabindex: 0, role: 'button', 'aria-label': `帧 ${index + 1} ${chart.label} ${fmt(value, 5)}`});
+      const value = frame[chart.key]; if (value == null || value < chart.min || value > chart.max) return;
+      const circle = svgNode('circle', {cx: x(index), cy: yFor(value), r: index === state.selected ? 5.5 : 3.5, fill: chart.color, tabindex: 0, role: 'button', 'aria-label': `帧 ${index + 1} ${chart.label} ${fmt(value, 5)}`});
       circle.append(svgNode('title', {}, `帧 ${index + 1} · ${fmt(frames[index].timestamp, 2)}s · ${fmt(value, 6)}`));
       circle.addEventListener('click', () => selectFrame(index));
       circle.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectFrame(index); } });
@@ -393,6 +403,7 @@ function activateToken(index) {
   const detail = score === undefined ? '观察窗口 / 不计入历史重要性' : `原始 mass = ${score.toExponential(5)} (${fmt(score * 100, 5)}%) · 帧内 p = ${stats.mass > 0 ? fmt(score / stats.mass, 6) : '未定义'}`;
   $('spatialReadout').textContent = `token #${position} · 帧内 #${index} · 行 ${cell.row + 1} / 列 ${cell.col + 1} · 原图区域 [${bounds.join(', ')}] px\n${detail}`;
   $('heatmapHint').textContent = `#${position} · 行 ${cell.row + 1} / 列 ${cell.col + 1}${score === undefined ? ' · 观察窗口' : ''}`;
+  window.kvViewer.highlightToken(state.selected, index);
 }
 function tokenDescription(index, view) {
   const frame = state.result.frames.find(f => index >= f.token_start && index < f.token_end);

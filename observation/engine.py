@@ -9,6 +9,7 @@ import torch
 
 from observation.metrics import WINDOW_SIZE, build_views, window_importance
 from observation.spatial import video_token_layout
+from observation.kv import save_kv_snapshot
 
 
 INIT_PROMPT = '<|im_start|>system \nYou are a helpful assistant.<|im_end|><|im_start|>user '
@@ -90,7 +91,7 @@ class ObservationEngine:
         self.processor, self.model = processor, model
 
     @torch.inference_mode()
-    def observe(self, images, frames, record, params, progress, check_cancel):
+    def observe(self, images, frames, record, params, progress, check_cancel, *, artifact_dir):
         began = time.monotonic()
         self.load(progress)
         check_cancel()
@@ -157,7 +158,7 @@ class ObservationEngine:
             check_cancel()
             scores[layer] = score
             progress('attention', f'计算注意力：第 {layer + 1}/{len(scores)} 层',
-                     0.48 + 0.28 * (layer + 1) / len(scores))
+                     0.48 + 0.23 * (layer + 1) / len(scores))
 
         cleanup = install_observer(decoder, capture)
         try:
@@ -167,6 +168,10 @@ class ObservationEngine:
         check_cancel()
         if any(score is None for score in scores):
             raise RuntimeError("Some decoder layers did not produce observation scores")
+        kv_snapshot = save_kv_snapshot(
+            prefill.past_key_values, frames, Path(artifact_dir) / 'kv', check_cancel,
+            lambda layer, total: progress('kv_snapshot', f'保存逐帧 K/V：第 {layer}/{total} 层',
+                                          0.71 + .06 * layer / total))
         observation_elapsed = time.monotonic() - began
         progress('answer', '基于同一批视频帧和所选问题生成回答', 0.78)
         answer_started = time.monotonic()
@@ -214,7 +219,7 @@ class ObservationEngine:
                         entropy='p_i = s_i / sum_frame(s); H = -sum(p_i * ln(p_i)); H_norm = H / ln(scored_tokens)',
                         pooling=False, frames_include_window_tokens=True,
                         reference='https://github.com/FasterDecoding/SnapKV'),
-            frames=frames, spatial=spatial, answer=answer,
+            frames=frames, spatial=spatial, answer=answer, kv_snapshot=kv_snapshot,
             views=build_views(np.stack(scores), frames, prefix_length),
             observation_elapsed_seconds=observation_elapsed,
             elapsed_seconds=time.monotonic() - began,
