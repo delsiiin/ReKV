@@ -74,6 +74,11 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
 
 ## Evaluation
 
+For a local HTML experiment showing RVS sampled frames, last-32-token attention
+importance and frame-conditional entropy, run `bash run_observation.sh` in the
+`rekv` environment and open `http://127.0.0.1:8765`.
+See [the observation guide](observation/README.md) for inputs and metric definitions.
+
 ```bash
 # The number of processes utilized for parallel evaluation.
 # Normally, set it to the number of GPUs on your machine.
