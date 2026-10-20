@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RVS · Attention Observatory</title>
-  <meta name="description" content="本地 RVS 视频注意力观察实验：实际采样帧、最后 32 token 重要性与帧内条件熵。">
-  <link rel="stylesheet" href="/style.css"><script src="/kv.js" defer></script><script src="/app.js" defer></script>
+  <meta name="description" content="本地 RVS 视频注意力观察实验：可配置视频窗口、逐帧 token 问题前后对照与帧内条件熵。">
+  <link rel="stylesheet" href="/style.css"><script src="/kv.js" defer></script><script src="/comparison.js" defer></script><script src="/vendi.js" defer></script><script src="/uniqueness.js" defer></script><script src="/app.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -20,6 +20,8 @@
     <label for="startTime">起始时间 / 秒</label><input id="startTime" type="number" value="0" min="0" step="any" required>
     <p class="field-note">从起始时间后的第一个采样帧开始，最多处理指定帧数。时间戳相对源视频。</p>
     <label for="mode">观察输入</label><select id="mode"><option value="video">视频编码末尾 32 token</option><option value="question">视频 + 问题末尾 32 token</option></select>
+    <label for="videoWindowSize">视频末尾 token 数 N</label><input id="videoWindowSize" type="number" value="32" min="1" step="1" required>
+    <p class="field-note">用于视频编码末尾窗口及“问题前”对照，可跨帧，不能超过实际视频 token 总数。“问题后”使用全部问题正文 token。</p>
     <label for="maxAnswerTokens">回答最大 token 数</label><input id="maxAnswerTokens" type="number" value="128" min="1" max="512" required>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
@@ -28,7 +30,7 @@
   <div class="side-footer"><span class="dot"></span> 本地模型 · 本地数据<div id="modelInfo">正在连接服务…</div></div>
 </aside>
 <main>
-  <header><div><div class="eyebrow">ATTENTION / OBSERVATION EXPERIMENT</div><h1>视频里，哪些 token 被关注？</h1><p class="subtitle">观察历史重要性，也观察每帧内部的注意力分布。</p></div><span class="badge">32 TOKEN WINDOW</span></header>
+  <header><div><div class="eyebrow">ATTENTION / OBSERVATION EXPERIMENT</div><h1>视频里，哪些 token 被关注？</h1><p class="subtitle">观察历史重要性，也观察每帧内部的注意力分布。</p></div><span id="windowBadge" class="badge">32 TOKEN WINDOW</span></header>
   <section class="panel sample-panel"><div class="panel-heading"><h2 id="sampleTitle">读取 RVS 样本</h2><span id="sampleTag" class="tag">—</span></div><div id="sampleMeta" class="meta-line"></div><div class="qa"><span>Q</span><p id="questionText">—</p></div><details><summary>参考答案与样本原始信息</summary><p id="answerText"></p><pre id="rawSample"></pre></details></section>
   <div id="status" class="status" role="status" aria-live="polite"><span id="statusText">选择参数后生成观察数据。首次运行需要加载模型。</span><span id="statusPercent"></span><div class="progress"><div id="progressBar"></div></div></div>
   <div id="emptyState" class="empty-state"><span class="empty-icon">▥</span><h2>从一段视频开始观察</h2><p>点击「生成观察数据」，查看采样帧、图片 token 映射、attention mass 与模型回答。</p><p class="muted">默认在视频末尾观察注意力，再基于同一批帧和所选问题生成回答。</p></div>
@@ -39,7 +41,40 @@
     <details id="inputDetails" class="panel" hidden><summary>本次模型输入与采样信息</summary><pre id="inputMetadata"></pre></details>
     <section id="massPanel" class="panel" hidden><div class="panel-heading"><div><h2>Attention mass 分布</h2><p class="muted">先查看总注意力去向，再比较视频帧获得的注意力。与所选层联动。</p></div><label class="mass-select" for="massScale">帧分布口径<select id="massScale"><option value="absolute">占总注意力比例</option><option value="video">占历史视频注意力比例</option></select></label></div><div id="massComposition" class="mass-composition" role="img" aria-label="历史文本、历史视频和观察窗口的注意力占比"></div><div id="massLegend" class="mass-legend"></div><div id="massBars"></div><p id="massCaption" class="muted"></p></section>
     <section class="panel" id="chartPanel" hidden><div class="panel-heading"><div><h2>逐帧注意力概览</h2><p class="muted">点击曲线上的采样点查看对应帧。两个图使用独立纵轴。</p></div><div class="legend"><span class="teal-dot"></span> attention mass <span class="orange-dot"></span> 条件熵</div></div><div id="charts"></div></section>
+    <section id="comparisonPanel" class="panel" hidden>
+      <div class="panel-heading"><div><h2>问题到来前后 · 当前帧 token 注意力</h2><p id="comparisonStatus" class="muted"></p></div><button id="exportComparisonCsv" class="text-button" type="button" disabled>↓ 对照 CSV</button></div>
+      <div id="comparisonControls" class="overlay-controls">
+        <label for="comparisonFrame">视频帧<select id="comparisonFrame" disabled></select></label>
+        <label for="comparisonMetric">统计口径<select id="comparisonMetric"><option value="mass">原始 token mass</option><option value="conditional">帧内条件概率</option></select></label>
+        <label for="comparisonDisplay">显示方式<select id="comparisonDisplay"><option value="grid">Token 网格</option><option value="overlay">原图叠加</option></select></label>
+        <label for="comparisonOpacity">叠加透明度<input id="comparisonOpacity" type="range" min="0" max="0.85" step="0.05" value="0.5"></label>
+      </div>
+      <div id="comparisonLegend" class="comparison-legend"></div>
+      <div id="comparisonReadout" class="spatial-readout" aria-live="polite"></div>
+      <details id="comparisonQueryDetails"><summary>实际 query token 与位置</summary><pre id="comparisonQueries"></pre></details>
+      <p id="comparisonNote" class="tiny">仅展示选中帧的全部视频 token，包括视频观察窗口；可在此处或帧列表中切换。它们比较两组 query 对视频的关注；因果注意力下，追加问题不会改变旧视频 token 已计算的注意力。各 query 与 attention head 等权；差值 = 问题后 − 问题前。</p>
+      <div id="comparisonFrames" class="comparison-frames"></div>
+    </section>
     <section class="panel" id="detailPanel" hidden><div class="panel-heading"><h2 id="detailTitle">帧细节</h2><span id="detailRange" class="muted"></span></div><div class="overlay-controls"><label class="check-label"><input id="showOverlay" type="checkbox" checked> 在图片上显示 token</label><label for="overlayMode">图片色阶<select id="overlayMode"><option value="mass">原始 token mass · 跨帧同标尺</option><option value="conditional">帧内条件概率 · 当前帧色阶</option></select></label><label for="overlayOpacity">叠加透明度<input id="overlayOpacity" type="range" min="0" max="0.85" step="0.05" value="0.45"></label></div><div class="detail-layout"><div id="imageStage" class="image-stage"><img id="detailImage" alt="当前选中的实际采样帧"><svg id="imageOverlay" aria-label="图片上的视频 token 空间位置"></svg></div><div class="heatmap-wrap"><div class="eyebrow">WITHIN-FRAME DISTRIBUTION</div><canvas id="heatmap" width="280" height="280" tabindex="0" aria-label="帧内 token 条件概率热力图，方向键选择 token"></canvas><p id="heatmapHint" class="muted">悬停查看 token 分数</p><p class="tiny">图片与网格联动高亮。灰色为观察窗口。</p></div><div id="frameMetrics" class="frame-metrics"></div></div><div id="spatialReadout" class="spatial-readout" aria-live="polite"></div><p class="tiny">橙色实线标记 token 的空间网格，虚线标记参与双线性池化的 patch 范围。它们是空间锚点，视觉编码器已混合全图信息。右侧及底部无 patch 锚点的窄边缘不分配 token。</p></section>
+    <section id="vendiPanel" class="panel" hidden>
+      <div class="panel-heading"><div><h2>逐帧 Key / Value 独立最近邻比例 <span class="tag">R_NN</span></h2><p id="vendiStatus" class="muted" role="status"></p></div><div class="toolbar-actions"><a id="vendiDownloadPlot" class="text-button" download="uniqueness-scores.png" hidden>↓ 分布 PNG</a><a id="vendiDownloadData" class="text-button" download hidden>↓ Uniqueness 数据</a><button id="exportVendiCsv" class="text-button" type="button" disabled>↓ K/V 全部分数 CSV</button></div></div>
+      <div class="kv-controls"><label for="uniquenessState">独立评估<select id="uniquenessState"><option value="key">Key</option><option value="value">Value</option></select></label><label for="uniquenessPosition">Key 阶段 · 分数图与热图共用<select id="uniquenessPosition"><option value="post" selected>RoPE 后 / post-RoPE</option><option id="uniquenessPreOption" value="pre" disabled>RoPE 前 / pre-RoPE</option></select></label><span id="uniquenessPositionHint" class="muted"></span></div>
+      <div id="vendiControls" class="kv-controls"><label for="vendiFrame">视频帧<select id="vendiFrame"></select></label><label for="vendiLayer">模型层 / 从 0 开始<select id="vendiLayer"></select></label><label for="vendiHead">KV head / 从 0 开始<select id="vendiHead"></select></label></div>
+      <div id="vendiLegend" class="mass-legend"><span><i class="mass-swatch" style="background:#087f80"></i> K/V 最近邻冗余比例 R_NN</span><span>箱体 Q1–Q3 · 横线 中位数 · 须 最小–最大 · 圆点 分数均值</span></div>
+      <div id="vendiChart" class="vendi-chart"></div><div id="vendiReadout" class="spatial-readout" aria-live="polite"></div>
+      <p class="tiny">K 和 V 分别评估。对 X ∈ {K,V}，s_X = √mean(‖xᵢ‖²) + ε₀（ε₀ = 10⁻⁸），dᵢᴺᴺ,X = minⱼ≠ᵢ ‖xᵢ−xⱼ‖/s_X。各自使用 τ_X = meanᵢ(dᵢᴺᴺ,X)，分别计算 R_NN,X = mean(dᵢᴺᴺ,X &lt; τ_X)。每帧、每层/head 独立计算，K/V 的近邻和阈值互不共享。范围 0～1，表示低于各自均值的比例；所有距离相等时（包括全零）分数为 0。只有一个 token 时分数未定义。</p>
+      <section id="uniquenessSection" class="uniqueness-section" hidden>
+        <div class="panel-heading"><div><h3>当前帧 · K/V 最近邻距离 空间热图</h3><p id="uniquenessStatus" class="muted" role="status" aria-live="polite"></p></div><div class="toolbar-actions"><a id="uniquenessDownloadPlot" class="text-button" download hidden>↓ 热图 PNG</a><a id="uniquenessDownloadData" class="text-button" download hidden>↓ Token uniqueness NPZ</a></div></div>
+        <div id="uniquenessControls" class="kv-controls"><label for="uniquenessLayer">热图模型层<select id="uniquenessLayer"></select></label><label for="uniquenessHead">热图 KV head<select id="uniquenessHead"></select></label><label for="uniquenessScale">热图色阶<select id="uniquenessScale"><option value="frame">0 到当前帧最大距离</option><option value="fixed">固定 0 到 2 · 超出饱和显示</option></select></label><label for="uniquenessOpacity">原图叠加透明度<input id="uniquenessOpacity" type="range" min="0" max="0.85" step="0.05" value="0.5"></label></div>
+        <div id="uniquenessLegend" class="uniqueness-legend" hidden><strong id="uniquenessFrameLabel"></strong><span>0 <i class="uniqueness-ramp"></i> <b id="uniquenessScaleMax"></b></span><span>灰色：未定义</span><span class="uniqueness-selected-label">青色实线：选中 token i</span><span class="uniqueness-nearest-label">紫色虚线：最近似其他 token j</span></div>
+        <div id="uniquenessMaps" class="uniqueness-maps" hidden>
+          <div><h4>原图 + K/V 最近邻距离</h4><div class="uniqueness-image-stage"><img id="uniquenessImage" alt="当前帧的 K/V 最近邻距离 叠加图"><svg id="uniquenessOverlay" aria-label="图片上的 token uniqueness 及最近似 token 位置"></svg></div></div>
+          <div><h4>K/V 最近邻距离 · Token 空间网格</h4><div class="uniqueness-plane"><canvas id="uniquenessCanvas" tabindex="0" aria-label="每格为一个 token 的 uniqueness，悬停读取，方向键选择 token"></canvas><svg id="uniquenessCursor" aria-hidden="true"></svg></div><p id="uniquenessGridLabel" class="muted"></p></div>
+        </div>
+        <div id="uniquenessReadout" class="spatial-readout" aria-live="polite" hidden></div>
+        <p class="tiny">热图显示所选 Key 或 Value 中每个 token 的最近邻归一化距离 dᵢᴺᴺ，越大越独特。Key 使用所选 RoPE 阶段；Value 使用原生缓存，两种阶段的 V 结果相同。距离非负，不限定在 0～2；固定色阶只将超过 2 的颜色饱和显示，读数保留原值。悬停查看 dᵢᴺᴺ、是否低于 τ 及最终 R_NN；点击或用方向键选择 token，可联动其他原图视图。</p>
+      </section>
+    </section>
     <section id="kvPanel" class="panel" hidden>
       <div class="panel-heading"><div><h2>逐帧 Key / Value magnitude</h2><p class="muted">Token × Channel × Absolute Value · 原生 KV cache，含该帧完整 token。</p></div><div class="toolbar-actions"><a id="kvDownloadPlot" class="text-button" download="kv-magnitude.png" hidden>↓ PNG</a><a id="kvDownloadData" class="text-button" download hidden>↓ K/V 数据</a></div></div>
       <div class="kv-controls"><label for="kvFrame">视频帧<select id="kvFrame"></select></label><label for="kvLayer">模型层 / 从 0 开始<select id="kvLayer"></select></label><label for="kvHead">KV head / 从 0 开始<select id="kvHead"></select></label><label for="kvElevation">俯仰角<select id="kvElevation"><option value="15">15°</option><option value="30" selected>30°</option><option value="45">45°</option><option value="60">60°</option><option value="75">75°</option></select></label><label for="kvAzimuth">方位角<select id="kvAzimuth"><option value="-135">−135°</option><option value="-90">−90°</option><option value="-60" selected>−60°</option><option value="-30">−30°</option><option value="0">0°</option><option value="45">45°</option><option value="90">90°</option><option value="135">135°</option></select></label><label class="check-label"><input id="kvSharedScale" type="checkbox"> K / V 共用高度与色阶</label></div>
@@ -50,9 +85,9 @@
       <p class="tiny">Key 为 RoPE 后的缓存，Value 为原始缓存；数值取逐元素绝对值，未做归一化、裁剪或降采样。此处独立选择单个模型层和原生 KV head，不使用跨层平均。热力图中 channel 从上到下递增；点击或用方向键选择 token，可联动定位原图。</p>
     </section>
     <section class="panel"><div class="panel-heading"><div><h2>实际采样帧 <span id="frameCount" class="count"></span></h2><p class="muted">按模型输入顺序排列；展示全部已处理帧。点击图片查看 token 位置与 mass 叠加图。</p></div></div><div id="frames" class="frame-grid"></div></section>
-    <section class="panel" id="tokensPanel" hidden><div class="panel-heading"><div><h2>历史 token 重要性</h2><p class="muted">包含提示词和所有视频 token；最后 32 个位置为灰色观察窗口。悬停读数，点击定位帧。</p></div><label class="check-label"><input id="logScale" type="checkbox" checked> 对数色阶</label></div><div class="token-scroll"><canvas id="tokenCanvas" aria-label="完整输入 token 重要性图"></canvas></div><div id="tokenHint" class="token-hint">—</div><details><summary>文本 token 明细</summary><div id="textTokens" class="text-tokens"></div></details></section>
+    <section class="panel" id="tokensPanel" hidden><div class="panel-heading"><div><h2>历史 token 重要性</h2><p id="windowTokenCaption" class="muted">包含提示词和所有视频 token；末尾观察窗口显示灰色。悬停读数，点击定位帧。</p></div><label class="check-label"><input id="logScale" type="checkbox" checked> 对数色阶</label></div><div class="token-scroll"><canvas id="tokenCanvas" aria-label="完整输入 token 重要性图"></canvas></div><div id="tokenHint" class="token-hint">—</div><details><summary>文本 token 明细</summary><div id="textTokens" class="text-tokens"></div></details></section>
   </div>
-  <section class="method"><div class="section-label">HOW TO READ / 计算口径</div><p><b>重要性 sᵢ</b>：最后 32 个 query 对 token i 的因果注意力，在 query 与 head 维度取平均。Softmax 分母包含全部可见 key，再取观察窗口之前的历史 token。全部层视图先平均各层的重要性。</p><div class="formula">M<sub>f</sub> = Σ<sub>i∈f</sub> sᵢ &nbsp; · &nbsp; pᵢ = sᵢ / M<sub>f</sub> &nbsp; · &nbsp; H<sub>f</sub> = −Σ pᵢ ln pᵢ &nbsp; · &nbsp; H̄<sub>f</sub> = H<sub>f</sub> / ln n<sub>f</sub></div><p>帧内重新归一化消除该帧总 mass 的缩放影响；熵越高，帧内分布越均匀。n<sub>f</sub> 为该帧参与评分的历史 token 数；0 mass 的熵记为未定义。这里展示聚合分布的熵，并非各 head 熵的平均。</p><p>采用完整因果 prefill 与模型原生位置编码。参考 <a href="https://github.com/FasterDecoding/SnapKV" target="_blank" rel="noreferrer">SnapKV 的窗口投票</a>，保留原始重要性，不执行 pooling 或 KV 淘汰。注意力仅作观察指标。</p></section>
+  <section class="method"><div class="section-label">HOW TO READ / 计算口径</div><p><b>原窗口重要性 sᵢ</b>：最后 <span id="methodWindowSize">32</span> 个 query 对 token i 的因果注意力，在 query 与 head 维度取平均。Softmax 分母包含全部可见 key，再取观察窗口之前的历史 token。全部层视图先平均各层的重要性。前后对照保留完整视频 token，不截去窗口。</p><div class="formula">M<sub>f</sub> = Σ<sub>i∈f</sub> sᵢ &nbsp; · &nbsp; pᵢ = sᵢ / M<sub>f</sub> &nbsp; · &nbsp; H<sub>f</sub> = −Σ pᵢ ln pᵢ &nbsp; · &nbsp; H̄<sub>f</sub> = H<sub>f</sub> / ln n<sub>f</sub></div><p>帧内重新归一化消除该帧总 mass 的缩放影响；熵越高，帧内分布越均匀。原窗口统计的 n<sub>f</sub> 为参与评分的历史 token 数，对照统计则使用该帧完整 token 数；0 mass 的熵记为未定义。这里展示聚合分布的熵，并非各 head 熵的平均。</p><p>采用完整因果 prefill 与模型原生位置编码。参考 <a href="https://github.com/FasterDecoding/SnapKV" target="_blank" rel="noreferrer">SnapKV 的窗口投票</a>，保留原始重要性，不执行 pooling 或 KV 淘汰。注意力仅作观察指标。</p></section>
   <footer>ReKV / RVS Attention Observatory <span id="runtime"></span></footer>
 </main>
 </body></html>

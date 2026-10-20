@@ -4,6 +4,103 @@ from pathlib import Path
 import numpy as np
 
 
+class PreRoPEKeyCapture:
+    """Capture actual Qwen2 k_proj outputs during the observation prefill only."""
+
+    def __init__(self, decoder, frames, directory, check_cancel=lambda: None, on_layer=lambda n, total: None):
+        self.decoder, self.frames, self.directory = decoder, frames, Path(directory)
+        self.check_cancel, self.on_layer = check_cancel, on_layer
+        self.handles, self.captured = [], set()
+        self.shape = self.source_dtype = self.storage_dtype = None
+        if not frames:
+            raise ValueError('Pre-RoPE Key capture requires video frames')
+        self.start, self.end = frames[0]['token_start'], frames[-1]['token_end']
+        self.tokens = frames[0]['token_end'] - self.start
+        if self.tokens < 1 or any(f['token_start'] != self.start + i * self.tokens or
+                                 f['token_end'] != self.start + (i + 1) * self.tokens
+                                 for i, f in enumerate(frames)):
+            raise ValueError('Video frame token ranges must be contiguous and equal-sized')
+
+    def __enter__(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            for index, layer in enumerate(self.decoder.layers):
+                attention = layer.self_attn
+                if attention.config.model_type != 'qwen2' or hasattr(attention, 'k_norm'):
+                    raise ValueError('Pre-RoPE capture supports Qwen2 k_proj followed directly by RoPE')
+                heads, channels = attention.config.num_key_value_heads, attention.head_dim
+
+                def capture(module, inputs, output, index=index, heads=heads, channels=channels):
+                    self._save_layer(index, heads, channels, output)
+                    # A forward hook must return None to preserve the model's output.
+
+                self.handles.append(attention.k_proj.register_forward_hook(capture))
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        return False
+
+    def _save_layer(self, index, heads, channels, output):
+        self.check_cancel()
+        if index in self.captured:
+            raise ValueError('Pre-RoPE Key layer was captured more than once during the prefill')
+        if output.ndim != 3 or output.shape[0] != 1 or output.shape[-1] != heads * channels or self.end > output.shape[1]:
+            raise ValueError('Invalid k_proj output shape or video token range')
+        shape = (len(self.frames), heads, self.tokens, channels)
+        source_dtype = str(output.dtype).removeprefix('torch.')
+        storage_dtype = np.dtype('float16' if source_dtype == 'float16' else 'float32')
+        if self.shape is not None and (shape != self.shape or source_dtype != self.source_dtype):
+            raise ValueError('Pre-RoPE Key shapes or dtypes differ between decoder layers')
+        self.shape, self.source_dtype, self.storage_dtype = shape, source_dtype, storage_dtype
+        selected = output.detach()[0, self.start:self.end].cpu()
+        if source_dtype != 'float16':
+            selected = selected.float()
+        array = selected.numpy().reshape(shape[0], shape[2], shape[1], shape[3]).transpose(0, 2, 1, 3)
+        if not np.isfinite(array).all():
+            raise ValueError('Non-finite pre-RoPE Key states')
+        temporary = self.directory / f'layer-{index:03d}.tmp'
+        try:
+            with temporary.open('wb') as stream:
+                np.save(stream, array, allow_pickle=False)
+            self.check_cancel()
+            temporary.replace(self.directory / f'layer-{index:03d}.npy')
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.captured.add(index)
+        self.on_layer(len(self.captured), len(self.decoder.layers))
+
+    def manifest(self):
+        if len(self.captured) != len(self.decoder.layers):
+            raise ValueError('Some decoder layers did not produce pre-RoPE Key states')
+        return dict(layers=len(self.captured), frames=self.shape[0], kv_heads=self.shape[1],
+                    tokens_per_frame=self.shape[2], channels=self.shape[3], source_dtype=self.source_dtype,
+                    storage_dtype=str(self.storage_dtype), storage_layout=['frame', 'kv_head', 'token', 'channel'],
+                    stored_values='signed native Key projection output; no GQA repetition',
+                    capture_point='Qwen2Attention.k_proj output, before reshape/transpose and apply_rotary_pos_emb',
+                    snapshot_phase='observation prefill, before answer generation',
+                    key_position='pre-RoPE', includes_window_tokens=True, includes_text_tokens=False,
+                    layer_indices='zero-based', head_indices='native KV heads, zero-based',
+                    data_bytes=int(np.prod(self.shape)) * self.storage_dtype.itemsize * len(self.captured))
+
+
+def read_pre_rope_key_slice(directory, manifest, layer, frame, head):
+    for value, size, label in [(layer, manifest['layers'], 'layer'), (frame, manifest['frames'], 'frame'),
+                               (head, manifest['kv_heads'], 'KV head')]:
+        if type(value) is not int or not 0 <= value < size:
+            raise ValueError(f'Invalid {label} index')
+    array = np.load(Path(directory) / f'layer-{layer:03d}.npy', mmap_mode='r', allow_pickle=False)
+    expected = (manifest['frames'], manifest['kv_heads'], manifest['tokens_per_frame'], manifest['channels'])
+    if manifest.get('key_position') != 'pre-RoPE' or array.shape != expected:
+        raise ValueError('Stored pre-RoPE Key shape or stage does not match the snapshot metadata')
+    return np.array(array[frame, head], dtype=np.float32, copy=True)
+
+
 def save_kv_snapshot(cache, frames, directory, check_cancel=lambda: None, on_layer=lambda n, total: None):
     """Persist native, unexpanded KV heads as [K/V, frame, head, token, channel]."""
     directory = Path(directory)

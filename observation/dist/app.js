@@ -32,6 +32,9 @@ async function cancelPrevious() {
 }
 function clearResults() {
   window.kvViewer.reset();
+  window.comparisonViewer.reset();
+  window.vendiViewer.reset();
+  window.uniquenessViewer.reset();
   state.result = null;
   state.selected = 0;
   state.selectedToken = 0;
@@ -43,6 +46,15 @@ function clearResults() {
   $('cancel').hidden = true;
   $('run').disabled = false;
   $('runtime').textContent = '';
+  updateWindowLabels();
+}
+function updateWindowLabels() {
+  const n = $('videoWindowSize').value || 'N';
+  $('mode').options[0].textContent = `视频编码末尾 ${n} token`;
+  const active = state.result?.sequence.window_size ?? ($('mode').value === 'video' ? n : 32);
+  $('windowBadge').textContent = `${active} TOKEN WINDOW`;
+  $('methodWindowSize').textContent = active;
+  $('windowTokenCaption').textContent = `包含提示词和所有视频 token；最后 ${active} 个位置为灰色观察窗口。悬停读数，点击定位帧。`;
 }
 function fillSamples() {
   $('sample').replaceChildren();
@@ -87,7 +99,8 @@ async function loadSample(auto = true) {
 function parameters() {
   return {sample_id: $('sample').value, max_frames: Number($('maxFrames').value),
     sample_fps: Number($('fps').value), start_time: Number($('startTime').value),
-    mode: $('mode').value, question_index: Number($('question').value), max_new_tokens: Number($('maxAnswerTokens').value)};
+    mode: $('mode').value, question_index: Number($('question').value), max_new_tokens: Number($('maxAnswerTokens').value),
+    video_window_size: Number($('videoWindowSize').value)};
 }
 async function run() {
   if (!state.record || !$('controls').reportValidity()) return;
@@ -149,7 +162,7 @@ function renderSummary(sampling) {
   const result = state.result, view = currentView();
   $('summary').replaceChildren(
     metricCard('实际处理帧', sampling.processed_frames, `${fmt(sampling.first_timestamp, 1)}–${fmt(sampling.last_timestamp, 1)} 秒 · ${sampling.truncated ? '已限制帧数' : '已到视频末尾'}`),
-    metricCard('历史 / 观察 token', result ? `${result.sequence.prefix_tokens} / 32` : '—', result ? `每帧 ${result.sequence.tokens_per_frame} 个 token` : '正在提取视频特征'),
+    metricCard('历史 / 观察 token', result ? `${result.sequence.prefix_tokens} / ${result.sequence.window_size}` : '—', result ? `每帧 ${result.sequence.tokens_per_frame} 个 token` : '正在提取视频特征'),
     metricCard('历史视频 attention mass', view ? pct(view.video_mass) : '—', view ? `历史文本 ${pct(view.text_mass)} · 窗口 ${pct(view.window_mass)}` : '完整因果注意力'),
     metricCard('帧内归一化熵 / 均值', view ? fmt(mean(view.frames.map(frame => frame.normalized_entropy))) : '—', '0 集中 ← 分布 → 均匀 1')
   );
@@ -164,7 +177,7 @@ function renderResult(url, cached) {
     token_layout: {prompt_tokens: result.sequence.prompt_tokens, video_tokens: result.sequence.video_tokens,
       total_tokens: result.sequence.total_tokens, window: [result.sequence.window_start, result.sequence.window_end]}, method: result.method,
     spatial: {...result.spatial, cells: `${result.spatial.cells.length} cells; full coordinates in JSON`},
-    answer: result.answer, kv_snapshot: result.kv_snapshot}, null, 2);
+    answer: result.answer, kv_snapshot: result.kv_snapshot, pre_rope_key_snapshot: result.pre_rope_key_snapshot}, null, 2);
   $('layer').replaceChildren(node('option', '', '全部层平均'));
   $('layer').options[0].value = 'all';
   result.views.slice(1).forEach(view => {
@@ -178,6 +191,10 @@ function renderResult(url, cached) {
   $('runtime').textContent = `torch ${result.model.versions.torch} / transformers ${result.model.versions.transformers}`;
   renderAnswer();
   window.kvViewer.configure(result);
+  window.comparisonViewer.configure(result);
+  window.vendiViewer.configure(result);
+  window.uniquenessViewer.configure(result);
+  updateWindowLabels();
   renderView();
 }
 function renderAnswer() {
@@ -197,6 +214,7 @@ function renderView() {
   renderMassDistribution();
   renderDetail();
   renderTokens();
+  window.comparisonViewer.render($('layer').value);
   const text = $('textTokens'); text.replaceChildren();
   result.sequence.text_tokens.forEach(token => {
     const item = node('div', 'text-token', token.text);
@@ -228,6 +246,8 @@ function selectFrame(index, scroll = false, tokenIndex = null) {
   document.querySelectorAll('.frame-card').forEach(card => card.classList.toggle('selected', Number(card.dataset.index) === index));
   renderCharts(); renderMassDistribution(); renderDetail();
   window.kvViewer.selectFrame(index, state.selectedToken);
+  window.vendiViewer.selectFrame(index);
+  window.uniquenessViewer.selectFrame(index, state.selectedToken);
   if (scroll) $('detailPanel').scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 function svgNode(tag, attributes, text) {
@@ -404,6 +424,8 @@ function activateToken(index) {
   $('spatialReadout').textContent = `token #${position} · 帧内 #${index} · 行 ${cell.row + 1} / 列 ${cell.col + 1} · 原图区域 [${bounds.join(', ')}] px\n${detail}`;
   $('heatmapHint').textContent = `#${position} · 行 ${cell.row + 1} / 列 ${cell.col + 1}${score === undefined ? ' · 观察窗口' : ''}`;
   window.kvViewer.highlightToken(state.selected, index);
+  window.comparisonViewer.highlightToken(state.selected, index);
+  window.uniquenessViewer.highlightToken(state.selected, index);
 }
 function tokenDescription(index, view) {
   const frame = state.result.frames.find(f => index >= f.token_start && index < f.token_end);
@@ -449,7 +471,7 @@ $('controls').addEventListener('submit', event => { event.preventDefault(); run(
 $('split').addEventListener('change', () => { fillSamples(); $('startTime').value = 0; loadSample(); });
 $('sample').addEventListener('change', () => { $('startTime').value = 0; loadSample(); });
 $('question').addEventListener('change', () => { showQuestion(); if ($('autoRun').checked) run(); else invalidate(); });
-['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens'].forEach(id => $(id).addEventListener('change', invalidate));
+['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));
@@ -468,6 +490,8 @@ async function init() {
     $('modelInfo').textContent = `${state.config.model_path.split('/').pop()} · ${state.config.device}`;
     $('maxFrames').max = state.config.max_frames;
     $('maxFrames').value = Math.min(8, state.config.max_frames);
+    $('videoWindowSize').value = state.config.default_video_window_size ?? 32;
+    updateWindowLabels();
     if (!state.samples.length) throw new Error('RVS 数据集中没有样本');
     $('split').value = state.samples[0].split;
     fillSamples(); await loadSample(false);

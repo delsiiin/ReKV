@@ -27,7 +27,8 @@ TERMINAL = {'complete', 'failed', 'cancelled'}
 def validate_params(raw, dataset, max_frames):
     if not isinstance(raw, dict):
         raise ValueError('Expected a JSON object')
-    allowed = {'sample_id', 'max_frames', 'sample_fps', 'start_time', 'mode', 'question_index', 'max_new_tokens'}
+    allowed = {'sample_id', 'max_frames', 'sample_fps', 'start_time', 'mode', 'question_index',
+               'max_new_tokens', 'video_window_size'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -45,13 +46,17 @@ def validate_params(raw, dataset, max_frames):
     mode = raw.get('mode', 'video')
     if mode not in ('video', 'question'):
         raise ValueError('mode must be video or question')
+    video_window = raw.get('video_window_size', 32)
+    if type(video_window) is not int or video_window < 1:
+        raise ValueError('video_window_size must be a positive integer')
     fps, start = raw.get('sample_fps', 0.5), raw.get('start_time', 0)
     if type(fps) not in (int, float) or not math.isfinite(fps) or not 0 < fps <= 1:
         raise ValueError('sample_fps must be in (0, 1] for this RVS experiment')
     if type(start) not in (int, float) or not math.isfinite(start) or start < 0:
         raise ValueError('start_time must be a finite nonnegative number')
     return dict(sample_id=sample_id, max_frames=frames, sample_fps=float(fps),
-                start_time=float(start), mode=mode, question_index=question, max_new_tokens=max_new_tokens)
+                start_time=float(start), mode=mode, question_index=question, max_new_tokens=max_new_tokens,
+                video_window_size=video_window)
 
 
 class ObservationService:
@@ -152,7 +157,7 @@ class ObservationService:
                 self.engine = ObservationEngine(self.args.model_path, self.args.device, self.args.dtype)
             result = self.engine.observe(images, frames, record, params, progress, check_cancel, artifact_dir=directory)
             result['kv_snapshot']['api_base'] = f'/api/kv/{job_id}'
-            result.update(schema_version=3, job_id=job_id, sample=record, parameters=params,
+            result.update(schema_version=14, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'
@@ -191,6 +196,23 @@ class ObservationService:
         pair = read_kv_slice(directory / 'kv', result['kv_snapshot'], layer, frame, head)
         return result, pair
 
+    def key_data(self, job_id, layer, frame, head, position='post'):
+        from observation.kv import read_pre_rope_key_slice
+        from observation.vendi import KEY_POSITIONS
+        if position not in KEY_POSITIONS:
+            raise ValueError('Key position must be pre or post')
+        if position == 'post':
+            result, pair = self.kv_data(job_id, layer, frame, head)
+            return result, pair[0], pair[1], KEY_POSITIONS[position]
+        directory = self.cache / job_id
+        result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
+        manifest = result.get('pre_rope_key_snapshot')
+        if manifest is None:
+            raise ValueError('This result has no captured pre-RoPE Key states; regenerate observation data')
+        key = read_pre_rope_key_slice(directory / 'key_pre_rope', manifest, layer, frame, head)
+        _, pair = self.kv_data(job_id, layer, frame, head)
+        return result, key, pair[1], KEY_POSITIONS[position]
+
 
 def handler_for(service):
     class Handler(BaseHTTPRequestHandler):
@@ -224,13 +246,87 @@ def handler_for(service):
                 if path == '/api/config':
                     return self.send_json(dict(model_path=str(Path(service.args.model_path).resolve()),
                                                device=service.args.device, max_frames=service.args.max_frames,
-                                               data_root=str(service.dataset.root), window_size=32))
+                                               data_root=str(service.dataset.root), window_size=32,
+                                               default_video_window_size=32))
                 if path == '/api/samples':
                     return self.send_json(service.dataset.summaries())
                 if path.startswith('/api/samples/'):
                     return self.send_json(service.dataset.get(path.removeprefix('/api/samples/')))
                 if path.startswith('/api/jobs/'):
                     return self.send_json(service.get_job(path.removeprefix('/api/jobs/')))
+                match = re.fullmatch(r'/api/uniqueness/([a-f0-9]{24})/distribution\.png', path)
+                if match:
+                    from observation.vendi import KEY_POSITIONS, METRIC, render_scores, selected_scores, validate_state
+                    result = json.loads((service.cache / match[1] / 'result.json').read_text(encoding='utf-8'))
+                    query = parse_qs(parsed.query)
+                    state = query.get('state', ['key'])[0]
+                    validate_state(state)
+                    position = query.get('position', ['post'])[0]
+                    if position not in KEY_POSITIONS:
+                        raise ValueError('Key position must be pre or post')
+                    metric = result.get('uniqueness_pre_rope' if position == 'pre' else 'uniqueness', {})
+                    if metric.get('metric') != METRIC or metric.get('key_position') != KEY_POSITIONS[position]:
+                        raise ValueError(f'This result has no current {KEY_POSITIONS[position]} uniqueness score; regenerate observation data')
+                    layer, head = (query.get(name, ['all'])[0] for name in ('layer', 'head'))
+                    layer, head = (None if index == 'all' else int(index) for index in (layer, head))
+                    frame = int(query.get('frame', ['0'])[0])
+                    selected_scores(metric, layer, head, state)
+                    if not 0 <= frame < metric['frames']:
+                        raise ValueError('Invalid uniqueness frame index')
+                    cache_tag = f'{METRIC}-{state}-mean-eps{metric["epsilon"]}'
+                    target = service.cache / match[1] / 'uniqueness' / position / cache_tag / f'layer-{layer}-head-{head}-frame-{frame}.png'
+                    with service.plot_lock:
+                        if not target.is_file():
+                            render_scores(metric, result['frames'], target, layer=layer, head=head, frame=frame, state=state)
+                    return self.send_file(target, 'image/png')
+                match = re.fullmatch(r'/api/uniqueness/([a-f0-9]{24})/(\d+)/(\d+)/(\d+)/(data\.json|map\.png|tensor\.npz)', path)
+                if match:
+                    from observation.vendi import (METRIC, DEFAULT_EPSILON, uniqueness_payload,
+                                                   uniqueness_stats, render_uniqueness_map, validate_state)
+                    job_id, layer, frame, head, filename = match.groups()
+                    layer, frame, head = int(layer), int(frame), int(head)
+                    query = parse_qs(parsed.query)
+                    state = query.get('state', ['key'])[0]
+                    validate_state(state)
+                    position = query.get('position', ['post'])[0]
+                    result, key, value, key_position = service.key_data(job_id, layer, frame, head, position)
+                    vectors = key if state == 'key' else value
+                    metric = result.get('uniqueness_pre_rope' if position == 'pre' else 'uniqueness', {})
+                    options = dict(epsilon=metric['epsilon'] if metric.get('metric') == METRIC else DEFAULT_EPSILON)
+                    cache_tag = f'{METRIC}-{state}-mean-eps{options["epsilon"]}'
+                    token_start = result['frames'][frame]['token_start']
+                    if filename == 'data.json':
+                        return self.send_json(uniqueness_payload(
+                            vectors, state=state, layer=layer, frame=frame, head=head, token_start=token_start,
+                            spatial=result.get('spatial'), key_position=key_position, **options))
+                    if filename == 'map.png':
+                        scale = query.get('scale', ['frame'])[0]
+                        if scale not in ('frame', 'fixed'):
+                            raise ValueError('Invalid uniqueness color scale')
+                        target = service.cache / job_id / 'uniqueness' / position / cache_tag / 'maps' / f'layer-{layer}-frame-{frame}-head-{head}-{scale}.png'
+                        with service.plot_lock:
+                            if not target.is_file():
+                                render_uniqueness_map(vectors, target, state=state, layer=layer, frame=frame, head=head,
+                                                      spatial=result.get('spatial'), scale=scale, key_position=key_position, **options)
+                        return self.send_file(target, 'image/png')
+                    import io
+                    statistics = uniqueness_stats(vectors, **options)
+                    output = io.BytesIO()
+                    np.savez_compressed(
+                        output, **{name: (np.nan if val is None else val) for name, val in statistics.items()
+                                   if name != 'undefined_reason'},
+                        undefined_reason=statistics['undefined_reason'] or '',
+                        token_positions=np.arange(token_start, token_start + len(key)), layer=layer, frame=frame,
+                        kv_head=head, state=state, key_position=key_position, excludes_self=True, score_units='ratio', metric=METRIC)
+                    content = output.getvalue()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/octet-stream')
+                    self.send_header('Content-Disposition',
+                                     f'attachment; filename="uniqueness-{state}-{position}-layer{layer}-frame{frame}-head{head}.npz"')
+                    self.send_header('Content-Length', str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
                 match = re.fullmatch(r'/api/kv/([a-f0-9]{24})/(\d+)/(\d+)/(\d+)/(data\.json|surface\.png|tensor\.npz)', path)
                 if match:
                     from observation.kv import magnitude_payload, render_kv_surface
@@ -274,6 +370,9 @@ def handler_for(service):
                 static = {'/': ('index.html', 'text/html; charset=utf-8'),
                           '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
                           '/kv.js': ('kv.js', 'application/javascript; charset=utf-8'),
+                          '/comparison.js': ('comparison.js', 'application/javascript; charset=utf-8'),
+                          '/vendi.js': ('vendi.js', 'application/javascript; charset=utf-8'),
+                          '/uniqueness.js': ('uniqueness.js', 'application/javascript; charset=utf-8'),
                           '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if path in static:
                     filename, mime = static[path]
@@ -338,7 +437,7 @@ def main():
     service = ObservationService(args)
     server = ThreadingHTTPServer((args.host, args.port), handler_for(service))
     print(f'RVS attention observation: http://{args.host}:{args.port}', flush=True)
-    print(f'{len(service.dataset.records)} samples | {args.device} | window=32 | cache={service.cache}', flush=True)
+    print(f'{len(service.dataset.records)} samples | {args.device} | default video window=32 | cache={service.cache}', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

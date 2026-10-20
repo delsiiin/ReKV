@@ -7,9 +7,11 @@ import time
 import numpy as np
 import torch
 
-from observation.metrics import WINDOW_SIZE, build_views, window_importance
+from observation.metrics import (WINDOW_SIZE, build_views, build_comparison, query_importance,
+                                 window_importance, validate_video_window)
 from observation.spatial import video_token_layout
-from observation.kv import save_kv_snapshot
+from observation.kv import PreRoPEKeyCapture, save_kv_snapshot
+from observation.vendi import score_snapshot
 
 
 INIT_PROMPT = '<|im_start|>system \nYou are a helpful assistant.<|im_end|><|im_start|>user '
@@ -41,7 +43,26 @@ def greedy_token_ids(decoder, lm_head, output, max_new_tokens, stop_token_ids,
     return generated, 'max_new_tokens'
 
 
-def install_observer(decoder, callback):
+def question_inputs(tokenizer, question, offset):
+    """Tokenize the exact suffix once; select tokens overlapping the question body."""
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Question body must contain at least one non-whitespace token")
+    suffix = f'\n{question}<|im_end|><|im_start|>assistant\n'
+    encoded = tokenizer(suffix, return_tensors='pt', return_offsets_mapping=True)
+    spans = encoded.offset_mapping[0].tolist()
+    selected = [i for i, (start, end) in enumerate(spans)
+                if end > 1 and start < 1 + len(question) and end > start]
+    if not selected:
+        raise ValueError("Question body did not produce any query tokens")
+    ids = encoded.input_ids[0].tolist()
+    tokens = [dict(position=offset + i, token_id=ids[i], text=tokenizer.decode([ids[i]]),
+                   char_start=spans[i][0] - 1, char_end=spans[i][1] - 1) for i in selected]
+    return encoded.input_ids, dict(kind='question_body', positions=[offset + i for i in selected],
+                                   count=len(selected), tokens=tokens, text=question)
+
+
+def install_observer(decoder, callback, *, window=WINDOW_SIZE, selections=None,
+                     check_cancel=lambda: None):
     """Dispatch post-RoPE Q/K to the observer, preserving native SDPA outputs."""
     from transformers import AttentionInterface
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -50,8 +71,22 @@ def install_observer(decoder, callback):
     def attention(module, query, key, value, attention_mask, **kwargs):
         if kwargs.get('sliding_window') is not None:
             raise ValueError("This experiment requires full causal attention")
-        module._rvs_observer(module.layer_idx, window_importance(
-            query, key, scaling=kwargs.get('scaling'), attention_mask=attention_mask))
+        check_cancel()
+        if selections is None:
+            scores = window_importance(query, key, scaling=kwargs.get('scaling'),
+                                       attention_mask=attention_mask, window=window)
+        else:
+            scores = {}
+            # Reuse coincident selections (legacy video window == comparison before).
+            computed = {}
+            for name, positions in selections.items():
+                indices = tuple(positions)
+                if indices not in computed:
+                    computed[indices] = query_importance(
+                        query, key, indices, scaling=kwargs.get('scaling'),
+                        attention_mask=attention_mask, check_cancel=check_cancel)
+                scores[name] = computed[indices]
+        module._rvs_observer(module.layer_idx, scores)
         return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
 
     AttentionInterface.register(ATTENTION_NAME, attention)
@@ -121,6 +156,9 @@ class ObservationEngine:
             features.append(output.pooler_output.to(device))
             del output, pixels
         video_features = torch.cat(features, dim=1)
+        video_window = validate_video_window(params.get('video_window_size', WINDOW_SIZE),
+                                             video_features.shape[1])
+        video_end = prefix.shape[1] + video_features.shape[1]
         if video_features.shape[1] % len(frames):
             raise ValueError("Video features do not divide evenly into frames")
         tokens_per_frame = video_features.shape[1] // len(frames)
@@ -135,8 +173,8 @@ class ObservationEngine:
                             text=processor.tokenizer.decode([int(token_id)]), kind='prompt')
                        for i, token_id in enumerate(prefix_ids[0])]
         question = record['conversations'][params['question_index']]['question']
-        suffix_text = f'\n{question}<|im_end|><|im_start|>assistant\n'
-        suffix_ids = processor.tokenizer(suffix_text, return_tensors='pt').input_ids.to(device)
+        suffix_ids, question_queries = question_inputs(processor.tokenizer, question, video_end)
+        suffix_ids = suffix_ids.to(device)
         if params['mode'] == 'question':
             offset = prefix.shape[1] + video_features.shape[1]
             text_tokens.extend(dict(position=offset + i, token_id=int(token_id),
@@ -151,20 +189,43 @@ class ObservationEngine:
         answer_input_length = length + (suffix_ids.shape[1] if params['mode'] == 'video' else 0)
         if answer_input_length >= limit:
             raise ValueError(f'Question input has {answer_input_length} tokens; reduce max_frames to leave generation space')
-        prefix_length = length - WINDOW_SIZE
+        window = video_window if params['mode'] == 'video' else WINDOW_SIZE
+        prefix_length = length - window
         scores = [None] * len(decoder.layers)
+        before_scores = [None] * len(decoder.layers)
+        after_scores = [None] * len(decoder.layers)
+        before_positions = list(range(video_end - video_window, video_end))
+        queries = dict(
+            before=dict(kind='video_tail', positions=before_positions, count=video_window,
+                        tokens=[dict(position=i, frame_index=(i - prefix.shape[1]) // tokens_per_frame,
+                                     frame_token=(i - prefix.shape[1]) % tokens_per_frame)
+                                for i in before_positions]),
+            after=question_queries,
+        )
 
-        def capture(layer, score):
+        def capture(layer, captured):
             check_cancel()
-            scores[layer] = score
+            scores[layer] = captured['legacy']
+            before_scores[layer] = captured['before'][:video_end]
+            if 'after' in captured:
+                after_scores[layer] = captured['after']
             progress('attention', f'计算注意力：第 {layer + 1}/{len(scores)} 层',
                      0.48 + 0.23 * (layer + 1) / len(scores))
 
-        cleanup = install_observer(decoder, capture)
+        selections = dict(legacy=range(prefix_length, length), before=before_positions)
+        if params['mode'] == 'question':
+            selections['after'] = question_queries['positions']
+        pre_rope_capture = PreRoPEKeyCapture(
+            decoder, frames, Path(artifact_dir) / 'key_pre_rope', check_cancel,
+            lambda layer, total: progress('pre_rope_key', f'保存 RoPE 前 Key：第 {layer}/{total} 层',
+                                          0.48 + .23 * (layer - 1) / total))
+        cleanup = install_observer(decoder, capture, selections=selections, check_cancel=check_cancel)
         try:
-            prefill = decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
+            with pre_rope_capture:
+                prefill = decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
         finally:
             cleanup()
+        pre_rope_key_snapshot = pre_rope_capture.manifest()
         check_cancel()
         if any(score is None for score in scores):
             raise RuntimeError("Some decoder layers did not produce observation scores")
@@ -172,12 +233,26 @@ class ObservationEngine:
             prefill.past_key_values, frames, Path(artifact_dir) / 'kv', check_cancel,
             lambda layer, total: progress('kv_snapshot', f'保存逐帧 K/V：第 {layer}/{total} 层',
                                           0.71 + .06 * layer / total))
-        observation_elapsed = time.monotonic() - began
-        progress('answer', '基于同一批视频帧和所选问题生成回答', 0.78)
-        answer_started = time.monotonic()
         if params['mode'] == 'video':
-            prefill = decoder(input_ids=suffix_ids, past_key_values=prefill.past_key_values,
-                              use_cache=True, return_dict=True)
+            def capture_question(layer, captured):
+                check_cancel()
+                after_scores[layer] = captured['after']
+                progress('question_attention', f'问题正文注意力：第 {layer + 1}/{len(scores)} 层',
+                         0.77 + .05 * (layer + 1) / len(scores))
+
+            cleanup = install_observer(
+                decoder, capture_question, selections=dict(after=question_queries['positions']),
+                check_cancel=check_cancel)
+            try:
+                prefill = decoder(input_ids=suffix_ids, past_key_values=prefill.past_key_values,
+                                  use_cache=True, return_dict=True)
+            finally:
+                cleanup()
+        if any(score is None for score in before_scores + after_scores):
+            raise RuntimeError("Some decoder layers did not produce comparison scores")
+        observation_elapsed = time.monotonic() - began
+        progress('answer', '基于同一批视频帧和所选问题生成回答', 0.82)
+        answer_started = time.monotonic()
         requested_tokens = params['max_new_tokens']
         budget = min(requested_tokens, limit - answer_input_length)
         stop_ids = model.generation_config.eos_token_id
@@ -187,7 +262,7 @@ class ObservationEngine:
 
         def on_token(count):
             if count == 1 or count % 8 == 0:
-                progress('answer', f'生成模型回答：{count}/{budget} token', 0.78 + 0.19 * count / budget)
+                progress('answer', f'生成模型回答：{count}/{budget} token', 0.82 + 0.15 * count / budget)
 
         answer_ids, finish_reason = greedy_token_ids(
             decoder, model.lm_head, prefill, budget, stop_ids, check_cancel, on_token)
@@ -202,25 +277,37 @@ class ObservationEngine:
                       elapsed_seconds=time.monotonic() - answer_started,
                       context='same selected video frames + selected question; reference answer is not an input')
         check_cancel()
+        progress('uniqueness', '计算逐帧 K/V 最近邻冗余比例 R_NN', 0.97)
+        uniqueness = score_snapshot(
+            Path(artifact_dir) / 'kv', kv_snapshot, check_cancel,
+            lambda layer, total: progress('uniqueness', f'计算 RoPE 后 uniqueness：第 {layer}/{total} 层',
+                                          0.97 + .005 * layer / total))
+        uniqueness_pre_rope = score_snapshot(
+            Path(artifact_dir) / 'key_pre_rope', pre_rope_key_snapshot, check_cancel,
+            lambda layer, total: progress('uniqueness', f'计算 RoPE 前 uniqueness：第 {layer}/{total} 层',
+                                          0.975 + .005 * layer / total))
         progress('statistics', '计算帧内条件熵并保存结果与模型回答', 0.98)
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         result = dict(
             sequence=dict(total_tokens=length, prefix_tokens=prefix_length,
                           prompt_tokens=prefix.shape[1], video_tokens=video_features.shape[1],
                           tokens_per_frame=tokens_per_frame, grid_size=grid if grid * grid == tokens_per_frame else None,
-                          window_start=prefix_length, window_end=length, window_size=WINDOW_SIZE,
+                          window_start=prefix_length, window_end=length, window_size=window,
                           text_tokens=text_tokens),
             model=dict(path=self.model_path, dtype=self.dtype_name, device=self.device,
                        layers=len(scores), heads=decoder.config.num_attention_heads,
                        kv_heads=decoder.config.num_key_value_heads, context_limit=limit, versions=versions),
             method=dict(attention='full causal prefill, native RoPE, no KV eviction',
-                        aggregation='mean over the last 32 queries and attention heads; all = mean over layers',
+                        aggregation=f'mean over the last {window} queries and attention heads; all = mean over layers',
                         importance='softmax over every causally visible key, then retain keys before the window',
                         entropy='p_i = s_i / sum_frame(s); H = -sum(p_i * ln(p_i)); H_norm = H / ln(scored_tokens)',
                         pooling=False, frames_include_window_tokens=True,
                         reference='https://github.com/FasterDecoding/SnapKV'),
             frames=frames, spatial=spatial, answer=answer, kv_snapshot=kv_snapshot,
+            uniqueness=uniqueness, uniqueness_pre_rope=uniqueness_pre_rope,
+            pre_rope_key_snapshot=pre_rope_key_snapshot,
             views=build_views(np.stack(scores), frames, prefix_length),
+            attention_comparison=build_comparison(before_scores, after_scores, frames, queries),
             observation_elapsed_seconds=observation_elapsed,
             elapsed_seconds=time.monotonic() - began,
         )

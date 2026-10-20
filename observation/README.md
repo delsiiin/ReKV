@@ -24,15 +24,20 @@ ssh -L 8765:127.0.0.1:8765 user@server
 ```
 
 页面支持：切换 RVS 分组和视频、查看全部问题与原始标注、设置最大帧数 / 采样 FPS /
-起始时间、生成或取消计算、切换观察层、查看逐帧图片 / mass / 熵和 token 热力图、
+起始时间 / 视频末尾 token 数 N、生成或取消计算、切换观察层、查看逐帧图片 / mass / 熵和 token 热力图、
 在原图上定位 token、比较 attention mass 分布、生成所选问题的模型回答、
+查看选中帧全部 token 在问题前 / 问题后及其差值的热图与原图叠加、
 查看逐帧 K/V 在 token × channel 上的 magnitude 三维曲面与热力图、
+查看 RoPE 前/后逐帧 K/V 最近邻冗余比例的层/head 分布、
+查看每帧 K/V 最近邻距离空间热图与原图叠加、
 下载完整 JSON 和当前层帧统计 CSV。首次打开需点击「生成观察数据」；之后切换样本
 默认自动计算，可关闭自动计算选项。参数变更后需点击生成按钮。
 
 ## 输入与采样
 
-- 默认：与 ReKV 相同的初始化提示词 + 视频特征，末尾 32 个**视频 token**作为 query 窗口。
+- 默认：与 ReKV 相同的初始化提示词 + 视频特征，末尾 N 个**视频 token**作为 query 窗口，N 默认 32。
+  可在页面“视频末尾 token 数 N”修改；窗口为整个视频序列的连续后缀，允许跨帧。
+  N 必须是正整数且不超过实际视频 token 总数，超过时报错，不自动截断。
   所选问题不进入默认注意力观察输入；完成观察后追加问题生成回答。参考答案只用于对照展示。
 - 可选：初始化提示词 + 视频特征 + ReKV 问题模板，取整个输入最后 32 个 token。
   短问题可能导致窗口同时包含视频和文本；可从完整 token 图和 JSON 查看确切范围。
@@ -97,11 +102,135 @@ JSON 的 `kv_snapshot` 记录维度、dtype、采集阶段、磁盘数据大小�
 7B FP16 模型约每帧占用 10.7 MiB（8 帧约 85.8 MiB）；快照保存在已有结果缓存目录。
 旧版本结果不含 K/V 快照，更新服务后重新生成即可。
 
+## 逐帧 Key / Value 独立最近邻比例 R_NN
+
+对同一帧、同一层、同一原生 KV head 的有符号 K/V，使用全部帧内视频 token
+（含观察窗口），排除提示词、问题及回答，不展开 GQA。每个切片独立计算：
+
+```text
+s_K = sqrt(mean_i(||k_i||_2^2)) + epsilon
+s_V = sqrt(mean_i(||v_i||_2^2)) + epsilon
+d^NN,K_i = min_{j != i} ||k_i - k_j||_2 / s_K
+d^NN,V_i = min_{j != i} ||v_i - v_j||_2 / s_V
+tau_K = mean_i(d^NN,K_i)
+tau_V = mean_i(d^NN,V_i)
+R_NN,K = mean_i(d^NN,K_i < tau_K)
+R_NN,V = mean_i(d^NN,V_i < tau_V)
+```
+
+Key 和 Value 各自计算最近邻距离，并以各自当前帧、当前层/head 内的距离均值作为阈值。
+默认 `epsilon=1e-8`，加在平方根外；离线命令支持 `--epsilon`。阈值自动计算，不提供固定 τ 参数。
+K、V 分别使用当前帧全部 token 的 RMS 范数作尺度，不逐 token 归一化，因此保留幅值差异。
+K、V 独立寻找最近邻，分别保存最近邻索引、阈值和分数，不合并两种距离。
+明确排除自身，距离相同时取最先达到最小值的帧内索引。阈值采用严格小于，等于 τ 不计入冗余。
+
+最终分数是 `[0,1]` 内最近邻距离**严格低于本切片均值**的 token 比例，描述距离分布的相对关系，
+不能单凭该比例判断绝对冗余程度。分数不使用 Shannon 熵，也不计算 `1-R_NN`。
+零向量有效，由 epsilon 防止除零；所有距离相等时分数为 0。
+特别地，所选状态的全部向量完全重复时距离为 0、τ=0，因为采用严格小于，分数也是 0。
+只有一个 token 时没有其他 token 可比较，分数未定义，原因为 `no_other_tokens`。
+输入非有限值或 K/V 形状不一致时明确报错，不删除 token。
+
+评分和热图支持 **pre-RoPE / post-RoPE Key**，通过上方“Key 阶段”统一切换，默认 RoPE 后。
+页面通过 Key / Value 选项同步切换分布图、空间热图和当前切片下载。
+Key 按所选 RoPE 阶段独立计算；Value 使用原生缓存 V（V 不经过 RoPE），前后阶段的 V 结果相同。
+RoPE 前 Key 在当前 Qwen2 每层的 `k_proj` 上以只读 forward hook 采集，保留 bias 并按原生 KV head 拆分；
+不从旋转后的缓存逆推。钩子只在观察输入的完整 prefill 中启用，在追加问题和生成回答前移除，
+异常或取消也会清理。这里的 pre-RoPE 指当前层的位置旋转之前。
+
+RoPE 前 Key 保存到 `key_pre_rope/layer-XXX.npy`，布局为 `[frame, kv_head, token, channel]`；
+`pre_rope_key_snapshot` 记录来源、维度和 dtype。FP16 原样保存，BF16 转为 FP32。
+RoPE 后 K 和两阶段 V 读取 `kv/layer-XXX.npy`，布局为 `[key_value, frame, kv_head, token, channel]`。
+缺少 pre-RoPE Key 的旧结果需重新生成才能使用前阶段。
+
+分布图展示每帧全部层/head 的独立 R_NN，箱体为 Q1–Q3、横线为中位数、须为最小–最大、圆点为均值。
+可独立筛选层与 head；先逐切片计算，再做统计，不先平均 K/V 或距离。
+切换 Key 阶段时分布图与空间热图同步切换，并给出相同筛选下 RoPE 前后的 R_NN 均值。
+
+### K/V 最近邻距离空间热图与导出
+
+热图的每格是所选 Key 或 Value 的一个 token 的 `d^NN_i`，按原图 token 网格排列，数值越大表示越独特。
+默认色阶为 `0 → 当前帧最大距离`；固定 `0 → 2` 便于跨帧比较，但距离没有固定的 2 上界，
+超出时仅颜色饱和，悬停读数和导出保留真实值。全零或无有效值时自动色阶回退到 `0 → 2`。
+悬停可读取最近邻距离、最近邻索引、是否低于 τ 和切片 R_NN；
+青色实线标出当前 token，紫色虚线标出最近邻。点击或方向键选择可联动其他原图视图。
+切换帧、层/head、RoPE 阶段时从快照按需读取，无需重新推理。
+
+JSON `uniqueness` 与 `uniqueness_pre_rope` 分别保存后/前阶段结果。
+指标标识为 `within_frame_separate_kv_nearest_neighbor_redundancy_mean_threshold`，`version=5`、`score_units=ratio`，
+包含 `threshold_rule=mean_nearest_neighbor_distance`、`epsilon`、`evaluation=independent_key_and_value` 和公式。`thresholds`（每个切片的 τ）、`scores`、`uniqueness_sums`、`mean_uniqueness`、
+`max_uniqueness`、`scales`、`zero_norm_tokens`、`undefined_reasons` 均按状态存储：
+`field.key[layer][frame][kv_head]` 和 `field.value[layer][frame][kv_head]`。
+为保留现有接口名称，`uniqueness` 字段现表示最近邻距离，`uniqueness_sums` 是距离之和。
+
+CSV 分数列为 `nearest_neighbor_redundancy`，每个切片分别导出 `state=key`、`state=value` 两行，包含各自 τ、epsilon 和 Key 阶段。
+切片与分布 PNG API 支持 `state=key|value`（默认 key），缓存和下载文件名区分状态。
+Token NPZ/JSON 按所选状态导出，包含 `state`、`uniqueness`、`nearest_token`、`scale`、
+`redundant`（距离是否严格小于 τ）、`score`、尺度、距离统计和参数；不再导出余弦或归一化概率。
+最近邻索引从帧内 0 开始；未定义索引在 NPZ 中为 −1、JSON 中为 null，
+未定义浮点值在 NPZ 中为 NaN、JSON 中为 null。NPZ 还保存全局 `token_positions`。
+
+已有 KV 快照可以离线计算，保留原始 result.json 和 KV 文件：
+
+```bash
+python -m observation.vendi results/rvs_observation/<fingerprint>/result.json
+python -m observation.vendi results/rvs_observation/<fingerprint>/result.json --position pre
+# 可选：--epsilon 1e-8 --output-dir results/my-uniqueness
+```
+
+默认分别导出到 `uniqueness/post/`、`uniqueness/pre/`，包含 `scores.json`、`scores.csv`、`distribution-key.png` 和 `distribution-value.png`。
+新观察保存到 `schema_version=14` 的主结果。旧余弦/熵、固定阈值或 K/V 联合结果不会复用为当前分数，
+图表缓存区分指标、Key/Value、阈值规则、epsilon 和 RoPE 阶段。离线计算不修改页面主结果；
+更新服务并重新生成观察数据后可在页面查看新分布。
+
+## 问题前后逐帧 token 对照
+
+每次计算都额外保存两组 query 对同一批视频 token 的注意力：
+
+- **问题前**：视频序列末尾 N 个 token，与原视频窗口共用 N。
+- **问题后**：问题正文的全部 token。对完整 ReKV 问题后缀一次分词，通过字符偏移选中与正文
+  相交的 token，排除纯换行、角色标记等模板 token；不会为了凑 32 个 query 混入视频。
+  若正文和相邻换行由同一 token 表示，该 token 整体参与统计，实际边界和文本均可查看。
+- 每组 query 与 attention head 等权平均，softmax 包含所有因果可见 key。
+  “全部层平均”先平均各层分数，再计算帧内熵。两组 query 的数量可能不同，页面显示实际数量与位置。
+
+对照统计覆盖每帧的**全部视频 token**，包括视频窗口内部的位置；原历史重要性面板仍将窗口标灰并排除。
+问题前窗口内部各 key 的因果可见次数不同，未对这种可见次数重新归一化。
+追加问题不会改变旧视频 token 已计算的注意力；这里比较的是两组 query 对视频内容的关注。
+对照在回答生成前采集，不包含生成回答的 query。
+
+对照面板只展示当前选中帧，并排显示“问题前 / 问题后 / 差值”，差值 = 后 − 前。
+可通过面板内的视频帧下拉框、原帧列表、注意力图表或 K/V 帧选择切换，所有视图同步。
+切换帧仅更新展示，不重新计算模型；JSON 与对照 CSV 仍包含全部帧。
+默认原始 token mass，所选层
+全部帧的前后图共用同一线性色阶；差值共用以零为中心的对称色阶，蓝色减少、橙色增加。
+可切换为帧内条件概率（各自除以该阶段帧 mass），再计算概率差；零 mass 的条件概率显示灰色“未定义”。
+支持切换原图叠加、调整透明度、悬停读取数值、点击或方向键选择 token，并联动原帧细节与 K/V。
+原帧细节仍显示原窗口统计，完整前后数值在对照面板中读取。
+
+视频模式复用原视频 prefill 和缓存追加问题；原问题模式在完整 prefill 中选取两组 query。
+统计按最多 32 个 query、4 个 head 分块，较大的 N 不会额外构造完整 N×序列长度矩阵。
+大窗口仍会增加统计时间；取消可在统计分块边界生效。
+
+任务参数新增 `video_window_size`（默认 32），参与缓存指纹。原“视频 + 问题末尾 32 token”
+模式仍固定 32，N 在该模式下只控制新增对照的“问题前”部分。
+JSON `schema_version=14`，`attention_comparison` 包含：
+
+- `queries.before / after`：query 位置、数量及 token 明细；视频 token 以帧号、帧内序号标识。
+- `token_positions`：两侧共享的完整视频 key 全局位置。
+- `views`：`id=all` 或从 0 编号的层；`before / after` 的 `scores` 按 `token_positions` 排列，
+  `frames` 保存完整帧 mass、条件熵等统计，`video_mass + text_mass ≈ 1`。
+
+“对照 CSV”导出所选层的全部视频 token，包括 N、两组 query 数量、帧号、全局/帧内位置、
+行列（均从 0 编号）、前后 mass 与条件概率及其差值。未定义的概率留空，零值保留为 0。
+原 JSON / 帧统计 CSV 和 K/V 下载继续可用。旧 JSON 没有对照字段时，页面提示重新生成。
+
 ## 模型回答
 
 每次计算都会对所选问题生成真实模型回答，使用与观察实验**完全相同的已选视频帧**。
 默认视频模式先采集窗口注意力，再在该完整 prefill 的 KV cache 上追加 ReKV 问题模板；
-问题模式的观察输入已包含问题，直接复用其 prefill。观察钩子在生成前移除，
+问题模式的观察输入已包含问题，直接复用其 prefill。视频模式追加问题时额外采集正文注意力；
+观察钩子在生成前移除，
 回答的 query 不会改变之前的窗口统计，也不执行 ReKV 检索或 KV 淘汰。
 
 回答使用贪心解码，默认最多 128 个新 token，可在界面设为 1–512。
@@ -114,10 +243,11 @@ JSON `answer` 保存问题、回答文本、生成 token IDs、输入/输出 tok
 这是独立的**完整因果注意力 prefill**观察路径，不调用 ReKV 的 KV 淘汰或检索，
 不修改现有评测推理。这样所选输入范围内的历史 token 都能被窗口观察。
 使用模型原生 RoPE 和 SDPA 计算隐藏状态，并在语言模型每层截取 post-RoPE Q/K。
-只额外构建最后 32 个 query 的注意力行，按组处理 heads；不保存完整 N×N 权重。
+原窗口统计使用最后 W 个 query（视频模式 W=N，问题模式 W=32），并额外采集前后对照。
+query 与 heads 均分块处理；不保存完整序列长度 × 序列长度权重。
 完整 prefill 的计算量仍随输入长度近似二次增长，限制帧数可降低计算成本。
 
-令序列长度为 T，窗口 W=[T−32,T)，历史 P=[0,T−32)：
+令序列长度为 T，窗口大小为 w（视频模式取 N，问题模式取 32），窗口 W=[T−w,T)，历史 P=[0,T−w)：
 
 ```
 A[l,h,q,i] = causal_softmax(Q[l,h,q] K[l,h,i]^T / sqrt(d))
@@ -145,13 +275,13 @@ GQA 根据 query head 对应的 KV head 展开后统计；所有 attention heads
 
 参考 [SnapKV 官方实现](https://github.com/FasterDecoding/SnapKV/blob/main/snapkv/monkeypatch/snapkv_utils.py)
 与 [论文](https://arxiv.org/abs/2404.14469) 的末尾窗口投票。这里对 query 取均值，
-与其求和相差常数 32，排名和帧内条件熵相同；不执行 pooling、top-k 选择或压缩。
+与其求和相差窗口大小这一常数，排名和帧内条件熵相同；不执行 pooling、top-k 选择或压缩。
 
 ## 结果与复现
 
 结果保存到 `results/rvs_observation/<fingerprint>/`：每帧 JPEG 与 `result.json`。
 JSON 包含完整样本、输入参数、采样策略、token 布局、每层及全部层平均的重要性、
-帧统计、空间映射、模型回答、K/V 快照元数据、模型路径 / dtype / 层数 / head 数、软件版本及耗时。
+帧统计、空间映射、模型回答、K/V 快照元数据、逐帧 K/V 最近邻冗余比例、模型路径 / dtype / 层数 / head 数、软件版本及耗时。
 缓存指纹包含参数、数据 / checkpoint 文件路径大小和修改时间、观察代码及关键依赖版本。
 相同配置复用结果。服务只运行一个 GPU 计算任务，另允许少量排队任务；切换样本时取消旧任务。
 取消在阶段或层边界生效，首次模型加载期间需等待加载结束。模型在服务进程内复用，
@@ -163,5 +293,5 @@ JSON 包含完整样本、输入参数、采样策略、token 布局、每层及
 验证核心数学口径和与原生 attention 的一致性：
 
 ```bash
-python -m unittest discover -s tests -p 'test_observation.py' -v
+python -m unittest discover -s tests -p 'test_observation*.py' -v
 ```
