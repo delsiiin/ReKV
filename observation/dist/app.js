@@ -1,6 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const state = {samples: [], record: null, result: null, job: null, generation: 0, selected: 0, selectedToken: 0, config: null};
+const tokenSimilarity = {controller: null, request: 0, data: null, col: 0};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fmt = (value, digits = 3) => value == null ? '—' : Number(value).toFixed(digits);
 const pct = value => value == null ? '—' : `${fmt(value * 100, 2)}%`;
@@ -31,17 +32,17 @@ async function cancelPrevious() {
   }
 }
 function clearResults() {
-  window.kvViewer.reset();
-  window.comparisonViewer.reset();
-  window.vendiViewer.reset();
-  window.uniquenessViewer.reset();
+  tokenSimilarity.controller?.abort(); tokenSimilarity.request++; tokenSimilarity.data = null;
+  $('exportSegmentCsv').disabled = true;
   state.result = null;
   state.selected = 0;
   state.selectedToken = 0;
   $('results').hidden = true;
   $('emptyState').hidden = false;
-  ['chartPanel', 'detailPanel', 'tokensPanel', 'inputDetails', 'answerPanel', 'massPanel', 'exportJson'].forEach(id => $(id).hidden = true);
+  ['chartPanel', 'detailPanel', 'tokensPanel', 'inputDetails', 'answerPanel', 'massPanel', 'exportJson', 'segmentPanel', 'segmentSimilarityPanel'].forEach(id => $(id).hidden = true);
   $('layer').disabled = true;
+  $('similarityLayer').disabled = true;
+  $('similarityRepresentation').disabled = true;
   $('exportCsv').disabled = true;
   $('cancel').hidden = true;
   $('run').disabled = false;
@@ -100,7 +101,9 @@ function parameters() {
   return {sample_id: $('sample').value, max_frames: Number($('maxFrames').value),
     sample_fps: Number($('fps').value), start_time: Number($('startTime').value),
     mode: $('mode').value, question_index: Number($('question').value), max_new_tokens: Number($('maxAnswerTokens').value),
-    video_window_size: Number($('videoWindowSize').value)};
+    video_window_size: Number($('videoWindowSize').value), segment_enabled: $('segmentEnabled').checked,
+    segment_ema_alpha: Number($('emaAlpha').value), segment_threshold_multiplier: Number($('emaMultiplier').value),
+    segment_min_frames: Number($('segmentMinFrames').value), summary_max_new_tokens: Number($('summaryMaxTokens').value)};
 }
 async function run() {
   if (!state.record || !$('controls').reportValidity()) return;
@@ -164,10 +167,8 @@ function renderSummary(sampling) {
     metricCard('实际处理帧', sampling.processed_frames, `${fmt(sampling.first_timestamp, 1)}–${fmt(sampling.last_timestamp, 1)} 秒 · ${sampling.truncated ? '已限制帧数' : '已到视频末尾'}`),
     metricCard('历史 / 观察 token', result ? `${result.sequence.prefix_tokens} / ${result.sequence.window_size}` : '—', result ? `每帧 ${result.sequence.tokens_per_frame} 个 token` : '正在提取视频特征'),
     metricCard('历史视频 attention mass', view ? pct(view.video_mass) : '—', view ? `历史文本 ${pct(view.text_mass)} · 窗口 ${pct(view.window_mass)}` : '完整因果注意力'),
-    metricCard('帧内归一化熵 / 均值', view ? fmt(mean(view.frames.map(frame => frame.normalized_entropy))) : '—', '0 集中 ← 分布 → 均匀 1')
   );
 }
-function mean(values) { const good = values.filter(value => value != null); return good.length ? good.reduce((a, b) => a + b, 0) / good.length : null; }
 function renderResult(url, cached) {
   const result = state.result;
   $('results').hidden = false;
@@ -177,7 +178,7 @@ function renderResult(url, cached) {
     token_layout: {prompt_tokens: result.sequence.prompt_tokens, video_tokens: result.sequence.video_tokens,
       total_tokens: result.sequence.total_tokens, window: [result.sequence.window_start, result.sequence.window_end]}, method: result.method,
     spatial: {...result.spatial, cells: `${result.spatial.cells.length} cells; full coordinates in JSON`},
-    answer: result.answer, kv_snapshot: result.kv_snapshot, pre_rope_key_snapshot: result.pre_rope_key_snapshot}, null, 2);
+    answer: result.answer}, null, 2);
   $('layer').replaceChildren(node('option', '', '全部层平均'));
   $('layer').options[0].value = 'all';
   result.views.slice(1).forEach(view => {
@@ -190,10 +191,8 @@ function renderResult(url, cached) {
   $('resultLabel').textContent = `${result.model.layers} 层 · ${result.model.heads} heads · ${cached ? '本地缓存' : `${fmt(result.total_elapsed_seconds, 1)} 秒`}`;
   $('runtime').textContent = `torch ${result.model.versions.torch} / transformers ${result.model.versions.transformers}`;
   renderAnswer();
-  window.kvViewer.configure(result);
-  window.comparisonViewer.configure(result);
-  window.vendiViewer.configure(result);
-  window.uniquenessViewer.configure(result);
+  renderSegments();
+  renderSegmentSimilarity();
   updateWindowLabels();
   renderView();
 }
@@ -214,7 +213,6 @@ function renderView() {
   renderMassDistribution();
   renderDetail();
   renderTokens();
-  window.comparisonViewer.render($('layer').value);
   const text = $('textTokens'); text.replaceChildren();
   result.sequence.text_tokens.forEach(token => {
     const item = node('div', 'text-token', token.text);
@@ -234,7 +232,7 @@ function renderFrames(frames, view) {
     top.append(node('span', '', `FRAME ${String(index + 1).padStart(2, '0')}`), node('span', '', `${fmt(frame.timestamp, 2)}s`));
     caption.append(top, node('div', 'source', `源帧 #${frame.source_index} · ${frame.width} × ${frame.height}`));
     const stats = view?.frames[index];
-    caption.append(node('div', 'stats', stats ? `M ${pct(stats.mass)} · H̄ ${fmt(stats.normalized_entropy)}${stats.window_tokens ? ' · 部分为窗口' : ''}` : '等待注意力统计…'));
+    caption.append(node('div', 'stats', stats ? `M ${pct(stats.mass)}${stats.window_tokens ? ' · 部分为窗口' : ''}` : '等待注意力统计…'));
     card.append(img, caption);
     card.addEventListener('click', () => { if (state.result) selectFrame(index, true); });
     container.append(card);
@@ -245,9 +243,6 @@ function selectFrame(index, scroll = false, tokenIndex = null) {
   state.selectedToken = tokenIndex ?? 0;
   document.querySelectorAll('.frame-card').forEach(card => card.classList.toggle('selected', Number(card.dataset.index) === index));
   renderCharts(); renderMassDistribution(); renderDetail();
-  window.kvViewer.selectFrame(index, state.selectedToken);
-  window.vendiViewer.selectFrame(index);
-  window.uniquenessViewer.selectFrame(index, state.selectedToken);
   if (scroll) $('detailPanel').scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 function svgNode(tag, attributes, text) {
@@ -259,10 +254,9 @@ function svgNode(tag, attributes, text) {
 function renderCharts() {
   const view = currentView(); if (!view) return;
   const frames = state.result.frames, n = frames.length, width = 900;
-  const svg = svgNode('svg', {viewBox: `0 0 ${width} 295`, role: 'img', 'aria-label': '逐帧 attention mass 与归一化条件熵'});
+  const svg = svgNode('svg', {viewBox: `0 0 ${width} 165`, role: 'img', 'aria-label': '逐帧 attention mass'});
   const x = i => n === 1 ? 470 : 65 + i / (n - 1) * 790;
-  [{key: 'mass', top: 34, bottom: 111, color: '#087f80', label: 'ATTENTION MASS', min: 0, max: Math.max(...view.frames.map(f => f.mass), 0.000001)},
-   {key: 'normalized_entropy', top: 167, bottom: 244, color: '#d77a3a', label: 'NORMALIZED CONDITIONAL ENTROPY', min: .8, max: 1}].forEach(chart => {
+  [{key: 'mass', top: 34, bottom: 111, color: '#087f80', label: 'ATTENTION MASS', min: 0, max: Math.max(...view.frames.map(f => f.mass), 0.000001)}].forEach(chart => {
     const yFor = value => chart.bottom - (value - chart.min) / (chart.max - chart.min) * (chart.bottom - chart.top);
     const clipId = `chart-clip-${chart.key}`;
     const defs = svgNode('defs', {}), clip = svgNode('clipPath', {id: clipId});
@@ -295,7 +289,7 @@ function renderCharts() {
   });
   frames.forEach((frame, index) => {
     if (index % Math.max(1, Math.ceil(n / 7)) === 0 || index === n - 1)
-      svg.append(svgNode('text', {x: x(index), y: 272, 'text-anchor': 'middle'}, `${fmt(frame.timestamp, 1)}s`));
+      svg.append(svgNode('text', {x: x(index), y: 145, 'text-anchor': 'middle'}, `${fmt(frame.timestamp, 1)}s`));
   });
   $('charts').replaceChildren(svg);
 }
@@ -348,8 +342,7 @@ function renderDetail() {
   $('detailImage').alt = `第 ${state.selected + 1} 张实际采样帧，源帧 ${frame.source_index}`;
   $('imageStage').style.aspectRatio = `${frame.width} / ${frame.height}`;
   $('frameMetrics').replaceChildren(...[
-    ['Attention mass', pct(stats.mass)], ['帧内条件熵 / nats', fmt(stats.entropy, 4)],
-    ['归一化熵', fmt(stats.normalized_entropy, 4)], ['有效 token 数 exp(H)', fmt(stats.effective_tokens, 1)]
+    ['Attention mass', pct(stats.mass)]
   ].map(([label, value]) => { const el = node('div', 'metric'); el.append(node('div', 'muted', label), node('b', '', value)); return el; }));
   renderImageOverlay();
   renderHeatmap();
@@ -423,9 +416,6 @@ function activateToken(index) {
   const detail = score === undefined ? '观察窗口 / 不计入历史重要性' : `原始 mass = ${score.toExponential(5)} (${fmt(score * 100, 5)}%) · 帧内 p = ${stats.mass > 0 ? fmt(score / stats.mass, 6) : '未定义'}`;
   $('spatialReadout').textContent = `token #${position} · 帧内 #${index} · 行 ${cell.row + 1} / 列 ${cell.col + 1} · 原图区域 [${bounds.join(', ')}] px\n${detail}`;
   $('heatmapHint').textContent = `#${position} · 行 ${cell.row + 1} / 列 ${cell.col + 1}${score === undefined ? ' · 观察窗口' : ''}`;
-  window.kvViewer.highlightToken(state.selected, index);
-  window.comparisonViewer.highlightToken(state.selected, index);
-  window.uniquenessViewer.highlightToken(state.selected, index);
 }
 function tokenDescription(index, view) {
   const frame = state.result.frames.find(f => index >= f.token_start && index < f.token_end);
@@ -454,10 +444,10 @@ function renderTokens() {
 }
 function exportCsv() {
   const view = currentView(); if (!view) return;
-  const columns = ['frame_index', 'source_index', 'timestamp', 'token_start', 'token_end', 'mass', 'entropy_nats', 'normalized_entropy', 'effective_tokens', 'scored_tokens', 'window_tokens'];
+  const columns = ['frame_index', 'source_index', 'timestamp', 'token_start', 'token_end', 'mass', 'scored_tokens', 'window_tokens'];
   const rows = state.result.frames.map((frame, i) => {
     const s = view.frames[i];
-    return [frame.index, frame.source_index, frame.timestamp, frame.token_start, frame.token_end, s.mass, s.entropy, s.normalized_entropy, s.effective_tokens, s.scored_tokens, s.window_tokens].map(v => v == null ? '' : v).join(',');
+    return [frame.index, frame.source_index, frame.timestamp, frame.token_start, frame.token_end, s.mass, s.scored_tokens, s.window_tokens].map(v => v == null ? '' : v).join(',');
   });
   const url = URL.createObjectURL(new Blob([columns.join(',') + '\n' + rows.join('\n')], {type: 'text/csv;charset=utf-8'}));
   const link = node('a'); link.href = url; link.download = `rvs-${state.result.sample.video_id}-layer-${view.id}.csv`; link.click();
@@ -471,7 +461,7 @@ $('controls').addEventListener('submit', event => { event.preventDefault(); run(
 $('split').addEventListener('change', () => { fillSamples(); $('startTime').value = 0; loadSample(); });
 $('sample').addEventListener('change', () => { $('startTime').value = 0; loadSample(); });
 $('question').addEventListener('change', () => { showQuestion(); if ($('autoRun').checked) run(); else invalidate(); });
-['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize'].forEach(id => $(id).addEventListener('change', invalidate));
+['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'emaMultiplier', 'segmentMinFrames', 'summaryMaxTokens'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));
@@ -484,11 +474,278 @@ $('logScale').addEventListener('change', renderTokens);
 $('exportCsv').addEventListener('click', exportCsv);
 $('cancel').addEventListener('click', async () => { if (state.job) { try { const job = await api(`/api/jobs/${state.job}/cancel`, {}); status(job.message, job.progress); } catch (error) { showError(error); } } });
 window.addEventListener('resize', renderTokens);
+function renderSegments() {
+  const experiment = state.result?.segment_experiment;
+  $('segmentPanel').hidden = !experiment;
+  $('segmentSimilarityPanel').hidden = !experiment;
+  $('similarityLayer').disabled = !experiment;
+  $('similarityRepresentation').disabled = !experiment;
+  if (!experiment) return;
+  const representations = experiment.token_similarity?.representations || ['key'];
+  $('similarityRepresentation').replaceChildren();
+  for (const kind of representations) {
+    const option = node('option', '', kind === 'hidden' ? 'Hidden states' : 'Key states');
+    option.value = kind; $('similarityRepresentation').append(option);
+  }
+  $('similarityLayer').replaceChildren(node('option', '', '全部层平均'));
+  $('similarityLayer').options[0].value = 'all';
+  for (let layer = 0; layer < state.result.model.layers; layer++) {
+    const option = node('option', '', `第 ${layer + 1} 层`);
+    option.value = String(layer); $('similarityLayer').append(option);
+  }
+  $('segmentCount').textContent = `${experiment.segments.length} SEGMENTS`;
+  const segmentation = experiment.segmentation_space ? `Vision encoder · ${experiment.vision_tokens_per_frame} patches/帧 · ${experiment.vision_feature_dim} 维 · 投影/池化前` : '旧结果：Key 分段（重新生成可使用 vision encoder）';
+  $('segmentMeta').textContent = `${segmentation} · EMA α=${experiment.alpha} · 阈值倍数 ${experiment.multiplier} · 切分前至少 ${experiment.min_frames} 帧`;
+  const {segments, layer_distances, transitions, ...method} = experiment;
+  $('segmentMethod').textContent = JSON.stringify({...method, summary_prompts: segments.map(s => ({segment: s.id + 1, prompt: s.summary.prompt}))}, null, 2);
+  const table = node('table', 'segment-table'), head = node('tr');
+  ['相邻帧', '距离 D', '1 / (1 + D)', '此前 EMA', '阈值', '判定'].forEach(label => head.append(node('th', '', label)));
+  table.append(head);
+  transitions.forEach(t => {
+    const row = node('tr', t.boundary ? 'boundary-row' : '');
+    const reason = {warmup: '初始化', boundary: '开启新段', min_frames: '未达最少帧数', below_threshold: '同一段'}[t.reason];
+    [`${t.previous_frame + 1} → ${t.current_frame + 1}`, fmt(t.distance, 5), fmt(t.similarity, 5), fmt(t.ema_before, 5), fmt(t.threshold, 5), reason].forEach(value => row.append(node('td', '', value)));
+    table.append(row);
+  });
+  $('segmentTransitions').replaceChildren(table);
+  renderSegmentDistance(transitions);
+  $('segmentCards').replaceChildren();
+  segments.forEach(segment => {
+    const card = node('article', 'segment-card'); card.id = `segment-${segment.id}`;
+    card.append(node('h3', '', `S${segment.id + 1} · 帧 ${segment.start_frame + 1}–${segment.end_frame} · ${fmt(segment.first_timestamp, 2)}–${fmt(segment.last_timestamp, 2)}s`));
+    const strip = node('div', 'segment-strip');
+    segment.frame_indices.forEach(index => {
+      const frame = state.result.frames[index], button = node('button', 'segment-thumbnail'); button.type = 'button';
+      const img = node('img'); img.src = frame.image_url; img.alt = `S${segment.id + 1} 帧 ${index + 1}`; img.loading = 'lazy';
+      button.append(img, node('span', '', `#${index + 1} · ${fmt(frame.timestamp, 2)}s`));
+      button.addEventListener('click', () => selectFrame(index, true)); strip.append(button);
+    });
+    const summary = segment.summary;
+    card.append(strip, node('p', 'answer-text', summary.text || '（模型没有生成可显示文字；图片 token 的平均相似度未定义。）'));
+    const reason = {eos: '完成', max_new_tokens: '达到长度上限', context_limit: '达到上下文上限'}[summary.finish_reason];
+    card.append(node('p', 'tiny', `${reason} · ${summary.generated_tokens} token · ${fmt(summary.elapsed_seconds, 2)} 秒 · 仅输入该段图片`));
+    $('segmentCards').append(card);
+  });
+  for (const id of ['similaritySummary', 'similaritySegment']) {
+    $(id).replaceChildren();
+    segments.forEach(s => {
+      const option = node('option', '', `${id === 'similaritySummary' ? 'Summary' : 'Segment'} ${s.id + 1} · ${fmt(s.first_timestamp, 1)}–${fmt(s.last_timestamp, 1)}s`);
+      option.value = s.id; $(id).append(option);
+    });
+  }
+  tokenSimilarity.col = 0;
+  fillSimilarityFrames();
+}
+function renderSegmentDistance(transitions) {
+  const container = $('segmentDistanceChart'); container.replaceChildren();
+  if (!transitions.length) { container.append(node('p', 'muted', '单帧输入，没有相邻帧距离。')); return; }
+  const svg = svgNode('svg', {viewBox: '0 0 900 195', role: 'img', 'aria-label': '相邻帧归一化视觉特征距离和历史 EMA 阈值；橙色点表示新段边界'});
+  const max = Math.max(...transitions.flatMap(t => [t.distance, t.threshold || 0]), 1e-6) * 1.1;
+  const x = i => transitions.length === 1 ? 465 : 65 + i * 790 / (transitions.length - 1);
+  const y = value => 150 - value / max * 110;
+  svg.append(svgNode('text', {x: 65, y: 18}, '青色：帧距离 D　虚线：此前 EMA × 倍数　橙色点：新段起始'));
+  for (const f of [0, .5, 1]) {
+    svg.append(svgNode('line', {x1: 65, x2: 855, y1: y(max * f), y2: y(max * f), stroke: '#e6ecef'}));
+    svg.append(svgNode('text', {x: 55, y: y(max * f) + 4, 'text-anchor': 'end'}, fmt(max * f)));
+  }
+  for (const [key, color, dash] of [['distance', '#087f80', ''], ['threshold', '#75889b', '5 4']]) {
+    let path = '';
+    transitions.forEach((t, i) => { if (t[key] != null) path += `${path ? 'L' : 'M'}${x(i)},${y(t[key])} `; });
+    svg.append(svgNode('path', {d: path, fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-dasharray': dash}));
+  }
+  transitions.forEach((t, i) => {
+    const dot = svgNode('circle', {cx: x(i), cy: y(t.distance), r: t.boundary ? 5 : 3, fill: t.boundary ? '#d77a3a' : '#087f80'});
+    dot.append(svgNode('title', {}, `帧 ${t.current_frame + 1}: D=${fmt(t.distance, 5)} / 阈值=${fmt(t.threshold, 5)} / ${t.reason}`)); svg.append(dot);
+    if (i % Math.max(1, Math.ceil(transitions.length / 8)) === 0 || i === transitions.length - 1)
+      svg.append(svgNode('text', {x: x(i), y: 177, 'text-anchor': 'middle'}, `帧 ${t.current_frame + 1}`));
+  });
+  container.append(svg);
+}
+function fillSimilarityFrames() {
+  const experiment = state.result?.segment_experiment;
+  if (!experiment) return;
+  const segment = experiment.segments[Number($('similaritySegment').value)];
+  $('similarityFrame').replaceChildren();
+  segment.frame_indices.forEach((index, local) => {
+    const frame = state.result.frames[index];
+    const option = node('option', '', `段内 ${local + 1}/${segment.frame_indices.length} · 全局帧 ${index + 1} · ${fmt(frame.timestamp, 2)}s`);
+    option.value = index; $('similarityFrame').append(option);
+  });
+}
+function similarityColorRange(scores) {
+  const valid = scores.filter(Number.isFinite);
+  return valid.length ? {min: Math.min(...valid), max: Math.max(...valid)} : {min: null, max: null};
+}
+function cosineColor(value, range) {
+  if (!Number.isFinite(value) || !Number.isFinite(range?.min) || !Number.isFinite(range?.max)) return '#dce2e5';
+  const target = [8, 127, 128];
+  const strength = range.max === range.min ? .5 : Math.max(0, Math.min(1, (value - range.min) / (range.max - range.min)));
+  return `rgb(${target.map(c => Math.round(255 + (c - 255) * strength)).join(',')})`;
+}
+function renderSimilarityScale(range) {
+  $('similarityScaleMin').textContent = `min ${fmt(range.min, 6)}`;
+  $('similarityScaleMax').textContent = `max ${fmt(range.max, 6)}`;
+  const empty = range.min == null, constant = !empty && range.min === range.max;
+  $('similarityScaleRamp').style.background = empty ? '#dce2e5' : constant ? cosineColor(range.min, range) : 'linear-gradient(90deg, white, rgb(8,127,128))';
+  $('similarityScaleNote').textContent = empty ? '无有效分数' : constant ? '所有分数相同 · 统一颜色' : '当前帧实际范围 · 灰色：无有效分数';
+}
+function meanSummaryTokenScores(data) {
+  return Array.from({length: data.image_tokens}, (_, col) => {
+    if (!data.cosine.length) return null;
+    let sum = 0;
+    for (const row of data.cosine) {
+      if (!Number.isFinite(row[col])) return null;
+      sum += row[col];
+    }
+    return sum / data.cosine.length;
+  });
+}
+function frameMeanPruning(scores) {
+  const valid = scores.filter(Number.isFinite);
+  if (!valid.length) return {threshold: null, pruned: scores.map(() => false), valid: 0};
+  // Subtract an anchor before summing so identical scores are retained exactly.
+  const anchor = valid[0];
+  const threshold = anchor + valid.reduce((sum, value) => sum + (value - anchor), 0) / valid.length;
+  return {threshold, pruned: scores.map(value => Number.isFinite(value) && value < threshold), valid: valid.length};
+}
+async function renderSegmentSimilarity() {
+  tokenSimilarity.controller?.abort();
+  const request = ++tokenSimilarity.request;
+  tokenSimilarity.data = null;
+  $('exportSegmentCsv').disabled = true;
+  $('similarityOverlay').replaceChildren();
+  $('similarityPrunedPreview').hidden = true;
+  $('similarityPrunedMask').replaceChildren();
+  $('similarityPruningMeta').textContent = '';
+  renderSimilarityScale({min: null, max: null});
+  const experiment = state.result?.segment_experiment;
+  if (!experiment) return;
+  const summary = Number($('similaritySummary').value), frameIndex = Number($('similarityFrame').value);
+  const frame = state.result.frames[frameIndex], layer = $('similarityLayer').value;
+  const representation = $('similarityRepresentation').value;
+  const representationLabel = representation === 'hidden' ? 'Hidden states' : 'Key states';
+  $('similarityRepresentationNote').textContent = representation === 'hidden'
+    ? 'Hidden states：所选 decoder block 的输出（attention 与 MLP 残差更新后，最终模型归一化前）。'
+    : 'Key states：所选层 k_proj 的输出（RoPE 前），拼接原生 KV heads。';
+  $('similaritySummaryText').textContent = experiment.segments[summary].summary.text || '（无可显示文字。）';
+  $('similarityImage').src = frame.image_url;
+  $('similarityImageStage').style.aspectRatio = `${frame.width} / ${frame.height}`;
+  $('similarityPrunedImage').src = frame.image_url;
+  $('similarityPrunedStage').style.aspectRatio = `${frame.width} / ${frame.height}`;
+  $('similarityFrameMeta').textContent = `全局帧 ${frameIndex + 1} · 源帧 ${frame.source_index} · ${fmt(frame.timestamp, 2)}s · ${frame.width} × ${frame.height}`;
+  $('segmentSimilarityMeta').textContent = '正在计算图片 token 的平均相似度…';
+  $('segmentSimilarityReadout').textContent = '正在读取…';
+  if (!experiment.token_similarity?.url) {
+    $('segmentSimilarityMeta').textContent = '旧结果未保存逐 token 表示，请重新生成观察数据。'; return;
+  }
+  const controller = new AbortController(); tokenSimilarity.controller = controller;
+  try {
+    const query = new URLSearchParams({summary, frame: frameIndex, layer, representation});
+    const response = await fetch(`${experiment.token_similarity.url}?${query}`, {signal: controller.signal});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    if (request !== tokenSimilarity.request) return;
+    data.mean_scores = meanSummaryTokenScores(data);
+    data.color_range = similarityColorRange(data.mean_scores);
+    data.pruning = frameMeanPruning(data.mean_scores);
+    tokenSimilarity.data = data;
+    tokenSimilarity.col = Math.min(tokenSimilarity.col, data.image_tokens - 1);
+    const own = Number($('similaritySegment').value) === summary;
+    $('segmentSimilarityMeta').textContent = `${representationLabel} · ${layer === 'all' ? '全部层平均' : `第 ${Number(layer) + 1} 层`} · 每个图片 token 对 ${data.text_tokens.length} 个 summary token 取均值 · ${data.image_tokens} 个图片位置 · ${own ? 'summary 来源段' : '跨段对照'} · 当前帧 min–max 色阶`;
+    renderSimilarityScale(data.color_range);
+    $('exportSegmentCsv').disabled = !data.text_tokens.length;
+    drawMeanSimilarity();
+    drawPrunedSimilarity();
+    inspectMeanSimilarity(tokenSimilarity.col);
+  } catch (error) {
+    if (error.name === 'AbortError' || request !== tokenSimilarity.request) return;
+    $('segmentSimilarityMeta').textContent = `相似度读取失败：${error.message}`;
+    $('segmentSimilarityReadout').textContent = '可重新选择帧重试。';
+  }
+}
+function drawPrunedSimilarity() {
+  const data = tokenSimilarity.data; if (!data) return;
+  const {threshold, pruned, valid} = data.pruning;
+  const mask = $('similarityPrunedMask'); mask.replaceChildren();
+  $('similarityPrunedPreview').hidden = threshold == null;
+  if (threshold == null) {
+    $('similarityPruningMeta').textContent = '无有效相似度分数，无法计算帧内均值或展示剪枝预览。';
+    return;
+  }
+  mask.setAttribute('viewBox', '0 0 1000 1000'); mask.setAttribute('preserveAspectRatio', 'none');
+  state.result.spatial.cells.forEach((cell, index) => {
+    if (!pruned[index]) return;
+    const [x1, y1, x2, y2] = cell.box;
+    const rect = svgNode('rect', {x: x1 * 1000, y: y1 * 1000, width: (x2 - x1) * 1000, height: (y2 - y1) * 1000,
+      fill: '#fff', 'data-token-index': index});
+    rect.append(svgNode('title', {}, `图片 token #${index} · ${fmt(data.mean_scores[index], 6)} < 帧内均值 ${fmt(threshold, 6)}`));
+    mask.append(rect);
+  });
+  const count = pruned.filter(Boolean).length, unknown = data.image_tokens - valid;
+  $('similarityPruningMeta').textContent = `帧内平均相似度 ${fmt(threshold, 6)} · 剪去 ${count}/${data.image_tokens} 个 token (${pct(count / data.image_tokens)}) · 保留 ${valid - count} 个有效 token。严格低于均值才剪枝，等于均值保留。${unknown ? ` ${unknown} 个无效分数不参与均值，保留原图区域。` : ''} 白色仅表示 token 空间区域的遮罩预览。`;
+}
+function inspectMeanSimilarity(col) {
+  const data = tokenSimilarity.data; if (!data) return;
+  const cell = state.result.spatial.cells[col], frame = state.result.frames[data.frame_index];
+  const location = cell ? `空间行 ${cell.row + 1} / 列 ${cell.col + 1}` : `帧内 token #${col}`;
+  $('segmentSimilarityReadout').textContent = `Summary ${data.summary_index + 1} · 全部 ${data.text_tokens.length} 个内容 token\n帧 ${data.frame_index + 1} (${fmt(frame.timestamp, 2)}s) · 图片 token #${col} · 全局 token #${data.frame_token_start + col} · ${location}\n平均余弦相似度：${fmt(data.mean_scores[col], 6)}${!data.text_tokens.length ? '（summary 无内容 token，均值未定义）' : ''}`;
+  $('similarityOverlay').querySelectorAll('rect').forEach((rect, index) => {
+    rect.setAttribute('stroke', index === col ? '#ff8a24' : '#ffffff55');
+    rect.setAttribute('stroke-width', index === col ? 5 : 1);
+  });
+}
+function drawMeanSimilarity() {
+  const data = tokenSimilarity.data; if (!data) return;
+  const overlay = $('similarityOverlay'); overlay.replaceChildren();
+  overlay.setAttribute('viewBox', '0 0 1000 1000'); overlay.setAttribute('preserveAspectRatio', 'none');
+  state.result.spatial.cells.forEach((c, index) => {
+    const [x1, y1, x2, y2] = c.box;
+    const rect = svgNode('rect', {x: x1 * 1000, y: y1 * 1000, width: (x2 - x1) * 1000, height: (y2 - y1) * 1000,
+      fill: cosineColor(data.mean_scores[index], data.color_range), 'fill-opacity': .5, stroke: '#ffffff55', 'stroke-width': 1});
+    rect.append(svgNode('title', {}, `图片 token #${index} · 全部 ${data.text_tokens.length} 个 summary token 的平均相似度：${fmt(data.mean_scores[index], 6)}`));
+    rect.addEventListener('mouseenter', () => inspectMeanSimilarity(index));
+    rect.addEventListener('click', () => { tokenSimilarity.col = index; inspectMeanSimilarity(index); });
+    overlay.append(rect);
+  });
+}
+$('similarityOverlay').addEventListener('mouseleave', () => inspectMeanSimilarity(tokenSimilarity.col));
+$('similarityOverlay').addEventListener('keydown', event => {
+  const data = tokenSimilarity.data; if (!data) return;
+  const cols = state.result.spatial.cols || 14;
+  const moves = {ArrowLeft: -1, ArrowRight: 1, ArrowUp: -cols, ArrowDown: cols};
+  if (!(event.key in moves)) return;
+  event.preventDefault();
+  tokenSimilarity.col = Math.max(0, Math.min(data.image_tokens - 1, tokenSimilarity.col + moves[event.key]));
+  inspectMeanSimilarity(tokenSimilarity.col);
+});
+$('similaritySummary').addEventListener('change', () => {
+  tokenSimilarity.col = 0;
+  $('similaritySegment').value = $('similaritySummary').value;
+  fillSimilarityFrames(); renderSegmentSimilarity();
+});
+$('similaritySegment').addEventListener('change', () => { fillSimilarityFrames(); renderSegmentSimilarity(); });
+$('similarityFrame').addEventListener('change', renderSegmentSimilarity);
+$('similarityLayer').addEventListener('change', renderSegmentSimilarity);
+$('similarityRepresentation').addEventListener('change', renderSegmentSimilarity);
+$('exportSegmentCsv').addEventListener('click', () => {
+  const data = tokenSimilarity.data; if (!data?.text_tokens.length) return;
+  const header = 'summary_index,frame_index,layer,representation,summary_token_count,image_token,global_token,grid_row,grid_col,mean_cosine,frame_mean_cosine,pruned';
+  const rows = data.mean_scores.map((value, j) => {
+    const cell = state.result.spatial.cells[j];
+    return [data.summary_index, data.frame_index, data.layer, data.representation, data.text_tokens.length, j,
+      data.frame_token_start + j, cell?.row ?? '', cell?.col ?? '', value ?? '',
+      data.pruning.threshold ?? '', Number.isFinite(value) ? Number(data.pruning.pruned[j]) : ''].join(',');
+  });
+  const url = URL.createObjectURL(new Blob([header + '\n' + rows.join('\n')], {type:'text/csv;charset=utf-8'}));
+  const link = node('a'); link.href = url; link.download = `summary-${data.summary_index + 1}-frame-${data.frame_index + 1}-${data.representation}-layer-${data.layer}-mean.csv`; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 async function init() {
   try {
     [state.config, state.samples] = await Promise.all([api('/api/config'), api('/api/samples')]);
     $('modelInfo').textContent = `${state.config.model_path.split('/').pop()} · ${state.config.device}`;
     $('maxFrames').max = state.config.max_frames;
+    $('segmentMinFrames').max = state.config.max_frames;
     $('maxFrames').value = Math.min(8, state.config.max_frames);
     $('videoWindowSize').value = state.config.default_video_window_size ?? 32;
     updateWindowLabels();

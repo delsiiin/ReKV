@@ -1,5 +1,6 @@
 """Uncompressed causal prefill of local LLaVA-OneVision with a window observer."""
 import importlib.metadata
+from contextlib import nullcontext
 import math
 from pathlib import Path
 import time
@@ -7,11 +8,11 @@ import time
 import numpy as np
 import torch
 
-from observation.metrics import (WINDOW_SIZE, build_views, build_comparison, query_importance,
+from observation.metrics import (WINDOW_SIZE, build_views,
                                  window_importance, validate_video_window)
 from observation.spatial import video_token_layout
-from observation.kv import PreRoPEKeyCapture, save_kv_snapshot
-from observation.vendi import score_snapshot
+from observation.segments import (EPSILON, SUMMARY_SYSTEM, TokenStateStore, capture_token_states,
+                                  selected_vision_features, vision_frame_distances, segment_by_ema, summary_prompt)
 
 
 INIT_PROMPT = '<|im_start|>system \nYou are a helpful assistant.<|im_end|><|im_start|>user '
@@ -43,25 +44,15 @@ def greedy_token_ids(decoder, lm_head, output, max_new_tokens, stop_token_ids,
     return generated, 'max_new_tokens'
 
 
-def question_inputs(tokenizer, question, offset):
-    """Tokenize the exact suffix once; select tokens overlapping the question body."""
+def question_inputs(tokenizer, question):
+    """Tokenize the question suffix used for model answering."""
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Question body must contain at least one non-whitespace token")
     suffix = f'\n{question}<|im_end|><|im_start|>assistant\n'
-    encoded = tokenizer(suffix, return_tensors='pt', return_offsets_mapping=True)
-    spans = encoded.offset_mapping[0].tolist()
-    selected = [i for i, (start, end) in enumerate(spans)
-                if end > 1 and start < 1 + len(question) and end > start]
-    if not selected:
-        raise ValueError("Question body did not produce any query tokens")
-    ids = encoded.input_ids[0].tolist()
-    tokens = [dict(position=offset + i, token_id=ids[i], text=tokenizer.decode([ids[i]]),
-                   char_start=spans[i][0] - 1, char_end=spans[i][1] - 1) for i in selected]
-    return encoded.input_ids, dict(kind='question_body', positions=[offset + i for i in selected],
-                                   count=len(selected), tokens=tokens, text=question)
+    return tokenizer(suffix, return_tensors='pt').input_ids
 
 
-def install_observer(decoder, callback, *, window=WINDOW_SIZE, selections=None,
+def install_observer(decoder, callback, *, window=WINDOW_SIZE,
                      check_cancel=lambda: None):
     """Dispatch post-RoPE Q/K to the observer, preserving native SDPA outputs."""
     from transformers import AttentionInterface
@@ -72,20 +63,9 @@ def install_observer(decoder, callback, *, window=WINDOW_SIZE, selections=None,
         if kwargs.get('sliding_window') is not None:
             raise ValueError("This experiment requires full causal attention")
         check_cancel()
-        if selections is None:
-            scores = window_importance(query, key, scaling=kwargs.get('scaling'),
-                                       attention_mask=attention_mask, window=window)
-        else:
-            scores = {}
-            # Reuse coincident selections (legacy video window == comparison before).
-            computed = {}
-            for name, positions in selections.items():
-                indices = tuple(positions)
-                if indices not in computed:
-                    computed[indices] = query_importance(
-                        query, key, indices, scaling=kwargs.get('scaling'),
-                        attention_mask=attention_mask, check_cancel=check_cancel)
-                scores[name] = computed[indices]
+        scores = window_importance(query, key, scaling=kwargs.get('scaling'),
+                                   attention_mask=attention_mask, window=window,
+                                   check_cancel=check_cancel)
         module._rvs_observer(module.layer_idx, scores)
         return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
 
@@ -126,7 +106,7 @@ class ObservationEngine:
         self.processor, self.model = processor, model
 
     @torch.inference_mode()
-    def observe(self, images, frames, record, params, progress, check_cancel, *, artifact_dir):
+    def observe(self, images, frames, record, params, progress, check_cancel, artifact_dir=None):
         began = time.monotonic()
         self.load(progress)
         check_cancel()
@@ -137,6 +117,9 @@ class ObservationEngine:
         prefix_ids = processor.tokenizer(INIT_PROMPT, return_tensors='pt').input_ids.to(device)
         prefix = embedding(prefix_ids)
         features = []
+        segment_enabled = params.get('segment_enabled', True)
+        vision_distances, previous_vision = [], None
+        vision_shape = None
         processed_shape = None
         for start in range(0, len(images), 4):
             check_cancel()
@@ -154,11 +137,18 @@ class ObservationEngine:
                 return_dict=True,
             )
             features.append(output.pooler_output.to(device))
+            if segment_enabled:
+                raw_vision = selected_vision_features(output, model.config.vision_feature_layer,
+                                                     model.config.vision_feature_select_strategy)
+                distances, previous_vision = vision_frame_distances(raw_vision, previous_vision)
+                vision_distances.extend(distances.tolist())
+                vision_shape = tuple(raw_vision.shape[1:])
+                del raw_vision
             del output, pixels
+        del previous_vision
         video_features = torch.cat(features, dim=1)
         video_window = validate_video_window(params.get('video_window_size', WINDOW_SIZE),
                                              video_features.shape[1])
-        video_end = prefix.shape[1] + video_features.shape[1]
         if video_features.shape[1] % len(frames):
             raise ValueError("Video features do not divide evenly into frames")
         tokens_per_frame = video_features.shape[1] // len(frames)
@@ -173,7 +163,7 @@ class ObservationEngine:
                             text=processor.tokenizer.decode([int(token_id)]), kind='prompt')
                        for i, token_id in enumerate(prefix_ids[0])]
         question = record['conversations'][params['question_index']]['question']
-        suffix_ids, question_queries = question_inputs(processor.tokenizer, question, video_end)
+        suffix_ids = question_inputs(processor.tokenizer, question)
         suffix_ids = suffix_ids.to(device)
         if params['mode'] == 'question':
             offset = prefix.shape[1] + video_features.shape[1]
@@ -192,64 +182,31 @@ class ObservationEngine:
         window = video_window if params['mode'] == 'video' else WINDOW_SIZE
         prefix_length = length - window
         scores = [None] * len(decoder.layers)
-        before_scores = [None] * len(decoder.layers)
-        after_scores = [None] * len(decoder.layers)
-        before_positions = list(range(video_end - video_window, video_end))
-        queries = dict(
-            before=dict(kind='video_tail', positions=before_positions, count=video_window,
-                        tokens=[dict(position=i, frame_index=(i - prefix.shape[1]) // tokens_per_frame,
-                                     frame_token=(i - prefix.shape[1]) % tokens_per_frame)
-                                for i in before_positions]),
-            after=question_queries,
-        )
+        if segment_enabled and artifact_dir is None:
+            raise ValueError('Segment token observations require an artifact directory')
+        token_stores = {kind: TokenStateStore(artifact_dir, kind) for kind in ('key', 'hidden')} if segment_enabled else {}
+
+        def capture_video_states(kind, layer, states):
+            token_stores[kind].video(layer, states, frames)
 
         def capture(layer, captured):
             check_cancel()
-            scores[layer] = captured['legacy']
-            before_scores[layer] = captured['before'][:video_end]
-            if 'after' in captured:
-                after_scores[layer] = captured['after']
+            scores[layer] = captured
             progress('attention', f'计算注意力：第 {layer + 1}/{len(scores)} 层',
-                     0.48 + 0.23 * (layer + 1) / len(scores))
+                     0.48 + 0.30 * (layer + 1) / len(scores))
 
-        selections = dict(legacy=range(prefix_length, length), before=before_positions)
-        if params['mode'] == 'question':
-            selections['after'] = question_queries['positions']
-        pre_rope_capture = PreRoPEKeyCapture(
-            decoder, frames, Path(artifact_dir) / 'key_pre_rope', check_cancel,
-            lambda layer, total: progress('pre_rope_key', f'保存 RoPE 前 Key：第 {layer}/{total} 层',
-                                          0.48 + .23 * (layer - 1) / total))
-        cleanup = install_observer(decoder, capture, selections=selections, check_cancel=check_cancel)
+        cleanup = install_observer(decoder, capture, window=window, check_cancel=check_cancel)
         try:
-            with pre_rope_capture:
+            with capture_token_states(decoder, capture_video_states, check_cancel) if segment_enabled else nullcontext():
                 prefill = decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
         finally:
             cleanup()
-        pre_rope_key_snapshot = pre_rope_capture.manifest()
         check_cancel()
         if any(score is None for score in scores):
             raise RuntimeError("Some decoder layers did not produce observation scores")
-        kv_snapshot = save_kv_snapshot(
-            prefill.past_key_values, frames, Path(artifact_dir) / 'kv', check_cancel,
-            lambda layer, total: progress('kv_snapshot', f'保存逐帧 K/V：第 {layer}/{total} 层',
-                                          0.71 + .06 * layer / total))
         if params['mode'] == 'video':
-            def capture_question(layer, captured):
-                check_cancel()
-                after_scores[layer] = captured['after']
-                progress('question_attention', f'问题正文注意力：第 {layer + 1}/{len(scores)} 层',
-                         0.77 + .05 * (layer + 1) / len(scores))
-
-            cleanup = install_observer(
-                decoder, capture_question, selections=dict(after=question_queries['positions']),
-                check_cancel=check_cancel)
-            try:
-                prefill = decoder(input_ids=suffix_ids, past_key_values=prefill.past_key_values,
-                                  use_cache=True, return_dict=True)
-            finally:
-                cleanup()
-        if any(score is None for score in before_scores + after_scores):
-            raise RuntimeError("Some decoder layers did not produce comparison scores")
+            prefill = decoder(input_ids=suffix_ids, past_key_values=prefill.past_key_values,
+                              use_cache=True, return_dict=True)
         observation_elapsed = time.monotonic() - began
         progress('answer', '基于同一批视频帧和所选问题生成回答', 0.82)
         answer_started = time.monotonic()
@@ -262,7 +219,7 @@ class ObservationEngine:
 
         def on_token(count):
             if count == 1 or count % 8 == 0:
-                progress('answer', f'生成模型回答：{count}/{budget} token', 0.82 + 0.15 * count / budget)
+                progress('answer', f'生成模型回答：{count}/{budget} token', 0.82 + 0.05 * count / budget)
 
         answer_ids, finish_reason = greedy_token_ids(
             decoder, model.lm_head, prefill, budget, stop_ids, check_cancel, on_token)
@@ -277,16 +234,31 @@ class ObservationEngine:
                       elapsed_seconds=time.monotonic() - answer_started,
                       context='same selected video frames + selected question; reference answer is not an input')
         check_cancel()
-        progress('uniqueness', '计算逐帧 K/V 最近邻冗余比例 R_NN', 0.97)
-        uniqueness = score_snapshot(
-            Path(artifact_dir) / 'kv', kv_snapshot, check_cancel,
-            lambda layer, total: progress('uniqueness', f'计算 RoPE 后 uniqueness：第 {layer}/{total} 层',
-                                          0.97 + .005 * layer / total))
-        uniqueness_pre_rope = score_snapshot(
-            Path(artifact_dir) / 'key_pre_rope', pre_rope_key_snapshot, check_cancel,
-            lambda layer, total: progress('uniqueness', f'计算 RoPE 前 uniqueness：第 {layer}/{total} 层',
-                                          0.975 + .005 * layer / total))
-        progress('statistics', '计算帧内条件熵并保存结果与模型回答', 0.98)
+        segment_experiment = None
+        if segment_enabled:
+            segment_experiment = segment_by_ema(
+                vision_distances, frames, params.get('segment_ema_alpha', .2),
+                params.get('segment_threshold_multiplier', 1.5), params.get('segment_min_frames', 1))
+            segment_experiment.update(
+                segmentation_space='vision encoder selected hidden states, before multimodal projector and spatial pooling',
+                vision_feature_layer=model.config.vision_feature_layer,
+                vision_feature_select_strategy=model.config.vision_feature_select_strategy,
+                vision_tokens_per_frame=vision_shape[0], vision_feature_dim=vision_shape[1], epsilon=EPSILON,
+                distance='mean over aligned vision patches of L2(V[t]-V[t-1])/sqrt(mean_i ||V[t,i]||^2 + epsilon)',
+                threshold_rule='D[t] > max(epsilon, multiplier * EMA[t-1]); update EMA after decision, including boundaries',
+                warmup='First adjacent pair initializes EMA and cannot create a boundary; final segment may be shorter than min_frames',
+                pooling=False,
+                similarity='Per-token cosine in selected key or hidden space; all = per-cell mean over language-model layers',
+                token_similarity=dict(storage='per-layer unpooled states in token_keys/*.npy and token_hidden/*.npy',
+                                      representations=['key', 'hidden'],
+                                      definitions=dict(key='pre-RoPE k_proj output; concatenate native KV heads',
+                                                       hidden='decoder block output after attention and MLP residuals, before final model norm'),
+                                      rows='summary content tokens', columns='selected frame spatial tokens in row-major order'),
+                interpretation='Representation-space observation, not a calibrated semantic score; visual language-model states retain earlier-frame context',
+                system_prompt=SUMMARY_SYSTEM)
+            self.summarize_segments(segment_experiment, token_stores, video_features,
+                                    tokens_per_frame, frames, params, stop_ids, progress, check_cancel)
+        progress('statistics', '汇总 attention mass 并保存结果与模型回答', 0.98)
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         result = dict(
             sequence=dict(total_tokens=length, prefix_tokens=prefix_length,
@@ -300,15 +272,74 @@ class ObservationEngine:
             method=dict(attention='full causal prefill, native RoPE, no KV eviction',
                         aggregation=f'mean over the last {window} queries and attention heads; all = mean over layers',
                         importance='softmax over every causally visible key, then retain keys before the window',
-                        entropy='p_i = s_i / sum_frame(s); H = -sum(p_i * ln(p_i)); H_norm = H / ln(scored_tokens)',
                         pooling=False, frames_include_window_tokens=True,
                         reference='https://github.com/FasterDecoding/SnapKV'),
-            frames=frames, spatial=spatial, answer=answer, kv_snapshot=kv_snapshot,
-            uniqueness=uniqueness, uniqueness_pre_rope=uniqueness_pre_rope,
-            pre_rope_key_snapshot=pre_rope_key_snapshot,
+            frames=frames, spatial=spatial, answer=answer,
             views=build_views(np.stack(scores), frames, prefix_length),
-            attention_comparison=build_comparison(before_scores, after_scores, frames, queries),
             observation_elapsed_seconds=observation_elapsed,
             elapsed_seconds=time.monotonic() - began,
         )
+        if segment_experiment is not None:
+            result['segment_experiment'] = segment_experiment
         return result
+
+    @torch.inference_mode()
+    def summarize_segments(self, experiment, token_stores, video_features, tokens_per_frame,
+                           frames, params, stop_ids, progress, check_cancel):
+        """Generate each summary from its segment only, then encode text independently."""
+        model, tokenizer = self.model, self.processor.tokenizer
+        decoder = model.model.language_model
+        embedding = decoder.get_input_embeddings()
+        device, limit = embedding.weight.device, decoder.config.max_position_embeddings
+        system = f'<|im_start|>system\n{SUMMARY_SYSTEM}<|im_end|><|im_start|>user\n'
+        system_ids = tokenizer(system, return_tensors='pt').input_ids.to(device)
+        text_prefix = tokenizer(INIT_PROMPT, return_tensors='pt').input_ids.to(device)
+        requested = params.get('summary_max_new_tokens', 192)
+        for index, segment in enumerate(experiment['segments']):
+            check_cancel()
+            began = time.monotonic()
+            start, end = segment['start_frame'], segment['end_frame']
+            prompt = summary_prompt(frames[start:end])
+            suffix = question_inputs(tokenizer, prompt).to(device)
+            visual = video_features[:, start * tokens_per_frame:end * tokens_per_frame]
+            inputs = torch.cat([embedding(system_ids), visual, embedding(suffix)], dim=1)
+            input_length = inputs.shape[1]
+            if input_length >= limit:
+                raise ValueError(f'Segment {index + 1} summary prompt exceeds context; reduce max_frames')
+            budget = min(requested, limit - input_length)
+
+            def report(count=0):
+                progress('segment_summary',
+                         f'生成 segment {index + 1}/{len(experiment["segments"])} 总结：{count}/{budget} token',
+                         .88 + .09 * (index + count / budget) / len(experiment['segments']))
+
+            report()
+            output = decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
+            ids, reason = greedy_token_ids(decoder, model.lm_head, output, budget, stop_ids,
+                                           check_cancel, lambda n: report(n) if n == 1 or n % 8 == 0 else None)
+            del output, inputs
+            if reason == 'max_new_tokens' and budget < requested:
+                reason = 'context_limit'
+            text = tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+            segment['summary'] = dict(text=text, prompt=prompt, token_ids=ids, generated_tokens=len(ids),
+                                      input_tokens=input_length, max_new_tokens=requested, finish_reason=reason,
+                                      decoding='greedy', context='this segment only; no question, answer or other summaries',
+                                      elapsed_seconds=time.monotonic() - began, tokens=[])
+            if text:
+                # Re-tokenize only the visible summary, excluding EOS and chat markers.
+                content = tokenizer(text, return_tensors='pt', add_special_tokens=False).input_ids.to(device)
+                combined = torch.cat([text_prefix, content], dim=1)
+                segment['summary']['tokens'] = [dict(index=i, token_id=int(token_id),
+                    text=tokenizer.decode([int(token_id)], skip_special_tokens=False,
+                                          clean_up_tokenization_spaces=False))
+                    for i, token_id in enumerate(content[0])]
+                if combined.shape[1] > limit:
+                    raise ValueError('Summary text exceeds context for independent encoding')
+
+                def capture_text(kind, layer, states):
+                    token_stores[kind].summary(layer, index, states[0, text_prefix.shape[1]:])
+
+                if content.shape[1]:
+                    with capture_token_states(decoder, capture_text, check_cancel):
+                        encoded = decoder(input_ids=combined, use_cache=False, return_dict=True)
+                    del encoded

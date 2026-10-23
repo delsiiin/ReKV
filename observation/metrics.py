@@ -1,5 +1,4 @@
-"""Window attention and conditional entropy; no KV pruning or pooling."""
-import math
+"""Window attention and frame mass; no KV pruning or pooling."""
 
 import numpy as np
 import torch
@@ -59,13 +58,14 @@ def query_importance(query, key, query_positions, *, scaling=None, attention_mas
     return total.cpu().numpy()
 
 
-def window_importance(query, key, *, scaling=None, window=WINDOW_SIZE, attention_mask=None):
+def window_importance(query, key, *, scaling=None, window=WINDOW_SIZE, attention_mask=None,
+                      check_cancel=lambda: None):
     """Compatibility wrapper for the last W queries of a complete prefill."""
     length = query.shape[-2]
     if type(window) is not int or window < 1 or length != key.shape[-2] or length <= window:
         raise ValueError("Observation requires a positive window smaller than a full prefill")
     return query_importance(query, key, range(length - window, length),
-                            scaling=scaling, attention_mask=attention_mask)
+                            scaling=scaling, attention_mask=attention_mask, check_cancel=check_cancel)
 
 
 def validate_video_window(window, video_tokens):
@@ -76,7 +76,7 @@ def validate_video_window(window, video_tokens):
 
 
 def frame_statistics(scores, frames):
-    """H(frame) uses p_i = score_i / frame_mass, over historical tokens only."""
+    """Sum attention mass over historical tokens in each frame."""
     scores = np.asarray(scores, dtype=np.float64)
     if not np.isfinite(scores).all() or (scores < 0).any():
         raise ValueError("Importance scores must be finite and nonnegative")
@@ -85,14 +85,7 @@ def frame_statistics(scores, frames):
         start, end = frame['token_start'], frame['token_end']
         values = scores[start:min(end, len(scores))]
         mass, count = float(values.sum()), len(values)
-        entropy = normalized = effective = None
-        if count and mass > 0:
-            p = values[values > 0] / mass
-            entropy = max(0.0, float(-(p * np.log(p)).sum()))
-            normalized = entropy / math.log(count) if count > 1 else 0.0
-            effective = math.exp(entropy)
-        result.append(dict(index=frame['index'], mass=mass, entropy=entropy,
-                           normalized_entropy=normalized, effective_tokens=effective,
+        result.append(dict(index=frame['index'], mass=mass,
                            scored_tokens=count, window_tokens=end - start - count))
     return result
 
@@ -113,33 +106,3 @@ def build_views(layer_scores, frames, prefix_length):
                           text_mass=max(0.0, float(scores.sum()) - video_mass),
                           window_mass=float(vector[prefix_length:].sum())))
     return views
-
-
-def build_comparison(before_scores, after_scores, frames, queries):
-    """Keep identical, complete video key positions in both phases."""
-    positions = [i for frame in frames for i in range(frame['token_start'], frame['token_end'])]
-    phase_views = {}
-    for phase, scores in [('before', before_scores), ('after', after_scores)]:
-        full = np.asarray(scores, dtype=np.float64)
-        if (full.ndim != 2 or not np.isfinite(full).all() or (full < 0).any()
-                or not np.allclose(full.sum(axis=1), 1, atol=2e-5)):
-            raise ValueError("Comparison attention must be finite, nonnegative and sum to one")
-        views = []
-        for vector in [full.mean(axis=0), *full]:
-            stats = frame_statistics(vector, frames)
-            video_mass = float(vector[positions].sum())
-            views.append(dict(scores=vector[positions].tolist(), frames=stats,
-                              video_mass=video_mass,
-                              text_mass=max(0.0, float(vector.sum()) - video_mass)))
-        phase_views[phase] = views
-    if len(phase_views['before']) != len(phase_views['after']):
-        raise ValueError("Comparison phases must have identical layers")
-    return dict(
-        queries=queries, token_positions=positions,
-        method=dict(aggregation='mean over selected queries and attention heads; all = mean over layers',
-                    denominator='all causally visible keys, including text and query-window keys',
-                    video_keys='all video tokens, including the video query window',
-                    difference='after - before'),
-        views=[dict(id='all' if i == 0 else str(i - 1), before=before, after=after)
-               for i, (before, after) in enumerate(zip(phase_views['before'], phase_views['after']))],
-    )
