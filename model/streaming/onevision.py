@@ -50,6 +50,7 @@ class OneVisionEngine:
         if self.model.dtype != torch.float16:
             raise ValueError('Compressed KV comparison requires a float16 model')
         self.decoder = self.model.model.language_model
+        self._model_parameter_bytes = sum(p.numel()*p.element_size() for p in self.model.parameters())
         self.device = self.decoder.get_input_embeddings().weight.device
         self.tokenizer = self.processor.tokenizer
         self.prefix = self.tokenizer(INIT_PROMPT, return_tensors='pt').input_ids.to(self.device)
@@ -142,7 +143,7 @@ class OneVisionEngine:
         self.decoder(inputs_embeds=feature, past_key_values=contexts, use_cache=True, return_dict=True)
         self.cache.append_frame(timestamp, [context.captured for context in contexts])
         if not self.compression_enabled:
-            self.cache.close_uncompressed_segment()
+            self.cache.close_uncompressed_segment(return_stats=False)
             self.timings['encode_seconds'] += time.monotonic()-began
             return
         self.features.append(feature.detach().clone())
@@ -156,8 +157,7 @@ class OneVisionEngine:
     def close_segment(self, reset_segmenter=True):
         self.check_cancel()
         if not self.compression_enabled:
-            self.cache.close_uncompressed_segment()
-            return self.stats()
+            return self.stats(self.cache.close_uncompressed_segment())
         if not self.features:
             return self.stats()
         began = time.monotonic()
@@ -190,12 +190,12 @@ class OneVisionEngine:
             error = f'{type(exc).__name__}: {exc}'[:256]
         self.timings['summary_seconds'] += time.monotonic()-began
         began = time.monotonic()
-        self.cache.close_segment(queries, error)
+        cache_stats = self.cache.close_segment(queries, error)
         self.timings['score_compress_seconds'] += time.monotonic()-began
         self.features, self.frame_info = [], []
         if reset_segmenter:
             self.segmenter.close()
-        stats = self.stats()
+        stats = self.stats(cache_stats)
         stats['summary'] = text
         stats['summary_error'] = error
         return stats
@@ -226,12 +226,12 @@ class OneVisionEngine:
                     process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,
                     gpu_peak_bytes=torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else 0)
 
-    def stats(self):
-        result = self.cache.memory_stats()
+    def stats(self, cache_stats=None):
+        result = self.cache.memory_stats() if cache_stats is None else dict(cache_stats)
         result.update(self.timings)
         result['inference_pid'] = os.getpid()
         result['model_instances'] = 1
-        result['model_parameter_bytes'] = sum(p.numel()*p.element_size() for p in self.model.parameters())
+        result['model_parameter_bytes'] = self._model_parameter_bytes
         result['feature_working_bytes'] = sum(x.untyped_storage().nbytes() for x in self.features)
         result['process_peak_rss_bytes'] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024
         result['gpu_peak_bytes'] = torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else 0

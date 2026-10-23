@@ -1,5 +1,6 @@
 """Single-writer immutable frame cache. KV stays on its originating device; snapshots never leave the owner process."""
 from dataclasses import dataclass, is_dataclass, replace
+import math
 import sys
 import time
 
@@ -8,6 +9,7 @@ import torch
 from .quantization import PackedKV
 from .segments import summary_scores
 from .profiling import measure
+from .accounting import MemoryLedger, TrackedDict
 
 
 def footprint(value, seen=None, storages=None):
@@ -181,7 +183,7 @@ class StreamingKVCache:
             raise ValueError('All cache layers must use one device')
         self.budget = budget_tokens * 4 * sum(k.shape[0]*k.shape[-1] for k, _ in self.sink)
         self.frame_tokens, self.recent_frames, self.group_size = frame_tokens, recent_frames, group_size
-        self.frames = {}
+        self._frames = TrackedDict(changed=self._frame_changed)
         self.next_id = self.segment_id = self.version = 0
         self.last_timestamp = float('-inf')
         self.last_activation_id = -1
@@ -201,13 +203,163 @@ class StreamingKVCache:
         protected = footprint((self.sink, reserve)) + (recent_frames-1)*footprint(layers) + 4096
         if self.budget < protected:
             raise ValueError(f'Budget {self.budget} bytes cannot hold sink/recent metadata; need at least {protected}')
+        self._reset_accounting()
+
+    @property
+    def frames(self):
+        return self._frames
+
+    @frames.setter
+    def frames(self, value):
+        if value is self._frames:
+            return
+        self._frames = TrackedDict(value, changed=self._frame_changed)
+        # Bulk replacement is a cold compatibility/debug path. Normal updates
+        # use the tracked table and never rebuild the object graph.
+        self._reset_accounting()
+
+    @property
+    def counts(self):
+        return self._counts
+
+    @counts.setter
+    def counts(self, value):
+        if value is not getattr(self, '_counts', None):
+            self._counts = TrackedDict(value, changed=self._diagnostics_changed)
+
+    @property
+    def snapshots(self):
+        return self._snapshots
+
+    @snapshots.setter
+    def snapshots(self, value):
+        if value is not getattr(self, '_snapshots', None):
+            self._snapshots = TrackedDict(value, changed=self._snapshot_changed)
+
+    @property
+    def last_event(self):
+        return self._last_event
+
+    @last_event.setter
+    def last_event(self, value):
+        if value is not getattr(self, '_last_event', None):
+            self._last_event = TrackedDict(value, changed=self._diagnostics_changed)
+
+    def _diagnostics_changed(self, mapping, key, previous, value):
+        self._working_ledger.mapping_changed(mapping, key)
+
+    def _reset_accounting(self):
+        self._recent_key = None
+        recent = set(self.recent_ids)
+        self._accounted_recent = recent
+        self._accounted_recent_ids = self.recent_ids
+        self._managed = {i: f for i, f in self.frames.items() if f.closed or i in recent}
+        self._open_ids = dict.fromkeys(i for i, f in self.frames.items() if not f.closed)
+        self._bits = {str(b): 0 for b in (16, 8, 4, 2, 0)}
+        self._frame_counts = {}
+        for frame in self.frames.values():
+            for layer in frame.layers:
+                self._bits[str(layer.bits)] += 1
+            self._frame_counts[frame.frame_id] = self._token_counts(frame)
+        self._persistent_ledger, self._working_ledger = MemoryLedger(), MemoryLedger()
+        self._persistent_root = self._persistent_value()
+        self._working_root = (self._persistent_root, self.frames, self.snapshots, self.counts, self.last_event)
+        self._persistent_ledger.add(self._persistent_root)
+        self._working_ledger.add(self._working_root)
+
+    def _frame_changed(self, mapping, key, previous, value):
+        # Appends and eviction of non-recent frames only need the previous top-k
+        # IDs. Avoid sorting every retained ID on every insertion/deletion.
+        if (self._recent_key is not None and self._recent_key[0] == id(mapping)
+                and self._recent_key[2] == self.recent_frames):
+            if previous is None:
+                self._recent_ids = tuple(sorted((*self._recent_ids, key))[-self.recent_frames:])
+                self._recent_key = (id(mapping), mapping.key_version, self.recent_frames)
+            elif value is None and key not in self._recent_ids:
+                self._recent_key = (id(mapping), mapping.key_version, self.recent_frames)
+        self._working_ledger.mapping_changed(mapping, key)
+        if previous is None or value is None or previous.layers is not value.layers:
+            if previous is not None:
+                for layer in previous.layers:
+                    self._bits[str(layer.bits)] -= 1
+            if value is not None:
+                for layer in value.layers:
+                    self._bits[str(layer.bits)] += 1
+                self._frame_counts[key] = self._token_counts(value)
+            else:
+                self._frame_counts.pop(key, None)
+        if value is None or value.closed:
+            self._open_ids.pop(key, None)
+        else:
+            self._open_ids[key] = None
+        self._update_managed(key)
+
+    @staticmethod
+    def _token_counts(frame):
+        counts = []
+        for layer in frame.layers:
+            row = [layer.high_indices.numel(), 0, 0, 0]
+            low = layer.low_indices.numel()
+            if low:
+                row[{16: 0, 8: 1, 4: 2, 2: 3}[layer.bits]] += low
+            counts.append(tuple(row))
+        return tuple(counts)
+
+    def _update_managed(self, changed=None):
+        recent_ids = self.recent_ids
+        if changed is None and recent_ids == self._accounted_recent_ids:
+            return
+        recent = set(recent_ids)
+        affected = recent ^ self._accounted_recent
+        if changed is not None:
+            affected.add(changed)
+        for key in affected:
+            frame = self.frames.get(key)
+            if frame is not None and (frame.closed or key in recent):
+                self._managed[key] = frame
+            else:
+                self._managed.pop(key, None)
+            self._persistent_ledger.mapping_changed(self._managed, key)
+            self._working_ledger.mapping_changed(self._managed, key)
+        self._accounted_recent = recent
+        self._accounted_recent_ids = recent_ids
+
+    def _snapshot_changed(self, mapping, key, previous, value):
+        self._working_ledger.mapping_changed(mapping, key)
+
+    def _persistent_value(self):
+        return (self.sink, self._managed, self.budget, self.frame_tokens, self.recent_frames,
+                self.group_size, self.next_id, self.segment_id, self.version, self.last_activation_id)
+
+    def _refresh_accounting(self):
+        # recent_frames and scalar configuration can also be adjusted by callers.
+        self._update_managed()
+        persistent = self._persistent_value()
+        if all(a is b for a, b in zip(persistent, self._persistent_root)):
+            persistent = self._persistent_root
+        else:
+            self._persistent_ledger.add(persistent)
+            self._persistent_ledger.remove(id(self._persistent_root))
+        working = (persistent, self.frames, self.snapshots, self.counts, self.last_event)
+        if all(a is b for a, b in zip(working, self._working_root)):
+            working = self._working_root
+        else:
+            self._working_ledger.add(working)
+            self._working_ledger.remove(id(self._working_root))
+        self._persistent_root, self._working_root = persistent, working
+        self._persistent_ledger.refresh_metadata_sizes()
+        self._working_ledger.refresh_metadata_sizes()
 
     @property
     def recent_ids(self):
-        return tuple(sorted(self.frames)[-self.recent_frames:])
+        key = (id(self.frames), self.frames.key_version, self.recent_frames)
+        if getattr(self, '_recent_key', None) != key:
+            self._recent_key = key
+            self._recent_ids = tuple(sorted(self.frames)[-self.recent_frames:])
+        return self._recent_ids
 
     def append_frame(self, timestamp, layers):
-        if not torch.isfinite(torch.tensor(timestamp)) or timestamp < self.last_timestamp:
+        if not math.isfinite(timestamp) or timestamp < self.last_timestamp:
             raise ValueError('Frame timestamps must be finite and nondecreasing')
         if len(layers) != len(self.sink):
             raise ValueError('Layer count mismatch')
@@ -225,17 +377,16 @@ class StreamingKVCache:
         return frame.frame_id
 
     def _persistent(self):
-        recent = set(self.recent_ids)
-        return (self.sink, {i: f for i, f in self.frames.items() if f.closed or i in recent},
-                self.budget, self.frame_tokens, self.recent_frames, self.group_size,
-                self.next_id, self.segment_id, self.version, self.last_activation_id)
+        self._refresh_accounting()
+        return self._persistent_root
 
     def persistent_bytes(self):
-        return footprint(self._persistent())
+        self._refresh_accounting()
+        return self._persistent_ledger.total
 
     def close_segment(self, queries, error=''):
         began = time.monotonic()
-        pending = [f for f in self.frames.values() if not f.closed]
+        pending = [self.frames[i] for i in self._open_ids]
         if not pending:
             return self.memory_stats()
         with measure(self.profiler, 'token_scoring'):
@@ -263,19 +414,19 @@ class StreamingKVCache:
         self._enforce_budget()
         self.last_event['elapsed_seconds'] = time.monotonic()-began
         self.last_event['after_bytes'] = self.persistent_bytes()
-        if self.persistent_bytes() > self.budget:
+        if self.last_event['after_bytes'] > self.budget:
             raise MemoryError('Protected cache exceeds budget')
         return self.memory_stats()
 
-    def close_uncompressed_segment(self):
+    def close_uncompressed_segment(self, *, return_stats=True):
         """Comparison baseline: retain every FP16 frame; no summaries or policy calls."""
-        pending = [f for f in self.frames.values() if not f.closed]
+        pending = [self.frames[i] for i in self._open_ids]
         for frame in pending:
             self.frames[frame.frame_id] = replace(frame, closed=True)
         if pending:
             self.segment_id += 1
             self.version += 1
-        return self.memory_stats()
+        return self.memory_stats() if return_stats else None
 
     def _enforce_budget(self):
         if self.persistent_bytes() <= self.budget:
@@ -352,30 +503,40 @@ class StreamingKVCache:
                 result.append(dict(frame_id=frame_id, segment_id=(segment_ids or {}).get(frame_id),
                                    status='evicted', protected=False, counts=None))
                 continue
-            counts = []
-            for layer in frame.layers:
-                row = [layer.high_indices.numel(), 0, 0, 0]
-                low = layer.low_indices.numel()
-                if low:
-                    row[{16: 0, 8: 1, 4: 2, 2: 3}[layer.bits]] += low
-                counts.append(row)
+            counts = [list(row) for row in self._frame_counts[frame_id]]
             result.append(dict(frame_id=frame_id, segment_id=frame.segment_id, status='closed' if frame.closed else 'open',
                                protected=frame_id in recent, counts=counts))
         return dict(layer_count=len(self.sink), tokens_per_frame=self.frame_tokens,
                     bit_order=[16, 8, 4, 2], frames=result)
 
     def memory_stats(self):
-        persistent = self._persistent()
-        pbytes = footprint(persistent)
-        working = footprint((persistent, self.frames, self.snapshots, self.counts, self.last_event)) - pbytes
-        bits = {str(b): 0 for b in (16, 8, 4, 2, 0)}
-        for frame in self.frames.values():
-            for layer in frame.layers:
-                bits[str(layer.bits)] += 1
+        self._refresh_accounting()
+        ledger = self._persistent_ledger
+        pbytes = ledger.total
+        working = self._working_ledger.total-pbytes
         return dict(cache_device=str(self.device), offload_enabled=False,
                     budget_bytes=self.budget, persistent_bytes=pbytes,
-                    persistent_tensor_bytes=tensor_storage_bytes(persistent),
-                    persistent_cuda_bytes=tensor_storage_bytes(persistent, 'cuda'),
+                    persistent_tensor_bytes=ledger.tensor_bytes,
+                    persistent_cuda_bytes=ledger.cuda_bytes,
                     cache_working_bytes=working, retained_frames=len(self.frames),
-                    open_frames=sum(not f.closed for f in self.frames.values()),
-                    bits=bits, counts=dict(self.counts), last_event=dict(self.last_event))
+                    open_frames=len(self._open_ids),
+                    bits=dict(self._bits), counts=dict(self.counts), last_event=dict(self.last_event))
+
+    def audit_accounting(self):
+        """Slow independent verification for tests/debugging, never budget checks."""
+        stats = self.memory_stats()
+        assert self.recent_ids == tuple(sorted(self.frames)[-self.recent_frames:])
+        recent = set(self.recent_ids)
+        expected_frames = {i: f for i, f in self.frames.items() if f.closed or i in recent}
+        assert self._managed.keys() == expected_frames.keys()
+        assert all(self._managed[i] is f for i, f in expected_frames.items())
+        assert set(self._open_ids) == {i for i, f in self.frames.items() if not f.closed}
+        persistent = self._persistent_root
+        expected = dict(persistent_bytes=footprint(persistent),
+                        persistent_tensor_bytes=tensor_storage_bytes(persistent),
+                        persistent_cuda_bytes=tensor_storage_bytes(persistent, 'cuda'),
+                        cache_working_bytes=footprint(self._working_root)-footprint(persistent))
+        for name, value in expected.items():
+            if stats[name] != value:
+                raise AssertionError(f'{name}: ledger={stats[name]}, full scan={value}')
+        return stats
