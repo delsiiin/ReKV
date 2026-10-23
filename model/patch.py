@@ -32,7 +32,7 @@ def huggingface_forward(forward):
     return hf_forward
 
 
-def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, **kwargs):
+def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, attention_factory=None, **kwargs):
     attn_kwargs = {**(attn_kwargs or {}), **kwargs}
     decoder = model if isinstance(model, (LlamaModel, MistralModel, Qwen2Model)) else getattr(model, "model", None)
     if not isinstance(decoder, (LlamaModel, MistralModel, Qwen2Model)):
@@ -110,7 +110,8 @@ def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, **kwargs):
         rope.inv_freq.copy_(decoder.rotary_emb.inv_freq)
     decoder.position_bias = rope
 
-    forward = huggingface_forward(rekv_attention_forward(**attn_kwargs))
+    factory = rekv_attention_forward if attention_factory is None else attention_factory
+    forward = huggingface_forward(factory(**attn_kwargs))
     for layer in decoder.layers:
         attention = layer.self_attn
         if not hasattr(attention, "_old_forward"):
