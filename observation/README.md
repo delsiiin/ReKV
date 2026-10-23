@@ -26,14 +26,15 @@ ssh -L 8765:127.0.0.1:8765 user@server
 页面支持：切换 RVS 分组和视频、查看全部问题与原始标注、设置最大帧数 / 采样 FPS /
 起始时间 / 视频末尾 token 数 N、生成或取消计算、切换观察层、查看逐帧图片 / mass 和 token 热力图、
 在原图上定位 token、比较 attention mass 分布、生成所选问题的模型回答、
-基于 vision encoder 输出距离自动分段、逐段主动总结，以及每帧图片 token 对全部 summary 内容 token 的平均余弦相似度热力图。
+基于 vision encoder 输出距离自动分段、逐段主动总结、图片 token 对全部 summary 内容 token 的平均余弦相似度，
+以及 summary Query → segment Key 的 softmax 前/后注意力热力图。
 可下载完整 JSON、当前层帧统计 CSV 和图片 token 平均相似度 CSV。首次打开需点击「生成观察数据」；之后切换样本
 默认自动计算，可关闭自动计算选项。参数变更后需点击生成按钮。
 
 当前采集所选输入末尾窗口的注意力与帧 mass，并生成模型回答；默认启用新增的 segment 观察实验。
 问题前后对照、K/V magnitude、K/V 冗余与有效数量、注意力熵的计算及接口已移除。
-新结果使用 `schema_version=19`，`segment_experiment` 记录逐 token 相似度入口，
-另存各语言模型层未池化的视频 / summary Key 与 hidden states，不保存 Value。旧缓存文件保留在磁盘上；
+新结果使用 `schema_version=21`，`segment_experiment` 记录逐 token 相似度及 segment 注意力入口，
+另存各语言模型层未池化的视频 / summary Key、hidden states，以及 summary Query，不保存 Value。旧缓存文件保留在磁盘上；
 代码指纹变化会使新任务重新计算。更新后请重启服务并刷新页面。
 
 ## 输入与采样
@@ -107,14 +108,15 @@ s[t] = sqrt(mean_i ||v[t,i]||_2^2 + epsilon)
 d[t,i] = ||v[t,i] - v[t-1,i]||_2 / s[t]
 D[t] = mean_i d[t,i]
 similarity[t] = 1 / (1 + D[t])
-tau[t] = max(epsilon, multiplier * EMA[t-1])
+tau[t] = max(epsilon, EMA[t-1])
 boundary[t] = D[t] > tau[t] and current_segment_frames >= min_frames
 EMA[t] = (1-alpha) * EMA[t-1] + alpha * D[t]
 ```
 
 `epsilon=1e-6`。尺度按当前帧全部 patch 的向量范数计算；距离使用 FP32。
 对应空间位置逐一计算后取平均，不先对整帧向量池化；跨 vision encoder 批次的相邻帧也正常比较。
-默认 `alpha=0.2`、`multiplier=1.5`、`min_frames=1`，均可在页面设置。
+阈值倍数固定为 `1`，不提供自定义输入；接口也只接受省略该参数或传入 `1`。
+默认 `alpha=0.2`、`min_frames=1`，这两项仍可在页面设置。
 第一对帧初始化 EMA、不产生边界；只有 1–2 帧时形成一段。若第一对帧已经发生切换，此初始化无法检出它。
 先使用历史 EMA 判定，再更新（边界距离也纳入更新）。切分发生在当前帧之前，新段从当前帧开始。
 最后一段可以少于 `min_frames`，不会丢弃或回并图片。
@@ -184,7 +186,65 @@ JSON 不内嵌全部 token 对，以控制结果大小；复现需保留同目�
 段的 `start_frame` 含起点、`end_frame` 不含终点；时间范围仅指首尾采样帧，不表示精确事件边界。
 所有新参数均进入缓存指纹。关闭实验时不生成该字段。
 
-## 注意力计算口径
+## Summary Query → Segment Key 注意力观察
+
+新增独立面板，与余弦相似度面板使用相同的图片网格、当前帧 min–max 色阶、
+低于帧内均值的白色剪枝预览、空间悬停/键盘定位和 CSV 导出方式。
+面板可独立选择 summary、图片 segment、段内帧和语言模型层，并同时展示 softmax 前、后的结果。
+
+可选择 **RoPE 前后对比**（默认）、**RoPE 前**或 **RoPE 后**。前后两组使用相同的 summary、segment、层和遮罩。
+
+- RoPE 前：取模型实际 `q_proj` / `k_proj` 输出。
+- RoPE 后：直接在模型原生 attention dispatch 入口采集已应用 RoPE 的 Q/K，不自行近似旋转。
+- summary 仍使用独立纯文本 prefill，图片 Key 使用原完整视频 prefill。
+  RoPE 使用各自输入的原生位置编号，**不将 summary 重新定位到视频之后**。
+  页面及接口记录 segment 和独立 summary 的位置区间；这仍是跨输入的 QK 对照。
+
+逻辑 Key 序列为 `[所选 segment 的全部图片 token, summary 的全部内容 token]`。
+每个 summary token 作为 Query，按原生 GQA 映射选择 KV head，单 head 维度为 d：
+
+```
+L[l,h,i,j] = Q[l,h,i] · K[l,kv(h),j] / sqrt(d)
+M[j] = 0       if j belongs to the selected segment
+M[j] = -inf    if j belongs to the summary (including the query token itself)
+L_masked[l,h,i,j] = L[l,h,i,j] + M[j]
+A[l,h,i,:] = softmax_j(L_masked[l,h,i,:])
+pre[l,j] = mean_{h,i} L_masked[l,h,i,j], j in segment
+post[l,j] = mean_{h,i} A[l,h,i,j], j in segment
+```
+
+计算中实际拼接图片 Key 与 summary Key，并在 softmax **之前**应用布尔 mask，
+不是计算包含 summary 的 softmax 后再隐藏其显示。prompt 与其他 segment 的 Key 不纳入此次观察。
+两组的 summary 权重和均为 0，segment 权重和约为 1；页面显示这两个校验量。
+mask 用于分析分布，不更改模型 forward 中隐藏状态的生成过程。
+
+“全部层平均”分别平均各层的 pre 和 post；必须先对每个 query、head 做 softmax，再平均，
+不对已平均的 logits 做 softmax。计算按 head 和 query 分块处理。
+Softmax 分母包含所选 segment 的全部帧、全部图片 token，而不是当前展示帧。
+切帧只切出对应 token 分数，单帧 post 总和可小于 1。
+无 summary 内容 token 时分数未定义，显示灰色且不展示剪枝。
+RoPE 前后、softmax 前后各自使用当前帧实际 min–max 色阶和帧内均值剪枝阈值，比较时可读取原始数值。
+
+各层的文件：
+- `token_queries/summary-{summary_index}-{layer}.npy`：RoPE 前 summary Query。
+- `token_queries_rope/summary-{summary_index}-{layer}.npy`：RoPE 后 summary Query。
+- `token_keys/video-{layer}.npy`、`token_keys/summary-{summary_index}-{layer}.npy`：RoPE 前图片 / summary Key。
+- `token_keys_rope/video-{layer}.npy`、`token_keys_rope/summary-{summary_index}-{layer}.npy`：RoPE 后图片 / summary Key。
+
+Query 形状为 `[summary 内容 token 数, query_heads × head_dim]`，不保存视频 Query。
+结果 JSON 的 `segment_experiment.segment_attention` 记录计算口径和接口：
+`GET /api/segment-attention/{job_id}?summary=0&segment=0&frame=0&layer=all&rope=both`。
+`rope` 可为 `pre` / `post` / `both`，省略时为 `pre`。frame 必须属于所选 segment。
+响应 `variants` 返回每个 RoPE 模式的 softmax 前后均值向量、各帧权重和、segment 权重和、summary 权重和；
+另记录 `masked_summary_tokens`、逻辑 Key 数量和原生位置范围。
+顶层分数保留第一个 variant 的数值以兼容单模式调用，`requested_rope` 记录请求模式。
+CSV 导出所显示的全部模式及其前后分数、阈值、剪枝标记、summary 权重和与 mask token 数。
+
+这是带 segment-only mask 的跨输入观察，不是完整上下文中的原生注意力。
+原有末尾窗口注意力、独立文字余弦相似度和问答计算仍保持各自口径。
+更新后需重启服务并重新生成一次，以采集 RoPE 后状态；之后切换无需重新运行模型。
+
+## 原末尾窗口注意力计算口径
 
 这是独立的**完整因果注意力 prefill**观察路径，不调用 ReKV 的 KV 淘汰或检索，
 不修改现有评测推理。这样所选输入范围内的历史 token 都能被窗口观察。

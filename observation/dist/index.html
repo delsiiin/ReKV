@@ -4,7 +4,7 @@
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RVS · Attention Observatory</title>
   <meta name="description" content="本地 RVS 视频注意力观察实验：可配置视频窗口、逐帧 attention mass 与 token 热力图。">
-  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/attention.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -25,10 +25,10 @@
     <label for="maxAnswerTokens">回答最大 token 数</label><input id="maxAnswerTokens" type="number" value="128" min="1" max="512" required>
     <div class="section-label">03 / SEGMENT 观察</div>
     <label class="check-label"><input id="segmentEnabled" type="checkbox" checked> 分段、主动总结与相似度</label>
-    <div class="field-pair"><div><label for="emaAlpha">EMA α</label><input id="emaAlpha" type="number" value="0.2" min="0.001" max="1" step="any" required></div><div><label for="emaMultiplier">阈值倍数</label><input id="emaMultiplier" type="number" value="1.5" min="0.001" max="100" step="any" required></div></div>
+    <label for="emaAlpha">EMA α</label><input id="emaAlpha" type="number" value="0.2" min="0.001" max="1" step="any" required>
     <label for="segmentMinFrames">切分前最少帧数</label><input id="segmentMinFrames" type="number" value="1" min="1" max="128" required>
     <label for="summaryMaxTokens">每段 summary 最大 token 数</label><input id="summaryMaxTokens" type="number" value="192" min="1" max="512" required>
-    <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。第一对帧初始化 EMA；后续距离超过历史 EMA × 倍数则切分。每段单独生成总结。</p>
+    <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。阈值倍数固定为 1；第一对帧初始化 EMA，后续距离超过历史 EMA 则切分。每段单独生成总结。</p>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
     <button id="cancel" class="secondary" type="button" hidden>取消当前任务</button>
@@ -73,6 +73,23 @@
       <p id="segmentSimilarityReadout" class="spatial-readout" aria-live="polite">选择 summary、segment 和帧查看相似度。</p>
       <p id="similarityRepresentationNote" class="tiny"></p>
       <p class="tiny">这是所选模型表示空间的观察量，未经语义匹配校准。图片表示来自完整视频的因果 prefill，保留此前帧的上下文；文字独立编码，不含图片、问题、参考答案或其他 summary。</p>
+    </section>
+    <section id="segmentAttentionPanel" class="panel" hidden>
+      <div class="panel-heading"><div><h2>Summary Query → Segment Key 注意力分布</h2><p id="segmentAttentionMeta" class="muted"></p></div><button id="exportAttentionCsv" class="text-button" type="button" disabled>↓ 当前帧 CSV</button></div>
+      <div class="similarity-controls">
+        <label for="segmentAttentionRope">QK 位置编码<select id="segmentAttentionRope"><option value="both">RoPE 前后对比</option><option value="pre">RoPE 前</option><option value="post">RoPE 后</option></select></label>
+        <label for="segmentAttentionLayer">注意力层<select id="segmentAttentionLayer"></select></label>
+        <label for="segmentAttentionSummary">文字 summary / Query<select id="segmentAttentionSummary"></select></label>
+        <label for="segmentAttentionSegment">图片 segment / Key<select id="segmentAttentionSegment"></select></label>
+        <label for="segmentAttentionFrame">段内图片帧<select id="segmentAttentionFrame"></select></label>
+      </div>
+      <p id="segmentAttentionSummaryText" class="answer-text"></p>
+      <p class="muted">每个 summary token 作为 Query；Key 序列为所选 segment 图片 token + summary token。Softmax 前将全部 summary Key 列（包括自身）mask 为 −∞，仅在整个 segment 的图片 token 上归一化，再平均 summary tokens、heads 与所选层。切帧不改变归一化范围。</p>
+      <p id="segmentAttentionMass" class="muted"></p>
+      <div id="segmentAttentionMaps"></div>
+      <p id="segmentAttentionReadout" class="spatial-readout" aria-live="polite">选择 summary、segment、帧和层查看分数。</p>
+      <p id="segmentAttentionPositions" class="tiny"></p>
+      <p class="tiny">RoPE 前取原生 q_proj / k_proj 输出，RoPE 后取模型实际旋转后的 Q/K，均使用原生 GQA head 对应关系。两组采用相同的 summary-Key mask。summary 仍独立编码，RoPE 使用各自输入的原生位置编号（未将 summary 重定位到视频之后）。遮罩作用于观察分布，不改变原模型 forward；这是跨输入 QK 对照，并非完整上下文中的原生注意力。</p>
     </section>
     <section id="answerPanel" class="panel" hidden><div class="panel-heading"><h2>模型回答</h2><span id="answerStatus" class="tag"></span></div><p id="answerQuestion" class="answer-question"></p><div class="answer-columns"><div><div class="eyebrow">MODEL RESPONSE</div><p id="modelAnswer" class="answer-text"></p></div><div class="reference-answer"><div class="eyebrow">REFERENCE ANSWER</div><p id="referenceAnswer" class="answer-text"></p></div></div><p id="answerMeta" class="muted"></p></section>
     <details id="inputDetails" class="panel" hidden><summary>本次模型输入与采样信息</summary><pre id="inputMetadata"></pre></details>

@@ -55,12 +55,15 @@ def validate_params(raw, dataset, max_frames):
         raise ValueError('start_time must be a finite nonnegative number')
     segment = dict(segment_enabled=raw.get('segment_enabled', True),
                    segment_ema_alpha=raw.get('segment_ema_alpha', .2),
-                   segment_threshold_multiplier=raw.get('segment_threshold_multiplier', 1.5),
+                   segment_threshold_multiplier=1.0,
                    segment_min_frames=raw.get('segment_min_frames', 1),
                    summary_max_new_tokens=raw.get('summary_max_new_tokens', 192))
     if type(segment['segment_enabled']) is not bool:
         raise ValueError('segment_enabled must be a boolean')
-    for name, upper in [('segment_ema_alpha', 1), ('segment_threshold_multiplier', 100)]:
+    multiplier = raw.get('segment_threshold_multiplier', 1)
+    if type(multiplier) not in (int, float) or multiplier != 1:
+        raise ValueError('segment_threshold_multiplier is fixed at 1')
+    for name, upper in [('segment_ema_alpha', 1)]:
         value = segment[name]
         if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= upper:
             raise ValueError(f'{name} must be finite and in (0, {upper}]')
@@ -172,7 +175,8 @@ class ObservationService:
             result = self.engine.observe(images, frames, record, params, progress, check_cancel, artifact_dir=directory)
             if 'segment_experiment' in result:
                 result['segment_experiment']['token_similarity']['url'] = f'/api/token-similarity/{job_id}'
-            result.update(schema_version=19, job_id=job_id, sample=record, parameters=params,
+                result['segment_experiment']['segment_attention']['url'] = f'/api/segment-attention/{job_id}'
+            result.update(schema_version=21, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'
@@ -209,6 +213,15 @@ class ObservationService:
             directory = self.cache / job_id
             result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
             return token_similarity(directory, result, summary, frame, layer, representation)
+
+    def segment_attention(self, job_id, summary, segment, frame, layer, rope='pre'):
+        from observation.segments import segment_attention
+        if not re.fullmatch(r'[a-f0-9]{24}', job_id):
+            raise ValueError('Invalid job id')
+        with self.similarity_lock:
+            directory = self.cache / job_id
+            result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
+            return segment_attention(directory, result, summary, segment, frame, layer, rope)
 
 
 def handler_for(service):
@@ -251,6 +264,14 @@ def handler_for(service):
                     return self.send_json(service.dataset.get(path.removeprefix('/api/samples/')))
                 if path.startswith('/api/jobs/'):
                     return self.send_json(service.get_job(path.removeprefix('/api/jobs/')))
+                match = re.fullmatch(r'/api/segment-attention/([a-f0-9]{24})', path)
+                if match:
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    required = {'summary', 'segment', 'frame', 'layer'}
+                    if not required <= set(query) <= required | {'rope'} or any(len(v) != 1 for v in query.values()):
+                        raise ValueError('Expected summary, segment, frame, layer and optional rope exactly once')
+                    return self.send_json(service.segment_attention(match[1], int(query['summary'][0]),
+                        int(query['segment'][0]), int(query['frame'][0]), query['layer'][0], query.get('rope', ['pre'])[0]))
                 match = re.fullmatch(r'/api/token-similarity/([a-f0-9]{24})', path)
                 if match:
                     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -267,6 +288,7 @@ def handler_for(service):
                                           'application/json; charset=utf-8' if filename.endswith('.json') else 'image/jpeg')
                 static = {'/': ('index.html', 'text/html; charset=utf-8'),
                           '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
+                          '/attention.js': ('attention.js', 'application/javascript; charset=utf-8'),
                           '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if path in static:
                     filename, mime = static[path]

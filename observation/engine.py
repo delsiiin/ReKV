@@ -11,7 +11,7 @@ import torch
 from observation.metrics import (WINDOW_SIZE, build_views,
                                  window_importance, validate_video_window)
 from observation.spatial import video_token_layout
-from observation.segments import (EPSILON, SUMMARY_SYSTEM, TokenStateStore, capture_token_states,
+from observation.segments import (EPSILON, SUMMARY_SYSTEM, TokenStateStore, capture_token_states, capture_rotary_states,
                                   selected_vision_features, vision_frame_distances, segment_by_ema, summary_prompt)
 
 
@@ -53,7 +53,7 @@ def question_inputs(tokenizer, question):
 
 
 def install_observer(decoder, callback, *, window=WINDOW_SIZE,
-                     check_cancel=lambda: None):
+                     check_cancel=lambda: None, rotary_callback=None):
     """Dispatch post-RoPE Q/K to the observer, preserving native SDPA outputs."""
     from transformers import AttentionInterface
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -63,6 +63,8 @@ def install_observer(decoder, callback, *, window=WINDOW_SIZE,
         if kwargs.get('sliding_window') is not None:
             raise ValueError("This experiment requires full causal attention")
         check_cancel()
+        if rotary_callback is not None:
+            rotary_callback(module.layer_idx, query, key)
         scores = window_importance(query, key, scaling=kwargs.get('scaling'),
                                    attention_mask=attention_mask, window=window,
                                    check_cancel=check_cancel)
@@ -184,10 +186,15 @@ class ObservationEngine:
         scores = [None] * len(decoder.layers)
         if segment_enabled and artifact_dir is None:
             raise ValueError('Segment token observations require an artifact directory')
-        token_stores = {kind: TokenStateStore(artifact_dir, kind) for kind in ('key', 'hidden')} if segment_enabled else {}
+        token_stores = {kind: TokenStateStore(artifact_dir, kind)
+                        for kind in ('key', 'hidden', 'query', 'key_rope', 'query_rope')} if segment_enabled else {}
 
         def capture_video_states(kind, layer, states):
             token_stores[kind].video(layer, states, frames)
+
+        def capture_video_rotary(layer, query, key):
+            states = key.transpose(1, 2).reshape(key.shape[0], key.shape[2], -1)
+            token_stores['key_rope'].video(layer, states, frames)
 
         def capture(layer, captured):
             check_cancel()
@@ -195,7 +202,8 @@ class ObservationEngine:
             progress('attention', f'计算注意力：第 {layer + 1}/{len(scores)} 层',
                      0.48 + 0.30 * (layer + 1) / len(scores))
 
-        cleanup = install_observer(decoder, capture, window=window, check_cancel=check_cancel)
+        cleanup = install_observer(decoder, capture, window=window, check_cancel=check_cancel,
+                                   rotary_callback=capture_video_rotary if segment_enabled else None)
         try:
             with capture_token_states(decoder, capture_video_states, check_cancel) if segment_enabled else nullcontext():
                 prefill = decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
@@ -238,14 +246,14 @@ class ObservationEngine:
         if segment_enabled:
             segment_experiment = segment_by_ema(
                 vision_distances, frames, params.get('segment_ema_alpha', .2),
-                params.get('segment_threshold_multiplier', 1.5), params.get('segment_min_frames', 1))
+                min_frames=params.get('segment_min_frames', 1))
             segment_experiment.update(
                 segmentation_space='vision encoder selected hidden states, before multimodal projector and spatial pooling',
                 vision_feature_layer=model.config.vision_feature_layer,
                 vision_feature_select_strategy=model.config.vision_feature_select_strategy,
                 vision_tokens_per_frame=vision_shape[0], vision_feature_dim=vision_shape[1], epsilon=EPSILON,
                 distance='mean over aligned vision patches of L2(V[t]-V[t-1])/sqrt(mean_i ||V[t,i]||^2 + epsilon)',
-                threshold_rule='D[t] > max(epsilon, multiplier * EMA[t-1]); update EMA after decision, including boundaries',
+                threshold_rule='D[t] > max(epsilon, EMA[t-1]); multiplier fixed at 1; update EMA after decision, including boundaries',
                 warmup='First adjacent pair initializes EMA and cannot create a boundary; final segment may be shorter than min_frames',
                 pooling=False,
                 similarity='Per-token cosine in selected key or hidden space; all = per-cell mean over language-model layers',
@@ -254,6 +262,15 @@ class ObservationEngine:
                                       definitions=dict(key='pre-RoPE k_proj output; concatenate native KV heads',
                                                        hidden='decoder block output after attention and MLP residuals, before final model norm'),
                                       rows='summary content tokens', columns='selected frame spatial tokens in row-major order'),
+                segment_attention=dict(query='independent summary native pre/post-RoPE Queries',
+                                       key='native pre/post-RoPE Keys of original video and independent summary',
+                                       rope_modes=['pre', 'post'],
+                                       positions='native position IDs from each independent input; summary positions are not moved after the video',
+                                       mask='set ALL summary Key columns to -inf before softmax; only selected segment image columns remain visible',
+                                       logits='Q K^T / sqrt(head_dim), native GQA head mapping',
+                                       normalization='each query and head: softmax over ALL image tokens in selected segment',
+                                       aggregation='separate mean of logits and mean of probabilities over queries, heads and selected layers',
+                                       interpretation='pre/post native RoPE cross-input diagnostic with summary-Key mask; not native full-context attention'),
                 interpretation='Representation-space observation, not a calibrated semantic score; visual language-model states retain earlier-frame context',
                 system_prompt=SUMMARY_SYSTEM)
             self.summarize_segments(segment_experiment, token_stores, video_features,
@@ -329,6 +346,8 @@ class ObservationEngine:
                 # Re-tokenize only the visible summary, excluding EOS and chat markers.
                 content = tokenizer(text, return_tensors='pt', add_special_tokens=False).input_ids.to(device)
                 combined = torch.cat([text_prefix, content], dim=1)
+                segment['summary']['encoding_token_start'] = text_prefix.shape[1]
+                segment['summary']['encoding_token_end'] = combined.shape[1]
                 segment['summary']['tokens'] = [dict(index=i, token_id=int(token_id),
                     text=tokenizer.decode([int(token_id)], skip_special_tokens=False,
                                           clean_up_tokenization_spaces=False))
@@ -339,7 +358,13 @@ class ObservationEngine:
                 def capture_text(kind, layer, states):
                     token_stores[kind].summary(layer, index, states[0, text_prefix.shape[1]:])
 
+                def capture_text_rotary(layer, query, key):
+                    for kind, value in [('query_rope', query), ('key_rope', key)]:
+                        states = value[0].transpose(0, 1).reshape(value.shape[2], -1)
+                        token_stores[kind].summary(layer, index, states[text_prefix.shape[1]:])
+
                 if content.shape[1]:
-                    with capture_token_states(decoder, capture_text, check_cancel):
+                    with capture_token_states(decoder, capture_text, check_cancel, include_queries=True), \
+                            capture_rotary_states(decoder, capture_text_rotary, check_cancel):
                         encoded = decoder(input_ids=combined, use_cache=False, return_dict=True)
                     del encoded

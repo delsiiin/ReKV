@@ -32,6 +32,7 @@ async function cancelPrevious() {
   }
 }
 function clearResults() {
+  document.dispatchEvent(new Event('observation:clear'));
   tokenSimilarity.controller?.abort(); tokenSimilarity.request++; tokenSimilarity.data = null;
   $('exportSegmentCsv').disabled = true;
   state.result = null;
@@ -102,7 +103,7 @@ function parameters() {
     sample_fps: Number($('fps').value), start_time: Number($('startTime').value),
     mode: $('mode').value, question_index: Number($('question').value), max_new_tokens: Number($('maxAnswerTokens').value),
     video_window_size: Number($('videoWindowSize').value), segment_enabled: $('segmentEnabled').checked,
-    segment_ema_alpha: Number($('emaAlpha').value), segment_threshold_multiplier: Number($('emaMultiplier').value),
+    segment_ema_alpha: Number($('emaAlpha').value),
     segment_min_frames: Number($('segmentMinFrames').value), summary_max_new_tokens: Number($('summaryMaxTokens').value)};
 }
 async function run() {
@@ -195,6 +196,7 @@ function renderResult(url, cached) {
   renderSegmentSimilarity();
   updateWindowLabels();
   renderView();
+  document.dispatchEvent(new Event('observation:result'));
 }
 function renderAnswer() {
   const result = state.result, answer = result.answer;
@@ -461,7 +463,7 @@ $('controls').addEventListener('submit', event => { event.preventDefault(); run(
 $('split').addEventListener('change', () => { fillSamples(); $('startTime').value = 0; loadSample(); });
 $('sample').addEventListener('change', () => { $('startTime').value = 0; loadSample(); });
 $('question').addEventListener('change', () => { showQuestion(); if ($('autoRun').checked) run(); else invalidate(); });
-['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'emaMultiplier', 'segmentMinFrames', 'summaryMaxTokens'].forEach(id => $(id).addEventListener('change', invalidate));
+['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));
@@ -543,7 +545,7 @@ function renderSegmentDistance(transitions) {
   const max = Math.max(...transitions.flatMap(t => [t.distance, t.threshold || 0]), 1e-6) * 1.1;
   const x = i => transitions.length === 1 ? 465 : 65 + i * 790 / (transitions.length - 1);
   const y = value => 150 - value / max * 110;
-  svg.append(svgNode('text', {x: 65, y: 18}, '青色：帧距离 D　虚线：此前 EMA × 倍数　橙色点：新段起始'));
+  svg.append(svgNode('text', {x: 65, y: 18}, '青色：帧距离 D　虚线：此前 EMA（倍数 1）　橙色点：新段起始'));
   for (const f of [0, .5, 1]) {
     svg.append(svgNode('line', {x1: 65, x2: 855, y1: y(max * f), y2: y(max * f), stroke: '#e6ecef'}));
     svg.append(svgNode('text', {x: 55, y: y(max * f) + 4, 'text-anchor': 'end'}, fmt(max * f)));
