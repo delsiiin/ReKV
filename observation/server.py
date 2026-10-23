@@ -27,7 +27,9 @@ def validate_params(raw, dataset, max_frames):
         raise ValueError('Expected a JSON object')
     allowed = {'sample_id', 'max_frames', 'sample_fps', 'start_time', 'mode', 'question_index',
                'max_new_tokens', 'video_window_size', 'segment_enabled', 'segment_ema_alpha',
-               'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens'}
+               'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
+               'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
+               'question_indices', 'custom_questions'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -43,8 +45,8 @@ def validate_params(raw, dataset, max_frames):
     if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 512:
         raise ValueError('max_new_tokens must be an integer from 1 to 512')
     mode = raw.get('mode', 'video')
-    if mode not in ('video', 'question'):
-        raise ValueError('mode must be video or question')
+    if mode not in ('video', 'question', 'compression'):
+        raise ValueError('mode must be video, question or compression')
     video_window = raw.get('video_window_size', 32)
     if type(video_window) is not int or video_window < 1:
         raise ValueError('video_window_size must be a positive integer')
@@ -71,9 +73,35 @@ def validate_params(raw, dataset, max_frames):
         value = segment[name]
         if type(value) is not int or not 1 <= value <= upper:
             raise ValueError(f'{name} must be an integer from 1 to {upper}')
+    compression = {}
+    if mode != 'compression' and ('question_indices' in raw or 'custom_questions' in raw):
+        raise ValueError('Multiple questions are supported in compression mode')
+    if mode == 'compression':
+        indices = raw.get('question_indices', [question])
+        custom = raw.get('custom_questions', [])
+        if not isinstance(indices, list) or any(type(i) is not int or not 0 <= i < len(record['conversations']) for i in indices):
+            raise ValueError('question_indices must be a list of valid question indices')
+        if len(set(indices)) != len(indices):
+            raise ValueError('question_indices must not contain duplicates')
+        if not isinstance(custom, list) or any(not isinstance(q, str) or not q.strip() or len(q) > 2000 for q in custom):
+            raise ValueError('custom_questions must contain nonempty strings of at most 2000 characters')
+        if not 1 <= len(indices)+len(custom) <= 32:
+            raise ValueError('请选择或输入 1–32 个问题')
+        compression.update(question_indices=indices, custom_questions=[q.strip() for q in custom])
+        for name, default, upper in [('compression_budget_tokens', 1024, 10000000),
+                                     ('compression_topk', 64, 512), ('compression_recent_frames', 2, 128),
+                                     ('compression_max_segment_frames', 32, 128)]:
+            value = raw.get(name, default)
+            if type(value) is not int or not 1 <= value <= upper:
+                raise ValueError(f'{name} must be an integer from 1 to {upper}')
+            compression[name] = value
+        if compression['compression_topk'] < compression['compression_recent_frames']:
+            raise ValueError('检索帧数不能小于 recent 保护帧数')
+        if compression['compression_max_segment_frames'] < segment['segment_min_frames']:
+            raise ValueError('段帧数上限不能小于最少帧数')
     return dict(sample_id=sample_id, max_frames=frames, sample_fps=float(fps),
                 start_time=float(start), mode=mode, question_index=question, max_new_tokens=max_new_tokens,
-                video_window_size=video_window, **segment)
+                video_window_size=video_window, **segment, **compression)
 
 
 class ObservationService:
@@ -97,7 +125,7 @@ class ObservationService:
         paths += sorted(p for p in model_path.iterdir() if p.is_file())
         signature = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
         code = hashlib.sha256()
-        for p in sorted(Path(__file__).parent.glob('*.py')):
+        for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/streaming').glob('*.py')) + [ROOT/'model/patch.py']):
             code.update(p.read_bytes())
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         value = dict(params=params, files=signature, code=code.hexdigest(), versions=versions,
@@ -172,18 +200,31 @@ class ObservationService:
             check_cancel()
             if self.engine is None:
                 self.engine = ObservationEngine(self.args.model_path, self.args.device, self.args.dtype)
-            result = self.engine.observe(images, frames, record, params, progress, check_cancel, artifact_dir=directory)
+            if params['mode'] == 'compression':
+                from observation.compression import compare
+                revision = 0
+                def publish_snapshot(side, point):
+                    nonlocal revision
+                    check_cancel()
+                    revision += 1
+                    # Only the latest scalar snapshot is retained in a running job.
+                    self.update(job_id, compression_live=dict(revision=revision, side=side,
+                                point=copy.deepcopy(point)))
+                result = compare(self.engine, images, frames, record, params, progress, check_cancel,
+                                 on_snapshot=publish_snapshot)
+            else:
+                result = self.engine.observe(images, frames, record, params, progress, check_cancel, artifact_dir=directory)
             if 'segment_experiment' in result:
                 result['segment_experiment']['token_similarity']['url'] = f'/api/token-similarity/{job_id}'
                 result['segment_experiment']['segment_attention']['url'] = f'/api/segment-attention/{job_id}'
-            result.update(schema_version=21, job_id=job_id, sample=record, parameters=params,
+            result.update(schema_version=25, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'
             temporary.write_text(json.dumps(result, ensure_ascii=False, allow_nan=False), encoding='utf-8')
             temporary.replace(directory / 'result.json')
             self.update(job_id, status='complete', progress=1, message='观察计算完成',
-                        result_url=f'/artifacts/{job_id}/result.json')
+                        result_url=f'/artifacts/{job_id}/result.json', compression_live=None)
         except Exception as error:
             cancelled = self.events[job_id].is_set()
             if not cancelled:
@@ -289,6 +330,7 @@ def handler_for(service):
                 static = {'/': ('index.html', 'text/html; charset=utf-8'),
                           '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
                           '/attention.js': ('attention.js', 'application/javascript; charset=utf-8'),
+                          '/compression.js': ('compression.js', 'application/javascript; charset=utf-8'),
                           '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if path in static:
                     filename, mime = static[path]

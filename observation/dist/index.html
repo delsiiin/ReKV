@@ -4,7 +4,7 @@
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RVS · Attention Observatory</title>
   <meta name="description" content="本地 RVS 视频注意力观察实验：可配置视频窗口、逐帧 attention mass 与 token 热力图。">
-  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/attention.js" defer></script>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/attention.js" defer></script><script src="/compression.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -19,7 +19,7 @@
     <div class="field-pair"><div><label for="maxFrames">处理帧数</label><input id="maxFrames" type="number" value="8" min="1" max="128" required></div><div><label for="fps">采样 FPS</label><input id="fps" type="number" value="0.5" min="0.001" max="1" step="any" required></div></div>
     <label for="startTime">起始时间 / 秒</label><input id="startTime" type="number" value="0" min="0" step="any" required>
     <p class="field-note">从起始时间后的第一个采样帧开始，最多处理指定帧数。时间戳相对源视频。</p>
-    <label for="mode">观察输入</label><select id="mode"><option value="video">视频编码末尾 32 token</option><option value="question">视频 + 问题末尾 32 token</option></select>
+    <label for="mode">观察输入</label><select id="mode"><option value="video">视频编码末尾 32 token</option><option value="question">视频 + 问题末尾 32 token</option><option value="compression">KV 压缩前后对照</option></select>
     <label for="videoWindowSize">视频末尾 token 数 N</label><input id="videoWindowSize" type="number" value="32" min="1" step="1" required>
     <p class="field-note">用于视频编码末尾窗口，可跨帧，不能超过实际视频 token 总数。</p>
     <label for="maxAnswerTokens">回答最大 token 数</label><input id="maxAnswerTokens" type="number" value="128" min="1" max="512" required>
@@ -29,6 +29,18 @@
     <label for="segmentMinFrames">切分前最少帧数</label><input id="segmentMinFrames" type="number" value="1" min="1" max="128" required>
     <label for="summaryMaxTokens">每段 summary 最大 token 数</label><input id="summaryMaxTokens" type="number" value="192" min="1" max="512" required>
     <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。阈值倍数固定为 1；第一对帧初始化 EMA，后续距离超过历史 EMA 则切分。每段单独生成总结。</p>
+    <div id="compressionControls" hidden>
+      <div class="section-label">04 / KV 压缩对照</div>
+      <label>本次一起提问的标注问题</label>
+      <div class="question-list-actions"><button id="compressionQuestionsAll" type="button" class="text-button">全选</button><button id="compressionQuestionsNone" type="button" class="text-button">清空</button></div>
+      <div id="compressionQuestions" class="compression-question-list" role="group" aria-label="本次提问的标注问题"></div>
+      <label for="compressionCustomQuestions">自定义问题 · 每行一个</label><textarea id="compressionCustomQuestions" rows="4" placeholder="What is the person doing?&#10;What changed in the scene?"></textarea>
+      <p class="field-note">可多选标注问题，也可输入自定义问题，合计最多 32 个。所有问题在最后一帧后依次回答，共用视频缓存；每题独立，不带入上一题回答。</p>
+      <label for="compressionBudget">Memory budget / FP16 token 数</label><input id="compressionBudget" type="number" value="1024" min="1" max="10000000" required>
+      <div class="field-pair"><div><label for="compressionRecent">Recent 保护帧数</label><input id="compressionRecent" type="number" value="2" min="1" max="128" required></div><div><label for="compressionTopk">检索帧数上限</label><input id="compressionTopk" type="number" value="64" min="1" max="512" required></div></div>
+      <label for="compressionMaxSegment">每段最多帧数</label><input id="compressionMaxSegment" type="number" value="32" min="1" max="128" required>
+      <p class="field-note">同一模型顺序运行全 FP16 与压缩缓存；使用上方的 EMA 和 summary 参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
+    </div>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
     <button id="cancel" class="secondary" type="button" hidden>取消当前任务</button>
@@ -40,6 +52,36 @@
   <section class="panel sample-panel"><div class="panel-heading"><h2 id="sampleTitle">读取 RVS 样本</h2><span id="sampleTag" class="tag">—</span></div><div id="sampleMeta" class="meta-line"></div><div class="qa"><span>Q</span><p id="questionText">—</p></div><details><summary>参考答案与样本原始信息</summary><p id="answerText"></p><pre id="rawSample"></pre></details></section>
   <div id="status" class="status" role="status" aria-live="polite"><span id="statusText">选择参数后生成观察数据。首次运行需要加载模型。</span><span id="statusPercent"></span><div class="progress"><div id="progressBar"></div></div></div>
   <div id="emptyState" class="empty-state"><span class="empty-icon">▥</span><h2>从一段视频开始观察</h2><p>点击「生成观察数据」，查看采样帧、图片 token 映射、attention mass 与模型回答。</p><p class="muted">默认在视频末尾观察注意力，再基于同一批帧和所选问题生成回答。</p></div>
+  <div id="compressionResults" hidden>
+    <div class="result-toolbar"><div><span class="section-label">KV COMPRESSION / PAIRED RUN</span><span id="compressionLabel" class="muted"></span></div><a id="compressionJson" class="text-button" download="kv-compression-comparison.json" hidden>↓ 完整对照 JSON</a></div>
+    <div id="compressionCards" class="summary-grid"></div>
+    <section class="panel"><div class="panel-heading"><div><h2>压缩前后显存</h2><p id="compressionMemoryNote" class="muted"></p></div></div><div id="compressionMemoryTable" class="compression-scroll"></div><div id="compressionMemoryChart"></div><label for="compressionFrame">选择输入进度</label><input id="compressionFrame" type="range" min="0" max="0" value="0"><p id="compressionFrameReadout" class="spatial-readout" aria-live="polite"></p><p class="tiny">持久 KV 统计去重后的张量 storage，含量化参数与位置索引；CUDA 分配量包含模型和工作缓冲。峰值单独测量。预算仅在段提交完成后强制满足。</p></section>
+    <section id="compressionFrameStatesPanel" class="panel">
+      <div class="panel-heading"><div><h2>每帧缓存状态</h2><p id="compressionFrameStatesMeta" class="muted"></p></div><button id="compressionFrameStatesCsv" type="button" class="text-button">↓ 当前状态 CSV</button></div>
+      <div class="cache-state-controls"><label for="compressionStateSide">缓存版本<select id="compressionStateSide"><option value="after">压缩后</option><option value="before">压缩前 · 全 FP16</option></select></label><label for="compressionStateLayer">语言模型层<select id="compressionStateLayer"><option value="all">全部层 · 每层平均</option></select></label><button id="compressionStateFinal" class="text-button" type="button">查看最终状态</button></div>
+      <div class="cache-playback-controls">
+        <button id="compressionStatePrev" class="text-button" type="button">← 上一步</button><button id="compressionStatePlay" class="text-button" type="button" aria-pressed="false">播放</button><button id="compressionStateNext" class="text-button" type="button">下一步 →</button>
+        <label for="compressionStateSpeed">回放速度<select id="compressionStateSpeed"><option value="1000">1× · 每步 1 秒</option><option value="500">2×</option><option value="250">4×</option></select></label>
+        <label id="compressionStateFollowLabel" class="check-label" hidden><input id="compressionStateFollow" type="checkbox" checked> 实时跟随最新状态</label>
+      </div><label for="compressionStateProgress" class="tiny">缓存状态进度（与上方显存曲线同步）</label><input id="compressionStateProgress" type="range" min="0" max="0" value="0"><p id="compressionStatePlaybackStatus" class="tiny" aria-live="polite"></p>
+      <div class="cache-state-legend"><span><i class="cache-bit-16"></i>FP16</span><span><i class="cache-bit-8"></i>8bit</span><span><i class="cache-bit-4"></i>4bit</span><span><i class="cache-bit-2"></i>2bit</span><span><i class="cache-bit-deleted"></i>已删除</span></div>
+      <p class="tiny">同一 segment 使用相同底色，左侧色线标记分段；底色与精度色条含义不同。与进度滑块联动，各层独立压缩；全部层视图展示每层平均数量及层间范围，不把跨层计数当作单帧 token 数。K/V 共用的一个 token 位置计一次，sink 不计入帧。平均位宽仅统计剩余 token，不含量化参数与填充。</p>
+      <div id="compressionFrameStates" class="compression-scroll"></div>
+    </section>
+    <section class="panel"><div class="panel-heading"><div><h2>各阶段耗时与新增开销</h2><p class="muted">互斥阶段计时：子阶段从父阶段扣除，避免重复累计。CUDA 在计时边界同步。</p></div><button id="compressionCsv" type="button" class="text-button">↓ 开销 CSV</button></div><div id="compressionCostChart"></div><div id="compressionCostTable" class="compression-scroll"></div><p id="compressionTimingNote" class="tiny"></p></section>
+    <section id="compressionHitsPanel" class="panel">
+      <div class="panel-heading"><h2>Retrieve 命中分布</h2><button id="compressionHitsCsv" type="button" class="text-button">↓ 命中 CSV</button></div>
+      <label for="compressionHitQuestion">统计范围</label><select id="compressionHitQuestion"></select>
+      <p id="compressionHitsNote" class="muted"></p>
+      <h3>每帧命中次数</h3><div id="compressionFrameHitsChart" class="retrieval-hit-chart"></div>
+      <h3>每个 Segment 命中次数</h3><div id="compressionSegmentHitsChart" class="retrieval-hit-chart"></div>
+      <p id="compressionHitsReadout" class="spatial-readout" aria-live="polite">悬停或聚焦曲线上的点查看命中次数。</p>
+      <details><summary>命中数值明细</summary><div id="compressionHitsTable" class="compression-scroll"></div></details>
+    </section>
+    <section class="panel"><div class="panel-heading"><h2>多问题 · 压缩前后回答</h2><span id="compressionAnswerStatus" class="tag"></span></div><label for="compressionAnswerQuestion">查看问题</label><select id="compressionAnswerQuestion"></select><p id="compressionQuestion" class="answer-question"></p><p id="compressionContext" class="muted"></p><div class="answer-columns"><div><div class="eyebrow">BEFORE / 全 FP16</div><p id="compressionBeforeAnswer" class="answer-text"></p><p id="compressionBeforeMeta" class="tiny"></p></div><div class="reference-answer"><div class="eyebrow">AFTER / 压缩缓存</div><p id="compressionAfterAnswer" class="answer-text"></p><p id="compressionAfterMeta" class="tiny"></p></div></div><details><summary>参考答案（不参与推理）</summary><p id="compressionReference"></p></details></section>
+    <section class="panel"><div class="panel-heading"><h2>本次使用的相同采样帧</h2></div><div id="compressionFrames" class="frame-grid"></div></section>
+    <details class="panel"><summary>对照设置与统计口径</summary><pre id="compressionMethod"></pre></details>
+  </div>
   <div id="results" hidden>
     <div class="result-toolbar"><div><span class="section-label">OBSERVATION RESULTS</span><span id="resultLabel" class="muted"></span></div><div class="toolbar-actions"><label for="layer">观察层</label><select id="layer" disabled><option value="all">全部层平均</option></select><a id="exportJson" class="text-button" download="rvs-observation.json" hidden>↓ JSON</a><button id="exportCsv" class="text-button" type="button" disabled>↓ CSV</button></div></div>
     <div id="summary" class="summary-grid"></div>

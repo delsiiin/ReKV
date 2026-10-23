@@ -39,7 +39,7 @@ if __name__ == '__main__':
 - 分段复用 observation 的投影/池化前视觉特征距离、历史 EMA 阈值、首对帧 warmup；默认 `alpha=.2`、`min_segment_frames=1`。达到 `max_segment_frames=32` 或 summary 上下文容量上限时闭段，不重置 EMA。
 - summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与在线视频 K 的点积均值，不做 softmax，不跨层平均。大于或等于该层帧内均值的 token 保持 FP16。summary 为空/计算失败时全帧按高分保留并记录原因。
 - sink 为初始化提示词；最新两帧是 recent，始终使用原始 FP16。未闭合段全精度暂存并可检索。各层的标签在段提交时固定。
-- 每个段提交后若超预算：所有已闭合非保护帧的低分区各降一级（16→8→4→2）；仍超预算则从旧到新逐帧删除低分区，每帧后重新检查；仍不足才按 `(问题命中次数, 时间, frame_id)` 淘汰整帧。
+- 每个段提交后若超预算：所有已闭合非保护帧的低分区各降一级（16→8→4→2）；仍超预算则从旧到新逐帧删除低分区，每帧后重新检查；仍不足才淘汰 retrieve 频率最低的整帧，频率相同则淘汰更早入库的帧，即按 `(hits, frame_id)` 升序淘汰（LFU，同频时 FIFO）。`hits` 为累计问题检索命中次数，`frame_id` 在入库时单调递增；每淘汰一帧后重新检查预算。
 - 一个问题在任一层用到某帧，该帧只加一次命中，recent 同样计数；summary 不增加命中。采用单调问题 ID 去重，不积累无限增长的历史 ID 集合。
 - K/V 都使用 PM-KVQ 的 `per_group` 方向：固定 head 和 token，沿通道维分组，默认 group size=128。首次压缩先生成 16bit 整数编码，再降到 8bit；后续逐次降为 4/2bit。打包采用 PM-KVQ 的 int16 容器和高位优先顺序。不使用 outlier calibration；高分 token、sink、recent 始终保留原始 FP16。
 

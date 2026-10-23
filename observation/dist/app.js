@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const state = {samples: [], record: null, result: null, job: null, generation: 0, selected: 0, selectedToken: 0, config: null};
+const state = {samples: [], record: null, result: null, compression: null, job: null, generation: 0, selected: 0, selectedToken: 0, config: null};
 const tokenSimilarity = {controller: null, request: 0, data: null, col: 0};
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fmt = (value, digits = 3) => value == null ? '—' : Number(value).toFixed(digits);
@@ -36,6 +36,8 @@ function clearResults() {
   tokenSimilarity.controller?.abort(); tokenSimilarity.request++; tokenSimilarity.data = null;
   $('exportSegmentCsv').disabled = true;
   state.result = null;
+  state.compression = null;
+  $('compressionResults').hidden = true;
   state.selected = 0;
   state.selectedToken = 0;
   $('results').hidden = true;
@@ -51,10 +53,17 @@ function clearResults() {
   updateWindowLabels();
 }
 function updateWindowLabels() {
+  const compressionMode = $('mode').value === 'compression';
+  $('compressionControls').hidden = !compressionMode;
+  $('question').disabled = compressionMode;
+  $('videoWindowSize').disabled = compressionMode;
+  $('segmentEnabled').disabled = compressionMode;
+  document.querySelector('section.method').hidden = compressionMode;
+  $('run').innerHTML = $('mode').value === 'compression' ? '运行压缩对照 <span>↗</span>' : '生成观察数据 <span>↗</span>';
   const n = $('videoWindowSize').value || 'N';
   $('mode').options[0].textContent = `视频编码末尾 ${n} token`;
   const active = state.result?.sequence.window_size ?? ($('mode').value === 'video' ? n : 32);
-  $('windowBadge').textContent = `${active} TOKEN WINDOW`;
+  $('windowBadge').textContent = compressionMode ? 'KV COMPRESSION' : `${active} TOKEN WINDOW`;
   $('methodWindowSize').textContent = active;
   $('windowTokenCaption').textContent = `包含提示词和所有视频 token；最后 ${active} 个位置为灰色观察窗口。悬停读数，点击定位帧。`;
 }
@@ -87,10 +96,16 @@ async function loadSample(auto = true) {
     $('sampleMeta').textContent = `标注时长 ${time(record.duration || 0)} · ${record.conversations.length} 个问题 · ${record.video_path}`;
     $('rawSample').textContent = JSON.stringify(record, null, 2);
     $('question').replaceChildren();
+    $('compressionQuestions').replaceChildren();
+    $('compressionCustomQuestions').value = '';
     record.conversations.forEach((question, index) => {
       const option = node('option', '', `${index + 1}. [${time(question.start_time)}–${time(question.end_time)}] ${question.question}`);
       option.value = index;
       $('question').append(option);
+      const label = node('label', 'check-label'), checkbox = node('input');
+      checkbox.type = 'checkbox'; checkbox.value = index; checkbox.checked = index === 0;
+      label.append(checkbox, node('span', '', `${index+1}. ${question.question}`));
+      $('compressionQuestions').append(label);
     });
     showQuestion();
     $('run').disabled = false;
@@ -100,11 +115,17 @@ async function loadSample(auto = true) {
 }
 function parameters() {
   return {sample_id: $('sample').value, max_frames: Number($('maxFrames').value),
+    ...($('mode').value === 'compression' ? {
+      question_indices: [...$('compressionQuestions').querySelectorAll('input:checked')].map(input => Number(input.value)),
+      custom_questions: $('compressionCustomQuestions').value.split('\n').map(q => q.trim()).filter(Boolean)
+    } : {}),
     sample_fps: Number($('fps').value), start_time: Number($('startTime').value),
     mode: $('mode').value, question_index: Number($('question').value), max_new_tokens: Number($('maxAnswerTokens').value),
     video_window_size: Number($('videoWindowSize').value), segment_enabled: $('segmentEnabled').checked,
     segment_ema_alpha: Number($('emaAlpha').value),
-    segment_min_frames: Number($('segmentMinFrames').value), summary_max_new_tokens: Number($('summaryMaxTokens').value)};
+    segment_min_frames: Number($('segmentMinFrames').value), summary_max_new_tokens: Number($('summaryMaxTokens').value),
+    compression_budget_tokens: Number($('compressionBudget').value), compression_recent_frames: Number($('compressionRecent').value),
+    compression_topk: Number($('compressionTopk').value), compression_max_segment_frames: Number($('compressionMaxSegment').value)};
 }
 async function run() {
   if (!state.record || !$('controls').reportValidity()) return;
@@ -126,7 +147,8 @@ async function run() {
     let previewShown = false;
     while (generation === state.generation) {
       status(job.message, job.progress || 0, job.status === 'failed');
-      if (job.preview && !previewShown) {
+      if(params.mode==='compression' && job.status!=='complete') renderCompressionLive(job);
+      if (job.preview && !previewShown && params.mode !== 'compression') {
         previewShown = true;
         $('results').hidden = false;
         $('emptyState').hidden = true;
@@ -137,17 +159,26 @@ async function run() {
       if (job.status === 'complete') {
         const result = await api(job.result_url);
         if (generation !== state.generation) return;
-        state.result = result;
-        renderResult(job.result_url, job.cached);
-        status(job.cached ? '已读取相同输入的本地缓存。' : '观察计算完成。可切换层、查看帧与 token 分数。', 1);
+        if (result.compression_experiment) {
+          state.compression = result;
+          renderCompressionResult(result, job.result_url, job.cached);
+          status(job.cached ? '已读取压缩对照缓存。' : result.compression_experiment.status === 'complete' ? '压缩前后对照完成。' : '部分对照失败，请查看各侧状态。', 1, result.compression_experiment.status !== 'complete');
+        } else {
+          state.result = result;
+          renderResult(job.result_url, job.cached);
+          status(job.cached ? '已读取相同输入的本地缓存。' : '观察计算完成。可切换层、查看帧与 token 分数。', 1);
+        }
         break;
       }
-      if (job.status === 'failed' || job.status === 'cancelled') break;
+      if (job.status === 'failed' || job.status === 'cancelled') {
+        if(params.mode==='compression') finishCompressionLive(job.status);
+        break;
+      }
       await sleep(1000);
       if (generation !== state.generation) return;
       job = await api(`/api/jobs/${job.id}`);
     }
-  } catch (error) { if (generation === state.generation) showError(error); }
+  } catch (error) { if (generation === state.generation) { showError(error); if(params.mode==='compression') finishCompressionLive('failed'); } }
   finally {
     if (generation === state.generation) {
       state.job = null;
@@ -463,7 +494,15 @@ $('controls').addEventListener('submit', event => { event.preventDefault(); run(
 $('split').addEventListener('change', () => { fillSamples(); $('startTime').value = 0; loadSample(); });
 $('sample').addEventListener('change', () => { $('startTime').value = 0; loadSample(); });
 $('question').addEventListener('change', () => { showQuestion(); if ($('autoRun').checked) run(); else invalidate(); });
-['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens'].forEach(id => $(id).addEventListener('change', invalidate));
+$('compressionQuestions').addEventListener('change', invalidate);
+$('compressionCustomQuestions').addEventListener('change', invalidate);
+for (const [id, checked] of [['compressionQuestionsAll', true], ['compressionQuestionsNone', false]]) {
+  $(id).addEventListener('click', () => {
+    $('compressionQuestions').querySelectorAll('input').forEach(input => input.checked = checked);
+    invalidate();
+  });
+}
+['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));

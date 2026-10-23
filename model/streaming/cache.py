@@ -7,6 +7,7 @@ import torch
 
 from .quantization import PackedKV
 from .segments import summary_scores
+from .profiling import measure
 
 
 def footprint(value, seen=None, storages=None):
@@ -30,6 +31,26 @@ def footprint(value, seen=None, storages=None):
     elif isinstance(value, (tuple, list, set)):
         size += sum(footprint(v, seen, storages) for v in value)
     return size
+
+
+def tensor_storage_bytes(value, device_type=None, seen=None, storages=None):
+    """Unique tensor payload bytes, excluding Python metadata and allocator reserves."""
+    seen = set() if seen is None else seen
+    storages = set() if storages is None else storages
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, torch.Tensor):
+        storage = value.untyped_storage()
+        identity = (str(value.device), storage.data_ptr(), storage.nbytes())
+        if identity in storages or (device_type is not None and value.device.type != device_type):
+            return 0
+        storages.add(identity)
+        return storage.nbytes()
+    if is_dataclass(value):
+        value = vars(value)
+    children = value.values() if isinstance(value, dict) else value if isinstance(value, (tuple, list)) else ()
+    return sum(tensor_storage_bytes(child, device_type, seen, storages) for child in children)
 
 
 def resident_copy(x):
@@ -101,7 +122,7 @@ class Frame:
     segment_id: int
     layers: tuple
     closed: bool = False
-    hits: int = 0
+    hits: int = 0  # Number of questions that retrieved this frame (once per question).
     score_error: str = ''
 
 
@@ -113,7 +134,7 @@ class CacheSnapshot:
     frames: tuple
     recent_ids: tuple
 
-    def retrieve_layer(self, layer, query, topk=64):
+    def retrieve_layer(self, layer, query, topk=64, profiler=None):
         """Select stable frame IDs, then materialize a ragged per-layer sequence."""
         if topk < len(self.recent_ids):
             raise ValueError('topk must accommodate the recent frames')
@@ -133,19 +154,21 @@ class CacheSnapshot:
         selected = [f for f in self.frames if f.frame_id in protected] + available[:topk-len(protected)]
         selected.sort(key=lambda f: (f.timestamp, f.frame_id))
         device = query.device
-        keys, values = [self.sink[layer][0].to(device)], [self.sink[layer][1].to(device)]
-        positions = []
-        for frame in selected:
-            key, value, ids = frame.layers[layer].materialize(device)
-            keys.append(key)
-            values.append(value)
-            positions.append((frame.frame_id, ids))
-        return (torch.cat(keys, 1)[None], torch.cat(values, 1)[None],
-                tuple(f.frame_id for f in selected), positions)
+        with measure(profiler, 'cache_materialization'):
+            keys, values = [self.sink[layer][0].to(device)], [self.sink[layer][1].to(device)]
+            positions = []
+            for frame in selected:
+                key, value, ids = frame.layers[layer].materialize(device)
+                keys.append(key)
+                values.append(value)
+                positions.append((frame.frame_id, ids))
+            return (torch.cat(keys, 1)[None], torch.cat(values, 1)[None],
+                    tuple(f.frame_id for f in selected), positions)
 
 
 class StreamingKVCache:
-    def __init__(self, sink, budget_tokens, frame_tokens, recent_frames=2, group_size=128):
+    def __init__(self, sink, budget_tokens, frame_tokens, recent_frames=2, group_size=128, profiler=None):
+        self.profiler = profiler
         if budget_tokens <= 0 or recent_frames < 1 or frame_tokens < 1:
             raise ValueError('Budget, recent_frames and frame_tokens must be positive')
         if group_size < 1 or group_size % 8:
@@ -215,21 +238,22 @@ class StreamingKVCache:
         pending = [f for f in self.frames.values() if not f.closed]
         if not pending:
             return self.memory_stats()
-        classified = {}
-        try:
-            if queries is None or len(queries) != len(self.sink):
-                raise ValueError(error or 'summary_empty')
+        with measure(self.profiler, 'token_scoring'):
+            classified = {}
+            try:
+                if queries is None or len(queries) != len(self.sink):
+                    raise ValueError(error or 'summary_empty')
+                for frame in pending:
+                    classified[frame.frame_id] = tuple(x.classify(q) for x, q in zip(frame.layers, queries))
+            except (ValueError, RuntimeError) as exc:
+                error = (error or str(exc))[:256]
+                classified = {f.frame_id: f.layers for f in pending}
+                self.counts['scoring_failures'] += 1
             for frame in pending:
-                classified[frame.frame_id] = tuple(x.classify(q) for x, q in zip(frame.layers, queries))
-        except (ValueError, RuntimeError) as exc:
-            error = (error or str(exc))[:256]
-            classified = {f.frame_id: f.layers for f in pending}
-            self.counts['scoring_failures'] += 1
-        for frame in pending:
-            self.frames[frame.frame_id] = replace(frame, layers=classified[frame.frame_id],
-                                                 closed=True, score_error=error)
-        # Drop local references before budgeting; snapshots explicitly own older versions.
-        del pending, classified
+                self.frames[frame.frame_id] = replace(frame, layers=classified[frame.frame_id],
+                                                     closed=True, score_error=error)
+            # Drop local references before budgeting; snapshots explicitly own older versions.
+            del pending, classified
         self.segment_id += 1
         self.version += 1
         self.last_event = dict(version=self.version, quantized=0, dropped_low=0, evicted=0,
@@ -243,6 +267,16 @@ class StreamingKVCache:
             raise MemoryError('Protected cache exceeds budget')
         return self.memory_stats()
 
+    def close_uncompressed_segment(self):
+        """Comparison baseline: retain every FP16 frame; no summaries or policy calls."""
+        pending = [f for f in self.frames.values() if not f.closed]
+        for frame in pending:
+            self.frames[frame.frame_id] = replace(frame, closed=True)
+        if pending:
+            self.segment_id += 1
+            self.version += 1
+        return self.memory_stats()
+
     def _enforce_budget(self):
         if self.persistent_bytes() <= self.budget:
             return
@@ -250,27 +284,31 @@ class StreamingKVCache:
         recent = set(self.recent_ids)
         candidates = sorted((f for f in self.frames.values() if f.closed and f.frame_id not in recent),
                             key=lambda f: (f.timestamp, f.frame_id))
-        for frame in candidates:
-            layers = tuple(x.shrink(self.group_size) for x in frame.layers)
-            self.last_event['quantized'] += sum(a is not b for a, b in zip(frame.layers, layers))
-            self.frames[frame.frame_id] = replace(frame, layers=layers)
+        with measure(self.profiler, 'quantization'):
+            for frame in candidates:
+                layers = tuple(x.shrink(self.group_size) for x in frame.layers)
+                self.last_event['quantized'] += sum(a is not b for a, b in zip(frame.layers, layers))
+                self.frames[frame.frame_id] = replace(frame, layers=layers)
         if self.persistent_bytes() <= self.budget:
             return
-        for old in candidates:
-            frame = self.frames[old.frame_id]
-            if not any(x.low_indices.numel() for x in frame.layers):
-                continue
-            self.frames[frame.frame_id] = replace(frame, layers=tuple(x.drop_low() for x in frame.layers))
-            self.counts['dropped_low_frames'] += 1
-            self.last_event['dropped_low'] += 1
-            if self.persistent_bytes() <= self.budget:
-                return
-        for old in sorted(candidates, key=lambda f: (f.hits, f.timestamp, f.frame_id)):
-            del self.frames[old.frame_id]
-            self.counts['evicted_frames'] += 1
-            self.last_event['evicted'] += 1
-            if self.persistent_bytes() <= self.budget:
-                return
+        with measure(self.profiler, 'token_pruning'):
+            for old in candidates:
+                frame = self.frames[old.frame_id]
+                if not any(x.low_indices.numel() for x in frame.layers):
+                    continue
+                self.frames[frame.frame_id] = replace(frame, layers=tuple(x.drop_low() for x in frame.layers))
+                self.counts['dropped_low_frames'] += 1
+                self.last_event['dropped_low'] += 1
+                if self.persistent_bytes() <= self.budget:
+                    return
+        with measure(self.profiler, 'frame_eviction'):
+            # LFU, then FIFO: frame_id is assigned monotonically on insertion.
+            for old in sorted(candidates, key=lambda f: (f.hits, f.frame_id)):
+                del self.frames[old.frame_id]
+                self.counts['evicted_frames'] += 1
+                self.last_event['evicted'] += 1
+                if self.persistent_bytes() <= self.budget:
+                    return
         if self.persistent_bytes() > self.budget:
             raise MemoryError('Budget cannot hold the protected cache')
 
@@ -299,6 +337,33 @@ class StreamingKVCache:
                 self.frames[frame_id] = replace(frame, hits=frame.hits+1)
         self.last_activation_id = question_id
 
+    def frame_states(self, segment_ids=None):
+        """Detached scalar diagnostics; counts are token positions, not heads or K+V.
+
+        Each row holds [FP16, INT8, INT4, INT2] counts for every decoder layer.
+        Missing frame IDs below next_id were evicted; future frames are not emitted.
+        No tensors, snapshots or GPU-to-CPU payload copies are retained by this report.
+        """
+        recent = set(self.recent_ids)
+        result = []
+        for frame_id in range(self.next_id):
+            frame = self.frames.get(frame_id)
+            if frame is None:
+                result.append(dict(frame_id=frame_id, segment_id=(segment_ids or {}).get(frame_id),
+                                   status='evicted', protected=False, counts=None))
+                continue
+            counts = []
+            for layer in frame.layers:
+                row = [layer.high_indices.numel(), 0, 0, 0]
+                low = layer.low_indices.numel()
+                if low:
+                    row[{16: 0, 8: 1, 4: 2, 2: 3}[layer.bits]] += low
+                counts.append(row)
+            result.append(dict(frame_id=frame_id, segment_id=frame.segment_id, status='closed' if frame.closed else 'open',
+                               protected=frame_id in recent, counts=counts))
+        return dict(layer_count=len(self.sink), tokens_per_frame=self.frame_tokens,
+                    bit_order=[16, 8, 4, 2], frames=result)
+
     def memory_stats(self):
         persistent = self._persistent()
         pbytes = footprint(persistent)
@@ -309,6 +374,8 @@ class StreamingKVCache:
                 bits[str(layer.bits)] += 1
         return dict(cache_device=str(self.device), offload_enabled=False,
                     budget_bytes=self.budget, persistent_bytes=pbytes,
+                    persistent_tensor_bytes=tensor_storage_bytes(persistent),
+                    persistent_cuda_bytes=tensor_storage_bytes(persistent, 'cuda'),
                     cache_working_bytes=working, retained_frames=len(self.frames),
                     open_frames=sum(not f.closed for f in self.frames.values()),
                     bits=bits, counts=dict(self.counts), last_event=dict(self.last_event))

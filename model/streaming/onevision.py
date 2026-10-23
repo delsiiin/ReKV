@@ -13,6 +13,7 @@ from observation.segments import SUMMARY_SYSTEM, summary_prompt, selected_vision
 from .attention import EncodeLayer, RetrieveLayer, streaming_attention_forward
 from .cache import StreamingKVCache
 from .segments import OnlineSegmenter
+from .profiling import stage, measure
 
 
 @contextmanager
@@ -29,15 +30,25 @@ def native_decoder(decoder):
 
 
 class OneVisionEngine:
-    def __init__(self, config):
+    def __init__(self, config, *, model=None, processor=None, profiler=None, check_cancel=lambda: None):
         self.config = config
+        self.profiler = profiler
+        self.check_cancel = check_cancel
+        self.compression_enabled = config.get('compression_enabled', True)
         device = config['device']
         if str(device).startswith('cuda'):
             torch.cuda.set_device(device)
-        self.processor = LlavaOnevisionProcessor.from_pretrained(config['model_path'], local_files_only=True)
-        self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-            config['model_path'], local_files_only=True, dtype=torch.float16,
-            device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
+        if (model is None) != (processor is None):
+            raise ValueError('Provide both model and processor, or neither')
+        if model is None:
+            self.processor = LlavaOnevisionProcessor.from_pretrained(config['model_path'], local_files_only=True)
+            self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+                config['model_path'], local_files_only=True, dtype=torch.float16,
+                device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
+        else:
+            self.model, self.processor = model, processor
+        if self.model.dtype != torch.float16:
+            raise ValueError('Compressed KV comparison requires a float16 model')
         self.decoder = self.model.model.language_model
         self.device = self.decoder.get_input_embeddings().weight.device
         self.tokenizer = self.processor.tokenizer
@@ -59,13 +70,14 @@ class OneVisionEngine:
             layer.self_attn._streaming_n_local = window
 
     @torch.inference_mode()
+    @stage('cache_init')
     def reset(self):
         self._set_window('encode')
         # Capture the actual initialization K/V through the same ReKV attention path.
         output = self.decoder(input_ids=self.prefix, use_cache=True, return_dict=True)
         sink = tuple((k[0], v[0]) for k, v in output.past_key_values)
         self.cache = StreamingKVCache(sink, self.config['budget_tokens'], self.frame_tokens,
-                                      self.config['recent_frames'], self.config['group_size'])
+                                      self.config['recent_frames'], self.config['group_size'], profiler=self.profiler)
         self.segmenter = OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
                                          self.config['max_segment_frames'])
         self.features, self.frame_info = [], []
@@ -88,31 +100,37 @@ class OneVisionEngine:
         return torch.cat([embedding(system_ids), visual, embedding(suffix)], 1)
 
     @torch.inference_mode()
+    @stage('video_encoding')
     def append_frame(self, image, timestamp):
+        self.check_cancel()
         began = time.monotonic()
         closed_seconds = 0.
-        pixels = self.processor.video_processor(videos=[image], do_sample_frames=False,
-                    return_tensors='pt').pixel_values_videos.to(self.device, torch.float16)
-        output = self.model.model.get_video_features(pixel_values=pixels,
-                    vision_feature_layer=self.model.config.vision_feature_layer,
-                    vision_feature_select_strategy=self.model.config.vision_feature_select_strategy,
-                    return_dict=True)
-        raw = selected_vision_features(output, self.model.config.vision_feature_layer,
-                                      self.model.config.vision_feature_select_strategy)
-        feature = output.pooler_output.reshape(1, -1, self.decoder.config.hidden_size)
-        if feature.shape[1] != self.frame_tokens:
-            raise ValueError(f'Expected {self.frame_tokens} frame tokens; got {feature.shape[1]}')
-        boundary = self.segmenter.push(raw[0])
+        with measure(self.profiler, 'vision_encoding'):
+            pixels = self.processor.video_processor(videos=[image], do_sample_frames=False,
+                        return_tensors='pt').pixel_values_videos.to(self.device, torch.float16)
+            output = self.model.model.get_video_features(pixel_values=pixels,
+                        vision_feature_layer=self.model.config.vision_feature_layer,
+                        vision_feature_select_strategy=self.model.config.vision_feature_select_strategy,
+                        return_dict=True)
+            feature = output.pooler_output.reshape(1, -1, self.decoder.config.hidden_size)
+            if feature.shape[1] != self.frame_tokens:
+                raise ValueError(f'Expected {self.frame_tokens} frame tokens; got {feature.shape[1]}')
         info = dict(index=self.cache.next_id, timestamp=float(timestamp))
-        # Check the exact summary prompt size, including timestamps and generation reserve.
-        context_full = self._summary_length(self.features+[feature], self.frame_info+[info]) + self.config['summary_max_new_tokens'] > self.decoder.config.max_position_embeddings
-        if self.features and (boundary or context_full):
-            close_started = time.monotonic()
-            self.close_segment(reset_segmenter=False)
-            closed_seconds += time.monotonic()-close_started
-            self.segmenter.count = 1
-        if self._summary_length([feature], [info]) + self.config['summary_max_new_tokens'] > self.decoder.config.max_position_embeddings:
-            raise ValueError('Even one frame plus summary prompt exceeds the model context')
+        if self.compression_enabled:
+            with measure(self.profiler, 'segmentation'):
+                raw = selected_vision_features(output, self.model.config.vision_feature_layer,
+                                              self.model.config.vision_feature_select_strategy)
+                boundary = self.segmenter.push(raw[0])
+                info = dict(index=self.cache.next_id, timestamp=float(timestamp))
+                # Check the exact summary prompt size, including timestamps and generation reserve.
+                context_full = self._summary_length(self.features+[feature], self.frame_info+[info]) + self.config['summary_max_new_tokens'] > self.decoder.config.max_position_embeddings
+                if self.features and (boundary or context_full):
+                    close_started = time.monotonic()
+                    self.close_segment(reset_segmenter=False)
+                    closed_seconds += time.monotonic()-close_started
+                    self.segmenter.count = 1
+                if self._summary_length([feature], [info]) + self.config['summary_max_new_tokens'] > self.decoder.config.max_position_embeddings:
+                    raise ValueError('Even one frame plus summary prompt exceeds the model context')
         contexts = []
         recent = [self.cache.frames[i] for i in self.cache.recent_ids]
         for layer, (sink_k, sink_v) in enumerate(self.cache.sink):
@@ -123,6 +141,10 @@ class OneVisionEngine:
         self._set_window('encode')
         self.decoder(inputs_embeds=feature, past_key_values=contexts, use_cache=True, return_dict=True)
         self.cache.append_frame(timestamp, [context.captured for context in contexts])
+        if not self.compression_enabled:
+            self.cache.close_uncompressed_segment()
+            self.timings['encode_seconds'] += time.monotonic()-began
+            return
         self.features.append(feature.detach().clone())
         self.frame_info.append(info)
         self.timings['encode_seconds'] += time.monotonic()-began-closed_seconds
@@ -130,29 +152,36 @@ class OneVisionEngine:
             self.close_segment()
 
     @torch.inference_mode()
+    @stage('segment_commit')
     def close_segment(self, reset_segmenter=True):
+        self.check_cancel()
+        if not self.compression_enabled:
+            self.cache.close_uncompressed_segment()
+            return self.stats()
         if not self.features:
             return self.stats()
         began = time.monotonic()
         queries, error, text = None, '', ''
         try:
             with native_decoder(self.decoder):
-                inputs = self._summary_inputs(self.features, self.frame_info)
-                output = self.decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
-                ids, _ = greedy_token_ids(self.decoder, self.model.lm_head, output,
-                    self.config['summary_max_new_tokens'], {self.tokenizer.eos_token_id})
-                text = self.tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
-                del output, inputs
+                with measure(self.profiler, 'summary_generation'):
+                    inputs = self._summary_inputs(self.features, self.frame_info)
+                    output = self.decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
+                    ids, _ = greedy_token_ids(self.decoder, self.model.lm_head, output,
+                        self.config['summary_max_new_tokens'], {self.tokenizer.eos_token_id}, self.check_cancel)
+                    text = self.tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+                    del output, inputs
                 if text:
-                    content = self.tokenizer(text, add_special_tokens=False, return_tensors='pt').input_ids.to(self.device)
-                    combined = torch.cat([self.prefix, content], 1)
-                    queries = [None]*len(self.decoder.layers)
-                    def capture(layer, states):
-                        attention = self.decoder.layers[layer].self_attn
-                        queries[layer] = states[0, self.prefix.shape[1]:].reshape(-1,
-                            attention.config.num_attention_heads, attention.head_dim).detach().clone()
-                    with capture_queries(self.decoder, capture):
-                        self.decoder(input_ids=combined, use_cache=False, return_dict=True)
+                    with measure(self.profiler, 'summary_query'):
+                        content = self.tokenizer(text, add_special_tokens=False, return_tensors='pt').input_ids.to(self.device)
+                        combined = torch.cat([self.prefix, content], 1)
+                        queries = [None]*len(self.decoder.layers)
+                        def capture(layer, states):
+                            attention = self.decoder.layers[layer].self_attn
+                            queries[layer] = states[0, self.prefix.shape[1]:].reshape(-1,
+                                attention.config.num_attention_heads, attention.head_dim).detach().clone()
+                        with capture_queries(self.decoder, capture):
+                            self.decoder(input_ids=combined, use_cache=False, return_dict=True)
                 else:
                     error = 'summary_empty'
         except (ValueError, RuntimeError) as exc:
@@ -172,15 +201,17 @@ class OneVisionEngine:
         return stats
 
     @torch.inference_mode()
+    @stage('answer_generation')
     def answer(self, snapshot, question, on_retrieved):
         """Complete retrieval and generation before allowing further video encoding."""
         began = time.monotonic()
         hits = set()
-        contexts = [RetrieveLayer(snapshot, layer, self.config['topk'], hits)
+        contexts = [RetrieveLayer(snapshot, layer, self.config['topk'], hits, getattr(self, 'profiler', None))
                     for layer in range(len(self.decoder.layers))]
         ids = self.tokenizer(question, return_tensors='pt').input_ids.to(self.device)
         self._set_window('qa')
-        result = self.decoder(input_ids=ids, past_key_values=contexts, use_cache=True, return_dict=True)
+        with measure(getattr(self, 'profiler', None), 'retrieval'):
+            result = self.decoder(input_ids=ids, past_key_values=contexts, use_cache=True, return_dict=True)
         past = result.past_key_values
         del result, contexts, snapshot
         on_retrieved(hits)
@@ -188,7 +219,7 @@ class OneVisionEngine:
                               past_key_values=past, use_cache=True, return_dict=True)
         del past
         tokens, reason = greedy_token_ids(self.decoder, self.model.lm_head, output,
-                         self.config['max_new_tokens'], {self.tokenizer.eos_token_id})
+                         self.config['max_new_tokens'], {self.tokenizer.eos_token_id}, getattr(self, 'check_cancel', lambda: None))
         return dict(answer=self.tokenizer.decode(tokens, skip_special_tokens=True).strip(),
                     hit_frames=sorted(hits), finish_reason=reason, qa_seconds=time.monotonic()-began,
                     inference_pid=os.getpid(),

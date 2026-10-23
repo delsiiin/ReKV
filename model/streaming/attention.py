@@ -16,6 +16,7 @@ class RetrieveLayer:
     layer: int
     topk: int
     hits: set
+    profiler: object = None
 
 
 def streaming_attention_forward(n_local, n_init, fattn=True, **kwargs):
@@ -31,7 +32,7 @@ def streaming_attention_forward(n_local, n_init, fattn=True, **kwargs):
         retrieving = isinstance(past_key_value, RetrieveLayer)
         encoding = isinstance(past_key_value, EncodeLayer)
         if retrieving:
-            pk, pv, ids, _ = past_key_value.snapshot.retrieve_layer(past_key_value.layer, q, past_key_value.topk)
+            pk, pv, ids, _ = past_key_value.snapshot.retrieve_layer(past_key_value.layer, q, past_key_value.topk, past_key_value.profiler)
             past_key_value.hits.update(ids)
         elif encoding:
             pk, pv = (x.to(q.device) for x in past_key_value.past)

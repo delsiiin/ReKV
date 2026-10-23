@@ -33,7 +33,7 @@ ssh -L 8765:127.0.0.1:8765 user@server
 
 当前采集所选输入末尾窗口的注意力与帧 mass，并生成模型回答；默认启用新增的 segment 观察实验。
 问题前后对照、K/V magnitude、K/V 冗余与有效数量、注意力熵的计算及接口已移除。
-新结果使用 `schema_version=21`，`segment_experiment` 记录逐 token 相似度及 segment 注意力入口，
+新结果使用 `schema_version=24`，`segment_experiment` 记录逐 token 相似度及 segment 注意力入口，
 另存各语言模型层未池化的视频 / summary Key、hidden states，以及 summary Query，不保存 Value。旧缓存文件保留在磁盘上；
 代码指纹变化会使新任务重新计算。更新后请重启服务并刷新页面。
 
@@ -294,3 +294,49 @@ JSON 包含完整样本、输入参数、采样策略、token 布局、每层及
 ```bash
 python -m unittest discover -s tests -p 'test_observation*.py' -v
 ```
+
+
+## KV 压缩前后对照
+
+重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；本模式始终进行算法要求的分段和 summary，不受注意力观察的启用复选框影响。
+
+结果包含：
+
+- **显存**：持久 KV 张量字节、编码结束时 `torch.cuda.memory_allocated`、全程 `max_memory_allocated` 分别比较；显示节省量、比例及可拖动的逐帧曲线。负的节省量表示增加。KV 载荷包括 scale/offset、索引及检索代表向量，不包括 Python 元数据；预算仍按管理器总字节检查。CUDA 总量包含模型权重与临时张量，allocator reserved 不作为节省量。
+- **开销**：初始化、视觉编码、视频入库、分段、summary 生成、summary Query 提取、token 评分、量化、低分 token 删除、整帧淘汰、段提交、问题检索、KV 读取/反量化/拼接和答案生成，共 14 个互斥阶段。CUDA 在边界同步，父阶段扣除子阶段。表格给出压缩前、压缩后及差值，支持 CSV 下载；未触发阶段为 0，失败侧为缺失值。
+- **回答**：支持勾选多个标注问题，或输入自定义问题（每行一个），合计 1–32 题。每侧只编码一次视频，在最后一帧后按列表顺序独立回答，共用视频缓存，不带入上一题的回答。通过问题下拉框切换压缩前后回答、命中帧及生成终止原因；参考答案只用于展示，不作为输入。
+- **命中折线图**：横轴分别为帧 ID 和 Segment ID，纵轴为问题检索命中次数。灰色虚线表示全 FP16，青色实线表示压缩缓存。可查看全部问题累计值或单题的 0/1 命中，悬停或键盘聚焦数据点查看数值，并导出当前统计范围的 CSV。跨层检索同一帧每题只计一次，包含 recent 帧；某段任意成员帧命中则该段本题计一次，不将段内帧次数相加。两侧都使用压缩侧实际观察到的分段进行聚合；基线本身仍不执行分段。压缩侧失败时 Segment 统计缺失，已淘汰帧仍保留在帧曲线中。
+
+对照使用**同一份已加载的 FP16 模型**，先完整运行全 FP16 缓存基线，再清理缓存并运行压缩路径。两边使用相同帧、初始化提示词、recent 编码窗口、top-k 检索和贪心生成参数。基线不做 summary、评分、量化或淘汰；它不是原注意力观察的完整上下文 prefill。实验在最后一张选中帧处提问，输入范围由采样参数决定，不自动以标注问题结束时间截断。
+
+该模式调用实际 `model/streaming` 压缩算法：K/V 均沿通道分组，首次 FP16→INT16→INT8，再按预算降位/删除；不 offload。结束或取消时恢复 observation 原生前向，原注意力及 segment 观察保持可用。模型只加载一次，计算任务仍由原服务的单工作线程串行执行。
+
+计时不含模型加载和视频解码，属于单次、基线先执行的配对测量；首次 kernel 初始化会影响耗时。两侧测量前各自清理 allocator 缓存并重置峰值，避免把第一侧的显存峰值带到第二侧。单侧 OOM 或预算过小会单独显示错误，不伪造节省值。取消任务不发布完整结果。
+
+API 沿用 `POST /api/jobs`，设置 `mode="compression"` 及 `compression_budget_tokens`、`compression_recent_frames`、`compression_topk`、`compression_max_segment_frames`。结果 `compression_experiment` 包含 `runs.before/after`、`memory`、`stages`、逐帧 `timeline` 和提交记录。JSON 导出包含全部口径和配置。缓存指纹包含压缩算法源码及参数，修改量化或策略代码后自动重新计算。
+
+多问题参数为 `question_indices`（标注问题的零基索引列表，保留提交顺序）和 `custom_questions`（随后回答的自定义问题字符串列表，每题最多 2000 字符）。可传空的 `question_indices` 仅问自定义问题；省略时沿用单个 `question_index`。`schema_version=25` 新增 `compression_experiment.questions`、每侧 `answers` 和 `retrieval_stats`，其中 `frame_hits` 保存每帧累计次数、时间戳和分段，`segment_hits` 保存每段累计次数及成员帧。每题答案带 `question_id`、`question_index`、`hit_frames` 和 `hit_segments`；自定义题的 `question_index=null`。原 `question`、`question_index`、`answer` 字段保留第一题，兼容单题结果读取。所有问题均在编码结束后提出，因此本批命中统计不会追溯影响已经完成的淘汰。
+
+
+### 每帧缓存状态
+
+压缩对照的「每帧缓存状态」面板与显存曲线的进度滑块联动，默认展示末段提交后的最终状态。可切换压缩前/后及语言模型层：
+
+- 每帧显示剩余/原始 token 数、FP16/8bit/4bit/2bit 分布、删除数、剩余 token 的平均位宽及状态。
+- recent 帧标记为保护；未闭合段标记为未闭段；整帧淘汰后仍显示该帧，剩余数为 0；尚未编码的帧显示「未编码」，不作为已删除帧。
+- 各层独立分类和压缩。单层视图展示整数计数；全部层视图展示每层平均数及各层剩余数的最小–最大范围。色条宽度以每层原始 token 数为分母，灰色部分为删除数。
+- 一个 token 位置的 K/V 共同计一次，不按 head 或 K/V 翻倍，sink 不属于视频帧。平均位宽按剩余 token 数加权，不含 scale、offset 和打包填充，不能替代实际显存统计。
+- 支持导出当前进度、版本、层选择对应的 CSV。
+
+`schema_version=24` 的 `timeline[].frame_states` 保存独立的纯数值快照：`layer_count`、`tokens_per_frame`、`bit_order=[16,8,4,2]` 及 `frames`；存活帧的 `counts[layer]` 为四档 token 数，淘汰帧为 `counts=null`。未来帧尚不出现在该进度的快照中。状态采集不保留 GPU tensor 引用、不执行 KV offload；采集用时单独记录为 `reporting_seconds`，从两侧 `encoding_seconds/total_seconds` 扣除，也不计入算法各阶段计时。旧结果会因源码指纹变化自动重新计算。
+
+
+### Segment 底色与动态状态
+
+逐帧状态表用稳定的 `segment_id` 标注 Segment 编号，同段使用相同淡色底色与左侧色线，相邻段颜色不同。帧被淘汰后仍保留已观察到的 segment 编号；未来帧不提前指定分段。全 FP16 基线没有运行语义分段，因此显示中性底色与「基线未分段」，不会把它每帧提交的存储编号当作 segment。
+
+- **实时显示**：任务运行期间，`GET /api/jobs/{id}` 的 `compression_live` 返回最新完成帧/末段提交的状态，页面每秒刷新。默认跟随当前计算侧的最新状态；取消「实时跟随」可停留查看已收到的快照，再勾选恢复跟随。快速完成的中间帧可能不被轮询捕获，最终结果仍保存全部状态点。
+- **完成后回放**：支持播放/暂停、上一步/下一步、1×/2×/4×速度以及进度滑块；到末尾自动暂停，末尾点击播放从头重播。回放沿用已保存的实际状态，不插值或重新运行模型。状态变化会短暂高亮精度色条。
+- 切换输入、新建任务或取消时停止回放计时器。取消/失败保留最后收到的状态并标记为不完整结果，不发布完整 JSON。
+
+服务端的运行任务仅保留一份最新 `compression_live`（`revision`、`side`、`point`），不会在 job 状态中累积全部历史。每帧 `segment_id` 连同状态快照写入最终结果和 CSV；快照采集及进度发布耗时仍归入 `reporting_seconds`，不计入算法开销。
