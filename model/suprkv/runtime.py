@@ -69,10 +69,10 @@ class StreamingRuntime:
         if self.closed:
             raise RuntimeError('Runtime is closed')
 
-    def _call(self, method, *args):
+    def _call(self, method, *args, **kwargs):
         self._ensure_open()
         try:
-            return getattr(self.model, method)(*args)
+            return getattr(self.model, method)(*args, **kwargs)
         except BaseException:
             self.close()
             raise
@@ -89,10 +89,27 @@ class StreamingRuntime:
     def close_segment(self):
         return self._call('close_segment')
 
-    def ask(self, question, cutoff=None):
+    def get_prompt(self, query, mc=False):
+        """Use the same OneVision chat suffix as ReKV's evaluation workers."""
+        from model.llava_onevision_rekv import LlavaOneVision_ReKV
+        return LlavaOneVision_ReKV.get_prompt(self, query, mc=mc)
+
+    def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
+        """Adapt ReKV's separate retrieval question and generation prompt."""
+        if retrieved_indices is not None:
+            raise NotImplementedError('SuPr-KV does not support external retrieved_indices')
+        return self.ask(input_text['question'], prompt=input_text['prompt'],
+                        max_new_tokens=max_new_tokens)['answer']
+
+    def ask(self, question, cutoff=None, *, prompt=None, max_new_tokens=None):
+        """Optional generation overrides apply only to this answer, not stream defaults."""
         self._ensure_open()
         if not isinstance(question, str) or not question.strip():
             raise ValueError('Question must not be empty')
+        if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
+            raise ValueError('Generation prompt must not be empty')
+        if max_new_tokens is not None and (not isinstance(max_new_tokens, int) or max_new_tokens < 1):
+            raise ValueError('max_new_tokens must be a positive integer')
         if cutoff is not None and not math.isfinite(float(cutoff)):
             raise ValueError('Question cutoff must be finite')
         cutoff = self.last_timestamp if cutoff is None else float(cutoff)
@@ -106,7 +123,12 @@ class StreamingRuntime:
             cache.record_activation(question_id, hits)
             cache.release_snapshot(question_id)
         try:
-            return self._call('answer', snapshot, question, retrieved)
+            overrides = {}
+            if prompt is not None:
+                overrides['prompt'] = prompt
+            if max_new_tokens is not None:
+                overrides['max_new_tokens'] = max_new_tokens
+            return self._call('answer', snapshot, question, retrieved, **overrides)
         finally:
             cache.release_snapshot(question_id)
 

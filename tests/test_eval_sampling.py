@@ -77,7 +77,7 @@ class EvalSamplingTests(unittest.TestCase):
         for dataset in datasets:
             with self.subTest(dataset=dataset), \
                  patch.object(run_eval, 'load_samples', return_value=self.samples[:2]), \
-                 patch.object(run_eval.multiprocessing, 'Process') as process, \
+                 patch.object(run_eval.multiprocessing, 'Process', return_value=Mock(exitcode=0)) as process, \
                  patch.object(run_eval, 'exec') as execute:
                 getattr(run_eval, f'eval_{dataset}')(args)
                 self.assertEqual(process.call_count, 2)

@@ -1,4 +1,4 @@
-"""Streaming output, temporal isolation and evaluation launcher failures without model weights."""
+"""Offline/streaming output and evaluation launcher failures without model weights."""
 import csv
 from contextlib import redirect_stderr
 import io
@@ -9,12 +9,15 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from video_qa import base, run_eval, suprkv_stream_vqa
+from video_qa import base, run_eval, suprkv_offline_vqa, suprkv_stream_vqa
 from video_qa.suprkv_stream_vqa import make_config
+from model.suprkv.runtime import StreamingRuntime
 
 
 class FakeRuntime:
     instances = []
+    get_prompt = StreamingRuntime.get_prompt
+    question_answering = StreamingRuntime.question_answering
 
     def __init__(self, config):
         self.config = config
@@ -35,10 +38,10 @@ class FakeRuntime:
         self.events.append(('frame', timestamp))
         return self.memory_stats()
 
-    def ask(self, question, cutoff=None):
+    def ask(self, question, cutoff=None, *, prompt=None, max_new_tokens=None):
         if cutoff is not None:
             assert all(timestamp <= cutoff for timestamp in self.frames)
-        self.events.append(('ask', question, cutoff, tuple(self.frames)))
+        self.events.append(('ask', question, cutoff, tuple(self.frames), prompt, max_new_tokens))
         return {'answer': '(B)\nchosen'}
 
     def close_segment(self):
@@ -122,6 +125,7 @@ class SuPrKVEvalTests(unittest.TestCase):
         self.assertEqual([event[3] for event in runtime.events if event[0] == 'ask'],
                          [(0.,), (0.,), (0., 2.)])
         self.assertTrue(all(event[2] is None for event in runtime.events if event[0] == 'ask'))
+        self.assertTrue(all(event[4:] == (None, None) for event in runtime.events if event[0] == 'ask'))
         self.assertNotIn(('frame', 4.), runtime.events)
         self.assertNotIn(('frame', 6.), runtime.events)
 
@@ -141,13 +145,116 @@ class SuPrKVEvalTests(unittest.TestCase):
         self.assertTrue(all(entry['memory'] == {'frames': 2} for entry in stats))
         self.assertFalse((self.directory / 'results.csv').exists())
 
-    def test_offline_datasets_rejected_before_launch(self):
+    def test_offline_datasets_dispatch_to_evaluator(self):
         for dataset in ('mlvu', 'qaego4d', 'egoschema', 'activitynet_qa', 'cgbench'):
-            with self.subTest(dataset=dataset), redirect_stderr(io.StringIO()), \
-                    patch.object(run_eval.multiprocessing, 'Process') as launch:
-                with self.assertRaises(SystemExit):
-                    run_eval.main(['--method', 'suprkv', '--dataset', dataset])
-                launch.assert_not_called()
+            with self.subTest(dataset=dataset), \
+                    patch.object(run_eval, f'eval_{dataset}') as evaluate:
+                run_eval.main(['--method', 'suprkv', '--dataset', dataset])
+                evaluate.assert_called_once()
+
+    def test_offline_worker_encodes_full_video_once_for_all_question_types(self):
+        conversations = [
+            dict(question='open question', answer='description', question_type='open'),
+            dict(question='which one?', choices=['first', 'second'], answer='second',
+                 question_type='action', end_time=0),
+            dict(question='hidden answer', choices=['first', 'second'], answer=None),
+        ]
+        samples = [dict(video_id=str(i), video_path=f'{i}.mp4', conversations=conversations)
+                   for i in range(2)]
+        self.annotation.write_text(json.dumps(samples))
+        with patch('model.suprkv.runtime.StreamingRuntime', FakeRuntime), \
+                patch.object(suprkv_offline_vqa, 'sampled_frames', frames):
+            base.work(suprkv_offline_vqa.SuPrKVOfflineVQA, method='suprkv',
+                      argv=self.worker_argv('--max_new_tokens', '32'))
+        self.assertEqual(len(FakeRuntime.instances), 1)
+        runtime = FakeRuntime.instances[0]
+        self.assertEqual(runtime.events.count(('reset',)), 2)
+        self.assertEqual(runtime.events.count(('commit',)), 2)
+        self.assertEqual(sum(event[0] == 'frame' for event in runtime.events), 8)
+        asks = [event for event in runtime.events if event[0] == 'ask']
+        self.assertEqual(len(asks), 6)
+        self.assertTrue(all(event[3] == (0., 2., 4., 6.) for event in asks))
+        self.assertEqual(asks[1][1], 'which one?')
+        self.assertEqual(asks[1][4],
+                         '\nQuestion: which one?\nOptions:\n(A) first\n(B) second\n'
+                         'Only give the best option.<|im_end|><|im_start|>assistant\nBest option: (')
+        self.assertEqual(asks[0][4], '\nopen question<|im_end|><|im_start|>assistant\n')
+        self.assertEqual([event[5] for event in asks], [1024, 16, 16] * 2)
+        for index, event in enumerate(runtime.events):
+            if event[0] == 'ask':
+                self.assertIn(runtime.events[index - 1][0], ('commit', 'ask'))
+        self.assertEqual(runtime.events[-1], ('close',))
+        rows = self.read_results()
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(rows[0]['task'], 'open')
+        self.assertEqual(rows[0]['pred_answer'], '(B)chosen')
+        self.assertEqual(rows[1]['correct_choice'], 'B')
+        self.assertEqual(rows[1]['pred_choice'], 'B')
+        self.assertEqual(float(rows[1]['qa_acc']), 100.)
+        self.assertEqual(rows[1]['task'], 'action')
+        self.assertEqual(rows[2]['answer'], 'first')
+        self.assertEqual(rows[2]['correct_choice'], 'A')
+        self.assertEqual(float(rows[2]['qa_acc']), 0.)
+        self.assertIsNone(samples[0]['conversations'][2]['answer'])
+        stats = [json.loads(line) for line in (self.directory / '1_0.stats.jsonl').read_text().splitlines()]
+        self.assertEqual([entry['video_id'] for entry in stats], ['0', '1'])
+        self.assertTrue(all(entry['memory'] == {'frames': 4} for entry in stats))
+        self.assertTrue(all(entry['config']['max_new_tokens'] == 32 for entry in stats))
+
+    def test_offline_closes_frame_iterator_on_encoding_error_and_rejects_empty_video(self):
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                closed = []
+
+                def source(path, fps):
+                    try:
+                        if not empty:
+                            yield 0., 'image'
+                    finally:
+                        closed.append(True)
+
+                runtime = FakeRuntime(make_config(self.worker_args('--device', 'cpu')))
+                runtime.append_frame = Mock(side_effect=ValueError('encoding failed'))
+                analyzer = suprkv_offline_vqa.SuPrKVOfflineVQA(
+                    anno=self.samples, save_dir=str(self.directory), sample_fps=.5, qa_model=runtime)
+                with patch.object(suprkv_offline_vqa, 'sampled_frames', source), \
+                        self.assertRaisesRegex(ValueError, 'no sampled frames' if empty else 'encoding failed'):
+                    analyzer.analyze_a_video(self.samples[0])
+                self.assertEqual(closed, [True])
+                self.assertEqual(analyzer.record[(64, 1)], [])
+                self.assertEqual(analyzer.video_stats, [])
+
+    def test_offline_empty_choice_response_is_incorrect(self):
+        runtime = FakeRuntime(make_config(self.worker_args('--device', 'cpu')))
+        runtime.ask = Mock(return_value={'answer': '  \n'})
+        analyzer = suprkv_offline_vqa.SuPrKVOfflineVQA(
+            anno=self.samples, save_dir=str(self.directory), sample_fps=.5, qa_model=runtime)
+        result = analyzer.video_close_qa('question', ['one', 'two'], 'A')
+        self.assertEqual(result['pred_choice'], '')
+        self.assertEqual(result['acc'], 0.)
+
+    def test_offline_launchers_forward_suprkv_config_and_use_dataset_scorers(self):
+        for dataset, scorer in (
+                ('mlvu', 'eval_multiple_choice.py'), ('qaego4d', 'eval_multiple_choice.py'),
+                ('egoschema', 'eval_egoschema.py'), ('activitynet_qa', 'eval_open_ended.py'),
+                ('cgbench', 'eval_multiple_choice.py')):
+            args = self.launcher_args('--dataset', dataset, '--budget_tokens', '4096',
+                                      '--max_new_tokens', '16', '--packed_attention')
+            with self.subTest(dataset=dataset), \
+                    patch.object(run_eval, 'get_eval_settings', return_value=(1, str(self.directory))), \
+                    patch.object(run_eval.multiprocessing, 'Process', return_value=Mock(exitcode=0)) as launch, \
+                    patch.object(run_eval, 'exec') as execute:
+                getattr(run_eval, f'eval_{dataset}')(args)
+                command, sub, device = launch.call_args.kwargs['args']
+                self.assertEqual(command[:3], ['python', '-m', 'video_qa.suprkv_offline_vqa'])
+                self.assertTrue(sub)
+                self.assertEqual(device, '0')
+                self.assertNotIn('--n_local', command)
+                worker_args = base.build_parser('suprkv').parse_args(command[3:])
+                self.assertEqual(suprkv_stream_vqa.config_overrides(worker_args),
+                                 suprkv_stream_vqa.config_overrides(args))
+                self.assertTrue(worker_args.packed_attention)
+                self.assertIn(scorer, execute.call_args.args[0])
 
     def test_invalid_timestamps_do_not_encode_frames_and_close_model(self):
         for cutoff in (1, -1, float('nan'), float('inf')):
@@ -201,7 +308,7 @@ class SuPrKVEvalTests(unittest.TestCase):
         self.assertIn(f'--pred_path {directory}/results.csv', commands[-1])
 
     def test_worker_failure_never_merges_or_scores_partial_results(self):
-        for dataset in ('rvs_ego', 'rvs_movie'):
+        for dataset in ('rvs_ego', 'rvs_movie', 'mlvu', 'qaego4d', 'egoschema', 'activitynet_qa', 'cgbench'):
             with self.subTest(dataset=dataset), \
                     patch.object(run_eval, 'get_eval_settings', return_value=(1, str(self.directory))), \
                     patch.object(run_eval.multiprocessing, 'Process', return_value=Mock(exitcode=1)), \

@@ -67,9 +67,10 @@ class OneVisionEngine:
         self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.)
         self.reset()
 
-    def _set_window(self, mode):
+    def _set_window(self, mode, max_new_tokens=None):
+        limit = self.config['max_new_tokens'] if max_new_tokens is None else max_new_tokens
         window = (self.config['recent_frames']*self.frame_tokens if mode == 'encode' else
-                  self.config['topk']*self.frame_tokens+self.config['max_new_tokens']+1024)
+                  self.config['topk']*self.frame_tokens+limit+1024)
         for layer in self.decoder.layers:
             layer.self_attn._streaming_n_local = window
 
@@ -212,24 +213,27 @@ class OneVisionEngine:
 
     @torch.inference_mode()
     @stage('answer_generation')
-    def answer(self, snapshot, question, on_retrieved):
+    def answer(self, snapshot, question, on_retrieved, *, prompt=None, max_new_tokens=None):
         """Complete retrieval and generation before allowing further video encoding."""
         began = time.monotonic()
+        limit = self.config['max_new_tokens'] if max_new_tokens is None else max_new_tokens
         hits = set()
         contexts = [RetrieveLayer(snapshot, layer, self.config['topk'], hits, getattr(self, 'profiler', None))
                     for layer in range(len(self.decoder.layers))]
         ids = self.tokenizer(question, return_tensors='pt').input_ids.to(self.device)
-        self._set_window('qa')
+        self._set_window('qa', max_new_tokens=limit)
         with measure(getattr(self, 'profiler', None), 'retrieval'):
             result = self.decoder(input_ids=ids, past_key_values=contexts, use_cache=True, return_dict=True)
         past = result.past_key_values
         del result, contexts, snapshot
         on_retrieved(hits)
-        output = self.decoder(input_ids=question_inputs(self.tokenizer, question).to(self.device),
+        prompt_ids = (question_inputs(self.tokenizer, question) if prompt is None else
+                      self.tokenizer(prompt, return_tensors='pt').input_ids)
+        output = self.decoder(input_ids=prompt_ids.to(self.device),
                               past_key_values=past, use_cache=True, return_dict=True)
         del past
         tokens, reason = greedy_token_ids(self.decoder, self.model.lm_head, output,
-                         self.config['max_new_tokens'], {self.tokenizer.eos_token_id}, getattr(self, 'check_cancel', lambda: None))
+                         limit, {self.tokenizer.eos_token_id}, getattr(self, 'check_cancel', lambda: None))
         answer = self.tokenizer.decode(
             tokens,
             skip_special_tokens=True,

@@ -28,7 +28,9 @@ python -m video_qa.run_eval \
 
 `--model`、`--dataset`、`--num_chunks`、`--max_samples`、`--sample_fps`、`--retrieve_size`、`--debug` 和 `--only_eval` 复用 ReKV 的含义。`--max_samples 0` 表示标注文件中的全部视频；非零值在分片前全局截取，保留每个视频的全部问题。`--debug true` 则仅处理每个分片的首个视频。
 
-SuPr-KV 入口仅支持 `rvs_ego`、`rvs_movie` 两个流式开放问答数据集，使用 ReKV 相同的默认标注路径和评分脚本。按标注中的 `end_time` 顺序回答，累计编码采样数组 `video[:int(end_time * sample_fps)]`，每次只编码新增部分。CSV 字段与 ReKV 流式输出一致：`video_id`、`question`、`answer`、`pred_answer`、`retrieve_size`、`chunk_size`（固定为 1）。SuPr-KV 新增的运行配置与缓存统计单独保存在 `.stats.jsonl` 中。
+SuPr-KV 支持 `rvs_ego`、`rvs_movie` 两个流式开放问答数据集，使用 ReKV 相同的默认标注路径和评分脚本。按标注中的 `end_time` 顺序回答，累计编码采样数组 `video[:int(end_time * sample_fps)]`，每次只编码新增部分。CSV 字段与 ReKV 流式输出一致：`video_id`、`question`、`answer`、`pred_answer`、`retrieve_size`、`chunk_size`（固定为 1）。SuPr-KV 新增的运行配置与缓存统计单独保存在 `.stats.jsonl` 中。
+
+离线数据集支持 `mlvu`、`qaego4d`、`egoschema`、`activitynet_qa` 和 `cgbench`，例如 `python -m video_qa.run_eval --method suprkv --dataset qaego4d --max_samples 5`。`SuPrKVOfflineVQA` 逐帧编码完整视频并结束最后一个片段，再复用该视频缓存回答全部问题，无需 `end_time`。开放题沿用 ReKV 的输出字段；选择题另存 `choices`、`correct_choice`、`pred_choice`、`qa_acc`（百分数），`question_type` 映射为 `task`。无公开答案时沿用 ReKV 取首个选项的约定，此时 `qa_acc` 不能视为真实准确率。离线开放题直接复用 `ReKVOfflineVQA.video_open_qa`，选择题复用 `BaseVQA.format_mcqa_prompt` 和 ReKV 的 OneVision 对话模板：检索仅输入原始问题；选择题生成 prompt 包含选项，并以 `Best option: (` 开始回答。开放题默认生成 1024 个新 token、选择题生成 16 个，覆盖 runtime 的 `--max_new_tokens`。两者均使用贪心生成和 EOS 停止，解码清理及非空答案的选项解析与 ReKV 一致；SuPr-KV 保留空选择题答案记错的处理。只生成离线预测可运行 `python -m video_qa.suprkv_offline_vqa --anno_path data/qaego4d/test_mc.json --save_dir results/suprkv_offline`。
 
 每个 worker 仅加载一次模型，在视频之间调用 `reset()`。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，沿用原 ReKV 的编号方式，由 worker 索引分配 GPU（第 0 个 worker 使用 GPU 0，以此类推）。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的 checkpoint；仅支持 OneVision Qwen2 系列。
 
@@ -48,7 +50,7 @@ python -m video_qa.suprkv_stream_vqa \
   --budget_tokens 8192
 ```
 
-`add_suprkv_arguments()` 逐项声明方法参数并提供作用说明，可用 `python -m video_qa.suprkv_stream_vqa --help` 查看。默认缓存预算为 8192 个 FP16 等效 token，问答和片段摘要分别最多生成 256 个新 token。
+`add_suprkv_arguments()` 逐项声明方法参数并提供作用说明，可用 `python -m video_qa.suprkv_stream_vqa --help` 查看。默认缓存预算为 8192 个 FP16 等效 token；流式问答和片段摘要默认分别最多生成 256 个新 token，离线问答使用上述 ReKV 的 1024/16 上限。
 
 默认从 Hugging Face 加载 `llava-hf/llava-onevision-qwen2-7b-ov-hf`，首次使用自动下载并缓存。
 可用 `--model_path` 指定其他 OneVision 模型 ID 或本地目录，用 `HF_HOME` 指定模型缓存目录。ReKV 与 SuPr-KV 共用 `video_qa/sampling.py`，采用原 ReKV 的采样规则：NPY 视为每秒一帧，使用 `np.linspace(0, 总帧数 - 1, int(总帧数 × sample_fps), dtype=int)`；MP4 使用 `int(round(原视频平均FPS) / sample_fps)` 的固定整数步长。这与 observation 在开始时间过滤、帧数限制之前的正常采样结果一致。MP4 时间戳仍由帧索引除以未取整的平均 FPS 估算，并非逐帧容器时间戳。两种方法的 RVS 问答均恢复原 ReKV 的 `int(end_time * sample_fps)` 数组切片边界，右边界不包含在内，超出视频长度时自然截断。ReKV 按问题批量编码新增帧，SuPr-KV 逐帧编码；重复边界不重复编码。SuPr-KV 回答时使用已编码帧的缓存快照，不再按标注时间做第二次过滤，因为数组切片选中的源帧时间可能等于或超过 `end_time`。
@@ -57,6 +59,7 @@ python -m video_qa.suprkv_stream_vqa \
 
 - `video_qa/base.py`：共用参数、数据分片、模型加载入口、视频遍历和 CSV 保存。
 - `video_qa/suprkv_stream_vqa.py`：与 `rekv_stream_vqa.py` 对应，只实现流式编码和问答；另存方法配置与缓存统计。
+- `video_qa/suprkv_offline_vqa.py`：复用 ReKV 的开放题方法和选择题 prompt 构造，逐次设置离线回答上限，使用 SuPr-KV 完整视频编码与统计输出。
 - `model/suprkv`：KV 保留在 GPU，负责分段摘要、重要性评分、压缩和检索；问答脚本不处理量化或缓存内部状态。
 
 ### Worker 运行时接口
@@ -77,6 +80,8 @@ if __name__ == '__main__':
 ```
 
 帧和问题必须按事件时间提交；不支持在已经编码未来帧后查询历史快照。`reset()` 仅清空视频状态，不重新加载模型。模型执行异常会释放问题快照并关闭当前 runtime；`close()` 释放该 runtime 持有的模型引用。接口面向单线程顺序调用。
+
+`get_prompt(query, mc=False)` 和 `question_answering(input_text, max_new_tokens=128)` 提供 ReKV 问答接口适配：`input_text["question"]` 仅用于检索，`input_text["prompt"]` 原样用于生成。`ask(question, prompt=..., max_new_tokens=...)` 也支持同样的逐次调用配置，不修改 runtime 的默认值；省略这些参数保持原流式行为。离线参数只影响该次问答的生成 prompt、token 上限和 QA 注意力窗口，不修改编码窗口、摘要、分段或压缩流程；后续流式问答仍使用原配置。外部指定 `retrieved_indices` 尚不支持，传入非空值会明确报错。
 
 ## 算法
 

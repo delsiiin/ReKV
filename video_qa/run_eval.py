@@ -43,15 +43,15 @@ def get_eval_settings(args, dataset, anno_path):
 def eval_mlvu(args):
     anno_path = "data/mlvu/dev_debug_mc.json"
     num_chunks, save_dir = get_eval_settings(args, "mlvu", anno_path)
-    solver = "rekv_offline_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_offline_vqa" if method == 'suprkv' else "rekv_offline_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -59,11 +59,21 @@ def eval_mlvu(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         for idx in range(num_chunks):
@@ -77,15 +87,15 @@ def eval_mlvu(args):
 def eval_qaego4d(args):
     anno_path = "data/qaego4d/test_mc.json"
     num_chunks, save_dir = get_eval_settings(args, "qaego4d", anno_path)
-    solver = "rekv_offline_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_offline_vqa" if method == 'suprkv' else "rekv_offline_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -93,11 +103,21 @@ def eval_qaego4d(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         for idx in range(num_chunks):
@@ -111,15 +131,15 @@ def eval_qaego4d(args):
 def eval_egoschema(args):
     anno_path = "data/egoschema/full.json"
     num_chunks, save_dir = get_eval_settings(args, "egoschema", anno_path)
-    solver = "rekv_offline_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_offline_vqa" if method == 'suprkv' else "rekv_offline_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -127,11 +147,21 @@ def eval_egoschema(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         for idx in range(num_chunks):
@@ -145,15 +175,15 @@ def eval_egoschema(args):
 def eval_activitynet_qa(args):
     anno_path = "data/activitynet_qa/test.json"
     num_chunks, save_dir = get_eval_settings(args, "activitynet_qa", anno_path)
-    solver = "rekv_offline_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_offline_vqa" if method == 'suprkv' else "rekv_offline_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -161,11 +191,21 @@ def eval_activitynet_qa(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         exec(f"rm -rf {save_dir}/tmp")
@@ -272,15 +312,15 @@ def eval_rvs_movie(args):
 def eval_cgbench(args):
     anno_path = "data/cgbench/full_mc.json"
     num_chunks, save_dir = get_eval_settings(args, "cgbench", anno_path)
-    solver = "rekv_offline_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_offline_vqa" if method == 'suprkv' else "rekv_offline_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -288,11 +328,21 @@ def eval_cgbench(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         for idx in range(num_chunks):
@@ -330,8 +380,6 @@ def main(argv=None):
             parser.error('SuPr-KV supports only LLaVA-OneVision Qwen2 models')
         if args.n_local is not None:
             parser.error('--n_local is ReKV-specific; configure SuPr-KV with --budget_tokens and --recent_frames')
-        if args.dataset not in ('rvs_ego', 'rvs_movie'):
-            parser.error('SuPr-KV supports only streaming datasets: rvs_ego, rvs_movie')
     elif config_overrides(args) or args.packed_attention:
         parser.error('SuPr-KV options require --method suprkv')
     if args.n_local is None:
