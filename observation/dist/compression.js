@@ -16,7 +16,7 @@ function renderCompressionResult(result, url, cached) {
   $('compressionStateFollowLabel').hidden = true;
   const e = result.compression_experiment, before = e.runs.before, after = e.runs.after;
   $('results').hidden = true; $('emptyState').hidden = true; $('compressionResults').hidden = false;
-  $('compressionLabel').textContent = `${e.frame_count} 帧 · 单模型 / 顺序执行 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
+  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · 单模型 / 顺序执行 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
   $('compressionJson').hidden = false; $('compressionJson').href = url;
   const memory = e.memory, saved = memory.persistent_kv;
   const gpu = e.method.cache_device.startsWith('cuda');
@@ -35,7 +35,7 @@ function renderCompressionResult(result, url, cached) {
   renderCompressionAnswer();
   renderRetrievalHits();
   $('compressionCostTable').replaceChildren(compressionTable(['阶段', '压缩前', '压缩后', '新增耗时'], e.stages.map(stage => [stage.label, millis(stage.before_seconds), millis(stage.after_seconds), deltaMs(stage.delta_seconds)])));
-  $('compressionTimingNote').textContent = `不含模型加载及视频解码；单次顺序测量，先运行全 FP16，首次调用的 kernel 初始化可能影响时间。编码总耗时：${fmt(before.encoding_seconds, 3)} → ${fmt(after.encoding_seconds, 3)} 秒。未触发的策略阶段显示 0。`;
+  $('compressionTimingNote').textContent = `不含模型加载及视频解码；单次顺序测量，先运行原精度，首次调用的 kernel 初始化可能影响时间。编码总耗时：${fmt(before.encoding_seconds, 3)} → ${fmt(after.encoding_seconds, 3)} 秒。未触发的策略阶段显示 0。`;
   $('compressionMethod').textContent = JSON.stringify({method: e.method, config: e.config, question_time: e.cutoff_timestamp, commits: after.commits ?? []}, null, 2);
   $('compressionFrames').replaceChildren();
   result.frames.forEach(frame => {
@@ -57,13 +57,17 @@ function compressionQuestions(e) {
   return e.questions ?? [{question_id: 1, question_index: e.question_index, question: e.question}];
 }
 function compressionAnswers(run) { return run.answers ?? (run.answer ? [run.answer] : []); }
+function compressionQuestionTime(q) {
+  return q.question_index == null ? '自定义问题，无数据集时间' :
+    datasetQuestionTime(state.compression?.sample?.conversations?.[q.question_index]);
+}
 function prepareCompressionQuestions(e) {
   $('compressionAnswerQuestion').replaceChildren();
   const all = node('option', '', '全部问题 · 累计命中'); all.value = 'all';
   $('compressionHitQuestion').replaceChildren(all);
   compressionQuestions(e).forEach((q, i) => {
     for (const id of ['compressionAnswerQuestion', 'compressionHitQuestion']) {
-      const option = node('option', '', `Q${i+1} · ${q.question}`); option.value = i; $(id).append(option);
+      const option = node('option', '', `Q${i+1} · ${compressionQuestionTime(q)} · ${q.question}`); option.value = i; $(id).append(option);
     }
   });
 }
@@ -72,7 +76,7 @@ function renderCompressionAnswer() {
   const e = result.compression_experiment, index = Number($('compressionAnswerQuestion').value);
   const q = compressionQuestions(e)[index]; if (!q) return;
   $('compressionQuestion').textContent = q.question;
-  $('compressionContext').textContent = `共 ${compressionQuestions(e).length} 题，两侧各编码同一批 ${e.frame_count} 帧一次，在 ${fmt(e.cutoff_timestamp, 2)} 秒处依次独立提问。`;
+  $('compressionContext').textContent = `${compressionQuestionTime(q)}。共 ${compressionQuestions(e).length} 题，两侧各编码同一批 ${e.frame_count} 帧一次，在 ${fmt(e.cutoff_timestamp, 2)} 秒处依次独立提问。`;
   for (const [side, run] of [['Before', e.runs.before], ['After', e.runs.after]]) {
     const answer = compressionAnswers(run)[index];
     $('compression'+side+'Answer').textContent = run.status !== 'complete' ? '本侧失败：'+run.error : answer?.answer || '（未生成可显示文本）';
@@ -85,7 +89,7 @@ function renderCompressionAnswer() {
 function retrievalHitSeries(e, kind) {
   const scope = $('compressionHitQuestion').value, key = kind === 'frame' ? 'frame_hits' : 'segment_hits';
   const idKey = kind === 'frame' ? 'frame_id' : 'segment_id';
-  return [['before', '全 FP16', '#8a98a2'], ['after', '压缩缓存', '#087f80']].map(([side, label, color]) => {
+  return [['before', '原精度', '#8a98a2'], ['after', '压缩缓存', '#087f80']].map(([side, label, color]) => {
     const run = e.runs[side], answer = scope === 'all' ? null : compressionAnswers(run)[Number(scope)];
     const selected = new Set(answer?.[kind === 'frame' ? 'hit_frames' : 'hit_segments'] ?? []);
     const points = (run.retrieval_stats?.[key] ?? []).map(row => ({...row, id: row[idKey],
@@ -151,7 +155,7 @@ function renderCompressionMemoryChart(e) {
   const left = e.runs.before.timeline, right = e.runs.after.timeline;
   if (!left || !right) { $('compressionFrame').disabled = true; $('compressionFrameReadout').textContent = '对照不完整，无法绘制显存轨迹。'; return; }
   const max = Math.max(1, ...left.map(p => p.persistent_tensor_bytes), ...right.map(p => p.persistent_tensor_bytes), e.runs.after.cache.budget_bytes)*1.12;
-  const svg = csvg('svg', {viewBox: '0 0 780 250', role: 'img', 'aria-label': '随输入帧变化的全 FP16 与压缩 KV 张量内存对比'});
+  const svg = csvg('svg', {viewBox: '0 0 780 250', role: 'img', 'aria-label': '随输入帧变化的原精度与压缩 KV 张量内存对比'});
   const x = index => 65 + index*690/Math.max(1, left.length-1), y = bytes => 210-bytes/max*180;
   for (let i=0; i<=4; i++) {
     const value = max*i/4;
@@ -171,7 +175,7 @@ function renderCompressionMemoryChart(e) {
     });
   });
   svg.append(csvg('text', {x:65, y:238}, '第一帧'), csvg('text', {x:755, y:238, 'text-anchor':'end'}, '末段提交后'));
-  target.append(svg, node('p', 'tiny', '灰色：全 FP16 · 青色：压缩缓存 · 点击曲线或移动下方滑块查看精确值'));
+  target.append(svg, node('p', 'tiny', '灰色：原精度 · 青色：压缩缓存 · 点击曲线或移动下方滑块查看精确值'));
   $('compressionFrame').disabled=false; $('compressionFrame').max=left.length-1; $('compressionFrame').value=left.length-1;
   updateCompressionReadout();
 }
@@ -179,7 +183,7 @@ function updateCompressionReadout() {
   renderCompressionFrameStates();
   const e=state.compression?.compression_experiment; if (!e?.runs.before.timeline || !e?.runs.after.timeline) return;
   const index=Number($('compressionFrame').value), before=e.runs.before.timeline[index], after=e.runs.after.timeline[index];
-  $('compressionFrameReadout').textContent=`帧 ${before.frame_index+1} · ${fmt(before.timestamp,2)}s · ${before.kind==='flush'?'末段提交完成':'当前帧入库后'}\n全 FP16 ${mib(before.persistent_tensor_bytes)} → 压缩 ${mib(after.persistent_tensor_bytes)} · 节省 ${mib(before.persistent_tensor_bytes-after.persistent_tensor_bytes)}\n保留帧数 ${before.retained_frames} → ${after.retained_frames}`;
+  $('compressionFrameReadout').textContent=`帧 ${before.frame_index+1} · ${fmt(before.timestamp,2)}s · ${before.kind==='flush'?'末段提交完成':'当前帧入库后'}\n原精度 ${mib(before.persistent_tensor_bytes)} → 压缩 ${mib(after.persistent_tensor_bytes)} · 节省 ${mib(before.persistent_tensor_bytes-after.persistent_tensor_bytes)}\n保留帧数 ${before.retained_frames} → ${after.retained_frames}`;
   $('compressionMemoryChart').querySelectorAll('[data-point]').forEach(dot=>dot.setAttribute('r', Number(dot.dataset.point)===index?5:3));
 }
 function renderCompressionCostChart(stages) {
@@ -233,7 +237,7 @@ function frameStateNumbers(snapshot, record, layer) {
   const counts = [0, 0, 0, 0];
   selected.forEach(row => row.forEach((count, i) => { counts[i] += count; }));
   const remaining = counts.reduce((sum, n) => sum+n, 0);
-  const bitSum = counts.reduce((sum, n, i) => sum+n*[16, 8, 4, 2][i], 0);
+  const bitSum = counts.reduce((sum, n, i) => sum+n*[snapshot.full_precision_dtype === 'float32' ? 32 : 16, 8, 4, 2][i], 0);
   const totals = selected.map(row => row.reduce((sum, n) => sum+n, 0));
   return {counts: counts.map(n => n/selected.length), remaining: remaining/selected.length,
     original: snapshot.tokens_per_frame, deleted: snapshot.tokens_per_frame-remaining/selected.length,
@@ -243,10 +247,10 @@ function cacheStateLabel(record, numbers) {
   if (!record) return '未编码';
   if (record.status === 'evicted') return '已整帧淘汰';
   if (record.protected) return record.status === 'open' ? 'Recent 保护 · 未闭段' : 'Recent 保护';
-  if (record.status === 'open') return '未闭段 · FP16';
+  if (record.status === 'open') return '未闭段 · 原精度';
   if (numbers.counts.slice(1).some(n => n > 0)) return '混合精度';
   if (numbers.deleted > 0) return '已删低分 token';
-  return 'FP16 保留';
+  return '原精度保留';
 }
 const tokenCount = n => n == null ? '—' : Number.isInteger(n) ? String(n) : fmt(n, 1);
 function renderCompressionFrameStates() {
@@ -291,7 +295,7 @@ function renderCompressionFrameStates() {
     if (numbers && layer==='all') retained.append(node('small', 'cache-state-range', `各层范围 ${numbers.min}–${numbers.max}`));
     const precision = node('td'), bar = node('div', 'cache-state-bar');
     if (numbers) {
-      const values = [...numbers.counts, numbers.deleted], labels = ['FP16', '8bit', '4bit', '2bit', '已删除'], classes = ['16', '8', '4', '2', 'deleted'];
+      const values = [...numbers.counts, numbers.deleted], labels = ['原精度', '8bit', '4bit', '2bit', '已删除'], classes = ['16', '8', '4', '2', 'deleted'];
       values.forEach((count, i) => {
         if (!count) return;
         const segment = node('span', 'cache-bit-'+classes[i]); segment.style.width = `${100*count/numbers.original}%`;
@@ -405,7 +409,7 @@ function renderCompressionLive(job) {
   $('results').hidden=true; $('emptyState').hidden=true; $('compressionResults').hidden=false;
   $('compressionResults').classList.add('is-live'); $('compressionJson').hidden=true;
   $('compressionStateFollowLabel').hidden=false;
-  $('compressionLabel').textContent=`实时计算 · ${update.side==='after'?'压缩后':'全 FP16 基线'} · 完成帧 ${update.point.frame_index+1}/${job.preview.frames.length}`;
+  $('compressionLabel').textContent=`实时计算 · ${update.side==='after'?'压缩后':'原精度 基线'} · 完成帧 ${update.point.frame_index+1}/${job.preview.frames.length}`;
   if($('compressionStateFollow').checked) followLatestCacheState(); else renderCompressionFrameStates();
 }
 function finishCompressionLive(status) {

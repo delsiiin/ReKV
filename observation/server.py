@@ -20,12 +20,13 @@ from observation.data import RVSDataset, decode_frames
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).parent / 'dist'
 TERMINAL = {'complete', 'failed', 'cancelled'}
+DTYPES = ('float16', 'bfloat16', 'float32')
 
 
-def validate_params(raw, dataset, max_frames):
+def validate_params(raw, dataset, default_dtype='float16'):
     if not isinstance(raw, dict):
         raise ValueError('Expected a JSON object')
-    allowed = {'sample_id', 'max_frames', 'sample_fps', 'start_time', 'mode', 'question_index',
+    allowed = {'sample_id', 'dtype', 'max_frames', 'sample_fps', 'start_time', 'mode', 'question_index',
                'max_new_tokens', 'video_window_size', 'segment_enabled', 'segment_ema_alpha',
                'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
                'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
@@ -36,9 +37,13 @@ def validate_params(raw, dataset, max_frames):
     if not isinstance(sample_id, str):
         raise ValueError('sample_id must be a string')
     record = dataset.get(sample_id)
-    frames, question = raw.get('max_frames', 8), raw.get('question_index', 0)
-    if type(frames) is not int or not 1 <= frames <= max_frames:
-        raise ValueError(f'max_frames must be an integer from 1 to {max_frames}')
+    question = raw.get('question_index', 0)
+    dtype = raw.get('dtype', default_dtype)
+    if dtype not in DTYPES:
+        raise ValueError('dtype must be float16, bfloat16 or float32')
+    max_frames = raw.get('max_frames')
+    if max_frames is not None and (type(max_frames) is not int or max_frames < 1):
+        raise ValueError('max_frames must be a positive integer or null for all sampled frames')
     if type(question) is not int or not 0 <= question < len(record['conversations']):
         raise ValueError('Invalid question index')
     max_new_tokens = raw.get('max_new_tokens', 128)
@@ -69,7 +74,9 @@ def validate_params(raw, dataset, max_frames):
         value = segment[name]
         if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= upper:
             raise ValueError(f'{name} must be finite and in (0, {upper}]')
-    for name, upper in [('segment_min_frames', max_frames), ('summary_max_new_tokens', 512)]:
+    if type(segment['segment_min_frames']) is not int or segment['segment_min_frames'] < 1:
+        raise ValueError('segment_min_frames must be a positive integer')
+    for name, upper in [('summary_max_new_tokens', 512)]:
         value = segment[name]
         if type(value) is not int or not 1 <= value <= upper:
             raise ValueError(f'{name} must be an integer from 1 to {upper}')
@@ -99,7 +106,7 @@ def validate_params(raw, dataset, max_frames):
             raise ValueError('检索帧数不能小于 recent 保护帧数')
         if compression['compression_max_segment_frames'] < segment['segment_min_frames']:
             raise ValueError('段帧数上限不能小于最少帧数')
-    return dict(sample_id=sample_id, max_frames=frames, sample_fps=float(fps),
+    return dict(sample_id=sample_id, dtype=dtype, max_frames=max_frames, sample_fps=float(fps),
                 start_time=float(start), mode=mode, question_index=question, max_new_tokens=max_new_tokens,
                 video_window_size=video_window, **segment, **compression)
 
@@ -129,11 +136,11 @@ class ObservationService:
             code.update(p.read_bytes())
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         value = dict(params=params, files=signature, code=code.hexdigest(), versions=versions,
-                     device=self.args.device, dtype=self.args.dtype)
+                     device=self.args.device)
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:24]
 
     def submit(self, raw):
-        params = validate_params(raw, self.dataset, self.args.max_frames)
+        params = validate_params(raw, self.dataset, self.args.dtype)
         job_id = self.cache_key(params)
         with self.lock:
             if job_id in self.jobs and self.jobs[job_id]['status'] not in {'failed', 'cancelled'}:
@@ -178,7 +185,7 @@ class ObservationService:
     def run(self, job_id, params):
         started = time.monotonic()
         try:
-            from observation.engine import Cancelled, ObservationEngine
+            from observation.engine import Cancelled
 
             def check_cancel():
                 if self.events[job_id].is_set():
@@ -198,8 +205,7 @@ class ObservationService:
                 frame['image_url'] = f"/artifacts/{job_id}/{frame['image']}"
             self.update(job_id, preview=dict(frames=copy.deepcopy(frames), sampling=sampling))
             check_cancel()
-            if self.engine is None:
-                self.engine = ObservationEngine(self.args.model_path, self.args.device, self.args.dtype)
+            self.select_dtype(params['dtype'])
             if params['mode'] == 'compression':
                 from observation.compression import compare
                 revision = 0
@@ -217,7 +223,7 @@ class ObservationService:
             if 'segment_experiment' in result:
                 result['segment_experiment']['token_similarity']['url'] = f'/api/token-similarity/{job_id}'
                 result['segment_experiment']['segment_attention']['url'] = f'/api/segment-attention/{job_id}'
-            result.update(schema_version=25, job_id=job_id, sample=record, parameters=params,
+            result.update(schema_version=26, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'
@@ -244,6 +250,19 @@ class ObservationService:
         for event in self.events.values():
             event.set()
         self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def select_dtype(self, dtype):
+        """Called only by the single compute worker; release before loading a new dtype."""
+        from observation.engine import ObservationEngine
+        if self.engine is not None and self.engine.dtype_name == dtype:
+            return
+        self.engine = None
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.engine = ObservationEngine(self.args.model_path, self.args.device, dtype)
 
     def token_similarity(self, job_id, summary, frame, layer, representation='key'):
         from observation.segments import token_similarity
@@ -296,7 +315,7 @@ def handler_for(service):
             try:
                 if path == '/api/config':
                     return self.send_json(dict(model_path=str(Path(service.args.model_path).resolve()),
-                                               device=service.args.device, max_frames=service.args.max_frames,
+                                               device=service.args.device, dtype=service.args.dtype, dtypes=DTYPES,
                                                data_root=str(service.dataset.root), window_size=32,
                                                default_video_window_size=32))
                 if path == '/api/samples':
@@ -322,7 +341,7 @@ def handler_for(service):
                     return self.send_json(service.token_similarity(
                         match[1], int(query['summary'][0]), int(query['frame'][0]), query['layer'][0],
                         query.get('representation', ['key'])[0]))
-                match = re.fullmatch(r'/artifacts/([a-f0-9]{24})/(result\.json|frame-\d{4}\.jpg)', path)
+                match = re.fullmatch(r'/artifacts/([a-f0-9]{24})/(result\.json|frame-\d{4,}\.jpg)', path)
                 if match:
                     filename = match[2]
                     return self.send_file(service.cache / match[1] / filename,
@@ -387,11 +406,8 @@ def main():
     parser.add_argument('--model-path', type=Path, default=ROOT / 'model_zoo/llava-onevision-qwen2-7b-ov-hf')
     parser.add_argument('--cache-dir', type=Path, default=ROOT / 'results/rvs_observation')
     parser.add_argument('--device', default='cuda:0')
-    parser.add_argument('--dtype', choices=['float16', 'bfloat16', 'float32'], default='float16')
-    parser.add_argument('--max-frames', type=int, default=128)
+    parser.add_argument('--dtype', choices=DTYPES, default='float16', help='Default dtype selected in the web UI')
     args = parser.parse_args()
-    if args.max_frames < 1:
-        parser.error('--max-frames must be positive')
     service = ObservationService(args)
     server = ThreadingHTTPServer((args.host, args.port), handler_for(service))
     print(f'RVS attention observation: http://{args.host}:{args.port}', flush=True)

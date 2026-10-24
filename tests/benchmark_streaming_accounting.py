@@ -8,6 +8,7 @@ The optional baseline is a saved, pre-change model/streaming/cache.py.
 import argparse
 from dataclasses import replace
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 import statistics
@@ -77,12 +78,13 @@ def replay(cls, frames, layers, device):
     x = torch.arange(8, device=device).view(1, 8, 1).expand(4, 8, 128).half()
     cache = cls([(x[:, :2], x[:, :2])]*layers, 1000000, 8)
     queries = [torch.ones(2, 8, 128, device=device)]*layers
+    score_kwargs = {'score_keys': [x]*layers} if 'score_keys' in inspect.signature(cache.append_frame).parameters else {}
     if device.startswith('cuda'):
         torch.cuda.synchronize(device)
     start = time.perf_counter()
     commits = 0
     for i in range(frames):
-        cache.append_frame(i, [(x, x)]*layers)
+        cache.append_frame(i, [(x, x)]*layers, **score_kwargs)
         if i % 2 == 1 or i == frames-1:
             cache.close_segment(queries)
             cache.memory_stats()

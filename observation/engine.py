@@ -177,10 +177,10 @@ class ObservationEngine:
         length = inputs.shape[1]
         limit = decoder.config.max_position_embeddings
         if length > limit:
-            raise ValueError(f"Input has {length} tokens, exceeding model context {limit}; reduce max_frames")
+            raise ValueError(f"Input has {length} tokens, exceeding model context {limit}; lower sample_fps or choose a later start_time")
         answer_input_length = length + (suffix_ids.shape[1] if params['mode'] == 'video' else 0)
         if answer_input_length >= limit:
-            raise ValueError(f'Question input has {answer_input_length} tokens; reduce max_frames to leave generation space')
+            raise ValueError(f'Question input has {answer_input_length} tokens; lower sample_fps or choose a later start_time to leave generation space')
         window = video_window if params['mode'] == 'video' else WINDOW_SIZE
         prefix_length = length - window
         scores = [None] * len(decoder.layers)
@@ -322,7 +322,7 @@ class ObservationEngine:
             inputs = torch.cat([embedding(system_ids), visual, embedding(suffix)], dim=1)
             input_length = inputs.shape[1]
             if input_length >= limit:
-                raise ValueError(f'Segment {index + 1} summary prompt exceeds context; reduce max_frames')
+                raise ValueError(f'Segment {index + 1} summary prompt exceeds context; lower sample_fps or choose a later start_time')
             budget = min(requested, limit - input_length)
 
             def report(count=0):

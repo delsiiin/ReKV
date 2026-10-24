@@ -8,6 +8,11 @@ const pct = value => value == null ? '—' : `${fmt(value * 100, 2)}%`;
 const time = value => `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`;
 const node = (tag, cls, text) => { const el = document.createElement(tag); if (cls) el.className = cls; if (text != null) el.textContent = text; return el; };
 
+function datasetQuestionTime(question) {
+  const seconds = value => value == null || value === '' || !Number.isFinite(Number(value)) ? '未标注' : fmt(value, 2);
+  return `数据集时间：${seconds(question?.start_time)}–${seconds(question?.end_time)} 秒`;
+}
+
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? {} : {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
@@ -104,7 +109,9 @@ async function loadSample(auto = true) {
       $('question').append(option);
       const label = node('label', 'check-label'), checkbox = node('input');
       checkbox.type = 'checkbox'; checkbox.value = index; checkbox.checked = index === 0;
-      label.append(checkbox, node('span', '', `${index+1}. ${question.question}`));
+      const content = node('span', '', `${index+1}. ${question.question}`);
+      content.append(node('span', 'question-dataset-time tiny', datasetQuestionTime(question)));
+      label.append(checkbox, content);
       $('compressionQuestions').append(label);
     });
     showQuestion();
@@ -114,7 +121,8 @@ async function loadSample(auto = true) {
   } catch (error) { if (generation === state.generation) showError(error); }
 }
 function parameters() {
-  return {sample_id: $('sample').value, max_frames: Number($('maxFrames').value),
+  return {sample_id: $('sample').value, dtype: $('dtype').value,
+    max_frames: $('maxFrames').value === '' ? null : Number($('maxFrames').value),
     ...($('mode').value === 'compression' ? {
       question_indices: [...$('compressionQuestions').querySelectorAll('input:checked')].map(input => Number(input.value)),
       custom_questions: $('compressionCustomQuestions').value.split('\n').map(q => q.trim()).filter(Boolean)
@@ -502,7 +510,7 @@ for (const [id, checked] of [['compressionQuestionsAll', true], ['compressionQue
     invalidate();
   });
 }
-['maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment'].forEach(id => $(id).addEventListener('change', invalidate));
+['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));
@@ -785,9 +793,7 @@ async function init() {
   try {
     [state.config, state.samples] = await Promise.all([api('/api/config'), api('/api/samples')]);
     $('modelInfo').textContent = `${state.config.model_path.split('/').pop()} · ${state.config.device}`;
-    $('maxFrames').max = state.config.max_frames;
-    $('segmentMinFrames').max = state.config.max_frames;
-    $('maxFrames').value = Math.min(8, state.config.max_frames);
+    $('dtype').value = state.config.dtype ?? 'float16';
     $('videoWindowSize').value = state.config.default_video_window_size ?? 32;
     updateWindowLabels();
     if (!state.samples.length) throw new Error('RVS 数据集中没有样本');

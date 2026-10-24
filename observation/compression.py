@@ -19,8 +19,8 @@ STAGES = [
     ('summary_generation', '生成 segment summary', True),
     ('summary_query', '提取 summary Query', True),
     ('token_scoring', 'Token 评分与分类', True),
-    ('quantization', '量化与渐进降位', True),
     ('token_pruning', '删除低分 token', True),
+    ('quantization', '高分区域量化与渐进降位', True),
     ('frame_eviction', '整帧淘汰', True),
     ('segment_commit', '段提交与预算统计', True),
     ('retrieval', '问题前向与帧检索', False),
@@ -166,8 +166,9 @@ def retrieval_statistics(run, frames, segment_ids):
 
 def compare(observation, images, frames, record, params, progress, check_cancel, on_snapshot=None):
     observation.load(progress)
-    if observation.model.dtype != torch.float16:
-        raise ValueError('压缩对照需要 float16 模型；请用 --dtype float16 启动服务')
+    dtype = str(observation.model.dtype).removeprefix('torch.')
+    if dtype not in ('float16', 'bfloat16', 'float32'):
+        raise ValueError('压缩对照支持 float16、bfloat16 和 float32')
     if not frames or len(images) != len(frames):
         raise ValueError('Compression comparison requires matching nonempty frames/images')
     config = asdict(StreamingConfig(model_path=observation.model_path, device=observation.device,
@@ -181,7 +182,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
     questions = [dict(q, question_id=i+1) for i, q in enumerate(questions)]
     runs = {}
     for index, (name, compressed, label) in enumerate([
-            ('before', False, '压缩前 · 全 FP16'), ('after', True, '压缩后 · 预算约束')]):
+            ('before', False, f'压缩前 · {dtype}'), ('after', True, '压缩后 · 预算约束')]):
         check_cancel()
         def report(frame, total):
             progress('compression_'+name, f'{label}：处理帧 {frame+1}/{total}', .15+.4*index+.3*frame/total)
@@ -224,11 +225,11 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         question=questions[0]['question'], question_index=questions[0]['question_index'], questions=questions,
         frame_count=len(frames),
         cutoff_timestamp=frames[-1]['timestamp'], config=config, runs=runs, memory=memory, stages=stages,
-        method=dict(model_instances=1, execution='sequential', cache_device=observation.device,
-            offload=False, baseline='same streaming encoding and top-k retrieval; all FP16; no compression or summaries',
+        method=dict(model_instances=1, execution='sequential', cache_device=observation.device, dtype=dtype,
+            offload=False, baseline=f'same streaming encoding and top-k retrieval; all {dtype}; no compression or summaries',
             timing='exclusive wall time, CUDA synchronized at stage boundaries; excludes model loading and video decoding',
             memory='unique persistent tensor storage; CUDA allocated/peak include weights and workspaces; reserved allocator memory is not savings',
-            frame_states='each progress point records per-frame, per-layer token counts [FP16, INT8, INT4, INT2]; evicted frames retain observed segment_id and have counts=null; baseline segment_id=null; no future frames; sink excluded',
+            frame_states='each progress point records per-frame, per-layer token counts [model dtype, INT8, INT4, INT2]; bit_order 16 denotes unquantized model dtype; evicted frames retain observed segment_id and have counts=null; baseline segment_id=null; no future frames; sink excluded',
             retrieval_hits='once per question per frame across layers, including recent frames; segment hit means any member frame was retrieved; both sides use compressed-run segments; unavailable if compressed run failed',
             sampling='identical selected frames and questions; questions are answered independently in order at the last selected frame using the same video cache; reference answers are not inputs',
             measurement='single paired run, baseline first; first-use kernel initialization can affect timing')))

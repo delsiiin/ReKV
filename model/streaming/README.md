@@ -37,17 +37,29 @@ if __name__ == '__main__':
 ## 算法
 
 - 分段复用 observation 的投影/池化前视觉特征距离、历史 EMA 阈值、首对帧 warmup；默认 `alpha=.2`、`min_segment_frames=1`。达到 `max_segment_frames=32` 或 summary 上下文容量上限时闭段，不重置 EMA。
-- summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与在线视频 K 的点积均值，不做 softmax，不跨层平均。大于或等于该层帧内均值的 token 保持 FP16。summary 为空/计算失败时全帧按高分保留并记录原因。
-- sink 为初始化提示词；最新两帧是 recent，始终使用原始 FP16。未闭合段全精度暂存并可检索。各层的标签在段提交时固定。
-- 每个段提交后若超预算：所有已闭合非保护帧的低分区各降一级（16→8→4→2）；仍超预算则从旧到新逐帧删除低分区，每帧后重新检查；仍不足才淘汰 retrieve 频率最低的整帧，频率相同则淘汰更早入库的帧，即按 `(hits, frame_id)` 升序淘汰（LFU，同频时 FIFO）。`hits` 为累计问题检索命中次数，`frame_id` 在入库时单调递增；每淘汰一帧后重新检查预算。
+- summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与暂存的 **RoPE 前 K** 的点积均值，不做 softmax，不跨层平均。大于或等于该层帧内均值的 token 归为高分区，其余归为低分区。分区掩码作用于 **RoPE 后 K 和原始 V**；V 不应用 RoPE。summary 为空/计算失败时全帧按高分保留并记录原因。
+- 持久缓存、量化载荷和问题快照中的 K 均为编码时局部 attention 使用的 RoPE 后 K。RoPE 前 K 仅作为分区评分工作内存，段提交成功或评分失败后均释放；不进入快照。未启用压缩的基线也存储 RoPE 后 K，但不保留评分副本。
+- sink 为初始化提示词；最新两帧是 recent，始终使用原始模型精度。未闭合段全精度暂存并可检索。各层的标签在段提交时固定。
+- 每个段提交后若超预算：直接丢弃所有已闭合非保护帧的低分区；若仍超预算，则将这些帧各层的高分区各降一级（16→8→4→2），每次事件最多降一级；仍不足才淘汰 retrieve 频率最低的整帧，频率相同则淘汰更早入库的帧，即按 `(hits, frame_id)` 升序淘汰（LFU，同频时 FIFO）。`hits` 为累计问题检索命中次数，`frame_id` 在入库时单调递增；每淘汰一帧后重新检查预算。
 - 一个问题在任一层用到某帧，该帧只加一次命中，recent 同样计数；summary 不增加命中。采用单调问题 ID 去重，不积累无限增长的历史 ID 集合。
-- K/V 都使用 PM-KVQ 的 `per_group` 方向：固定 head 和 token，沿通道维分组，默认 group size=128。首次压缩先生成 16bit 整数编码，再降到 8bit；后续逐次降为 4/2bit。打包采用 PM-KVQ 的 int16 容器和高位优先顺序。不使用 outlier calibration；高分 token、sink、recent 始终保留原始 FP16。
+- 分组方向参考 KIVI：**K per-channel**，固定 head 和 channel，沿 token 维分组；**V per-token**，固定 head 和 token，沿 channel 维分组。默认 group size=128。首次压缩先生成 16bit 整数编码，再降到 8bit；后续逐次降为 4/2bit。初始化、整数降位和打包仍采用 PM-KVQ 的公式、int16 容器和高位优先顺序。不使用 outlier calibration；sink、recent 始终保留原始模型精度，高分区在预算不足时渐进降位。
 
 ### 量化计算
 
-仅量化已经分类为低分的 K/V，输入形状为 `[H_kv, N_low, D]`，每层、每帧独立处理。K/V 的参数形状均为 `[H_kv, N_low, ceil(D/G)]`，其中 `G=group_size`。G 必须为 8 的正整数倍，不同 token 不共享量化参数。
+仅量化已经分类为高分的 K/V，输入形状为 `[H_kv, N_high, D]`，每层、每帧独立处理，`G=group_size` 必须为 8 的正整数倍。
 
-第一次超预算压缩的路径是 **原始 FP16 → 16bit 整数编码 → 8bit 整数编码**。INT16 是本次压缩的中间阶段，不作为新增预算事件；未触发压缩的低分区仍为原始 FP16。每个组取 `m=min(x)`、`M=max(x)`：
+| 缓存 | 分组范围 | scale/offset 形状 | 内部打包方向 |
+| --- | --- | --- | --- |
+| K（`axis='channel'`） | 每个 channel 内的 G 个存活 token | `[H_kv, D, ceil(N_high/G)]` | 转为 `[H_kv, D, N_high]` 后沿 token 维打包 |
+| V（`axis='token'`） | 每个 token 内的 G 个 channel | `[H_kv, N_high, ceil(D/G)]` | 沿 channel 维打包 |
+
+K 的分组按高分 token 的原始顺序进行，不跨帧或层拼组；组内 token 共享该 channel 的量化参数。反量化后 K/V 都恢复为 `[H_kv, N_high, D]`，保持原始 token 顺序。较短帧的 K 尾组会增加每个有效 token 分摊的参数与填充开销，预算账本按实际 storage 字节计量。
+
+这里的 K 是 RoPE 后 K。每帧记录编码时的旋转起点 `rope_start`，存活 token 的源位置为 `rope_start + 原始帧内索引`。检索拼接、删 token 或滑窗移动后，读取的 K 只施加位置差旋转 `R(目标位置−源位置)`，不对已旋转 K 再施加完整 RoPE。该处理保留 ReKV 的局部重排位置语义；sink 补充 attention 阶段单独变换到原有零位置语义。量化发生在源位置旋转之后，位置差旋转不会重新量化或改写持久缓存。
+
+底层 `StreamingKVCache.append_frame(timestamp, layers, score_keys=..., rope_start=...)` 的 `layers` 接收 RoPE 后 K/V，`score_keys` 接收逐层 RoPE 前 K；缺少评分 K 时分区会明确记录错误并按全高分保留，不会误用 RoPE 后 K 评分。decoder 返回的每层缓存为 `RotaryCache(key, value, positions)`，编码和后续解码必须传递位置元数据。
+
+第一次超预算压缩的路径是 **原始模型精度 → 16bit 整数编码 → 8bit 整数编码**。INT16 是本次压缩的中间阶段，不作为新增预算事件；未触发降位的高分区仍为原始模型精度，可压缩帧的低分区在超预算事件中直接删除。每个组取 `m=min(x)`、`M=max(x)`：
 
 ```text
 scale16 = clamp((M-m)/65535, 1e-5, 1e5)
@@ -55,18 +67,18 @@ offset  = -m
 q16     = clamp(round((x+offset)/scale16), 0, 65535)
 ```
 
-随后使用 PM-KVQ 原始整数移位公式降位。16→8、8→4、4→2 的 scale 分别乘以 **257、17、5**；offset 不变。反量化为 `x_hat=q*scale-offset`，不保留 FP16 备份，不重新计算范围。整数编码虽为无符号数值，存储容器为 `torch.int16`，解包时通过掩码恢复无符号值。
+随后使用 PM-KVQ 原始整数移位公式降位。16→8、8→4、4→2 的 scale 分别乘以 **257、17、5**；offset 不变。反量化为 `x_hat=q*scale-offset`，不保留原精度备份，不重新计算范围。整数编码虽为无符号数值，存储容器为 `torch.int16`，解包时通过掩码恢复无符号值。
 
-分组维度、16bit 初始化、scale 截断、整数降位及打包布局均与本地 PM-KVQ 对照验证。适配 ReKV 时保留 FP32 参数计算/存储，读取时恢复 FP16；数值测试以 **FP32 输入的 PM-KVQ 量化器**为参考，使用相同输出 dtype 比较反量化结果。没有接入 PM-KVQ 的 SmoothAttention 重参数化或预算分配。
+16bit 初始化、scale 截断、整数降位及打包布局与本地 PM-KVQ 对照验证；K 的分组方向改为 KIVI 的 per-channel，并在转置布局上验证逐级编码与反量化。适配 ReKV 时保留 FP32 参数计算/存储，读取时恢复模型 dtype；PM-KVQ 数值对照以其 **FP32 输入量化器**为参考，使用相同输出 dtype 比较反量化结果。没有接入 PM-KVQ 的 SmoothAttention 重参数化或预算分配，也没有改为 KIVI 的直接目标位宽量化或 residual 缓存策略。
 
-PM-KVQ 原版要求通道维可被 group size 整除。本后端额外支持尾组：只用有效元素计算 min/max，整数码补齐到 8 的倍数供 2bit 打包，填充值不参与量化范围。模型 head_dim=128、G=128 的常用配置无需填充。
+本后端支持两个方向的尾组：只用有效元素计算 min/max，K 的 token 维和 V 的 channel 维分别补齐到 8 的倍数供 2bit 打包，填充值不参与量化范围。模型 head_dim=128、G=128 时 V 无需填充，K 是否填充由该层该帧的高分 token 数决定。
 
 
 ## 缓存与内存口径
 
 `budget_bytes = budget_tokens × 4 × Σ(layer.kv_heads × layer.head_dim)`，包括 K/V 两份、每个 FP16 元素 2 字节。实际计量覆盖管理器中的持久 K/V、量化参数、填充、位置索引、代表向量与元数据；以唯一 tensor storage 的 `nbytes` 加 Python 对象 `sys.getsizeof` 计量，不把逻辑 token 数当成真实压缩存储。
 
-该指标是**受管理缓存字节**，包含 GPU tensor storage 和少量 CPU Python 元数据，不是进程 RSS 或 CUDA allocator 的全部占用。模型权重、summary/问答临时张量、未闭合段非 recent 部分、被问题固定的旧版本属于工作内存。预算保证发生在段提交处理完毕时；中间帧到来后可暂时超过预算。启动时会保守检查 sink/recent 的最低容量。
+该指标是**受管理缓存字节**，包含 GPU tensor storage 和少量 CPU Python 元数据，不是进程 RSS 或 CUDA allocator 的全部占用。模型权重、summary/问答临时张量、未闭合段非 recent 部分、被问题固定的旧版本属于工作内存。RoPE 前评分 K 由缓存账本单独计入 `cache_working_bytes`，不计入持久预算，段提交后释放。预算保证发生在段提交处理完毕时；中间帧到来后可暂时超过预算。启动时会保守检查 sink/recent 的最低容量。
 
 预算和报告使用 `accounting.py` 的增量引用计数账本：帧新增、分类、降位、删除以及快照获取/释放时更新变化的对象与存储。Python 对象身份和底层 tensor storage 分别去重；张量 view、跨层共享对象和旧快照均不会重复计费。正常预算查询与 `memory_stats()` 不扫描全部帧或访问全部 tensor storage，开销不随保留帧数增长；新记录的登记成本在帧更新时支付。仅修改命中数或关闭标记时，复用原有层与张量的登记记录。
 
@@ -92,7 +104,7 @@ python tests/benchmark_streaming_accounting.py \
 
 增量登记有写入成本：同次基准中单帧入库从 1.85 ms 增至 2.77 ms；连续重放仍减少约 95% 的总耗时。上述结果只度量合成管理路径，不含真实视频模型推理。
 
-主缓存和问题快照都留在调用方进程中；K/V、低位载荷、scale/offset、位置索引、代表向量、summary Query 和待总结视觉特征均保留在同一 GPU，压缩、检索、反量化不经过 CPU offload。CPU 只处理输入图片、帧 ID、时间、计数和文本等控制信息。降位和删除通过替换不可变记录完成；问答完成逐层检索后立即记录激活并释放快照，答案继续使用其选出的临时 GPU KV。不创建跨进程模型或缓存副本。检索代表向量使用原始帧 Key 均值；删除部分 token 不改写代表向量。recent 占用 `topk` 名额，最终按时间拼接每层存活 token，再采用 ReKV 的 RoPE 与滑动窗口注意力。
+主缓存和问题快照都留在调用方进程中；K/V、低位载荷、scale/offset、位置索引、代表向量、summary Query 和待总结视觉特征均保留在同一 GPU，压缩、检索、反量化不经过 CPU offload。CPU 只处理输入图片、帧 ID、时间、计数和文本等控制信息。降位和删除通过替换不可变记录完成；问答完成逐层检索后立即记录激活并释放快照，答案继续使用其选出的临时 GPU KV。不创建跨进程模型或缓存副本。检索代表向量使用量化前、RoPE 后的整帧 Key 均值，查询 Q 在各帧存储坐标中紧随该帧应用 RoPE 后评分；不使用分区暂存的 RoPE 前 K。删除部分 token 不改写代表向量。recent 占用 `topk` 名额，最终按时间拼接每层存活 token，并通过位置差旋转对齐 ReKV 滑动窗口注意力。
 
 输出字段：
 
@@ -107,7 +119,7 @@ python tests/benchmark_streaming_accounting.py \
 | `memory.feature_working_bytes` | 待总结段的视觉语言特征占用 |
 | `gpu_peak_bytes` | 对应进程 PyTorch 分配显存峰值，包含模型权重 |
 | `process_peak_rss_bytes` | 对应进程 RSS 高水位，包含模型加载 |
-| `memory.bits` | 各位宽/已删低分区的“层×帧”记录数 |
+| `memory.bits` | 高分区各位宽的“层×帧”记录数；兼容键 `0` 保留且为 0，低分区删除见 `memory.counts` |
 | `memory.counts` | 超预算事件、低分区删除帧次、整帧淘汰次数 |
 | `summary_seconds/score_compress_seconds/encode_seconds` | 当前进程中编码相关累计耗时；编码时间不含闭段 summary |
 | `answers[].qa_seconds` | 同步问题检索与完整答案生成耗时 |
@@ -128,3 +140,5 @@ python -m unittest discover -s tests -v
 原 `video_qa/base.py` 在每个评测实例中调用一次模型加载，`ReKVStreamVQA` 依次调用同一个对象的 `encode_video()` 和 `question_answering()`；原缓存管理器使用 CPU offload。README 描述了跨进程/跨 GPU 的分离能力，但当前流式评测入口没有单份模型的跨进程并发前向实现。新增后端不修改原缓存管理器，也不改变未启用 `--compressed` 的入口。
 
 新增后端同样在调用方进程中加载一次模型，按 `append_frame → ask（完成回答）→ append_frame` 顺序执行。与原 ReKV 的主要区别是新增后端将压缩缓存保留在 GPU，按预算执行量化和淘汰。旧版新增后端的 `ask_async()`、延迟取结果的 `answer()`、队列和超时配置已移除；改用同步 `ask()`。
+
+模型直接加载时默认使用 FP16；observation 网页注入的模型可使用 FP16、BF16 或 FP32。sink、recent、评分暂存与未压缩帧保留模型 dtype，反量化恢复同一 dtype。FP32 使用 PyTorch attention，CUDA 上的 FP16/BF16 使用现有 Triton attention。预算仍以 FP16-token 等价字节定义，FP32 张量按实际 4 字节计入账本。`bits`/`bit_order` 中的兼容键 `16` 表示未量化状态，真实浮点精度由 `cache_dtype` 或 `full_precision_dtype` 指明。

@@ -16,9 +16,12 @@
     <label for="sample">视频样本</label><select id="sample"></select>
     <label for="question">关联问题</label><select id="question"></select>
     <div class="section-label">02 / 输入范围</div>
-    <div class="field-pair"><div><label for="maxFrames">处理帧数</label><input id="maxFrames" type="number" value="8" min="1" max="128" required></div><div><label for="fps">采样 FPS</label><input id="fps" type="number" value="0.5" min="0.001" max="1" step="any" required></div></div>
+    <label for="fps">采样 FPS</label><input id="fps" type="number" value="0.5" min="0.001" max="1" step="any" required>
     <label for="startTime">起始时间 / 秒</label><input id="startTime" type="number" value="0" min="0" step="any" required>
-    <p class="field-note">从起始时间后的第一个采样帧开始，最多处理指定帧数。时间戳相对源视频。</p>
+    <label for="maxFrames">处理帧数 / 可选</label><input id="maxFrames" type="number" min="1" step="1" placeholder="留空处理到视频结束">
+    <p class="field-note">从起始时间开始，处理指定数量的采样帧后结束；留空则处理到视频结束。不设固定帧数上限。时间戳相对源视频。</p>
+    <label for="dtype">模型计算精度 / dtype</label><select id="dtype"><option value="float16">FP16 / float16</option><option value="bfloat16">BF16 / bfloat16</option><option value="float32">FP32 / float32</option></select>
+    <p class="field-note">切换精度后，下次计算会重新加载模型；压缩对照两侧使用相同精度。</p>
     <label for="mode">观察输入</label><select id="mode"><option value="video">视频编码末尾 32 token</option><option value="question">视频 + 问题末尾 32 token</option><option value="compression">KV 压缩前后对照</option></select>
     <label for="videoWindowSize">视频末尾 token 数 N</label><input id="videoWindowSize" type="number" value="32" min="1" step="1" required>
     <p class="field-note">用于视频编码末尾窗口，可跨帧，不能超过实际视频 token 总数。</p>
@@ -26,7 +29,7 @@
     <div class="section-label">03 / SEGMENT 观察</div>
     <label class="check-label"><input id="segmentEnabled" type="checkbox" checked> 分段、主动总结与相似度</label>
     <label for="emaAlpha">EMA α</label><input id="emaAlpha" type="number" value="0.2" min="0.001" max="1" step="any" required>
-    <label for="segmentMinFrames">切分前最少帧数</label><input id="segmentMinFrames" type="number" value="1" min="1" max="128" required>
+    <label for="segmentMinFrames">切分前最少帧数</label><input id="segmentMinFrames" type="number" value="1" min="1" required>
     <label for="summaryMaxTokens">每段 summary 最大 token 数</label><input id="summaryMaxTokens" type="number" value="192" min="1" max="512" required>
     <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。阈值倍数固定为 1；第一对帧初始化 EMA，后续距离超过历史 EMA 则切分。每段单独生成总结。</p>
     <div id="compressionControls" hidden>
@@ -39,7 +42,7 @@
       <label for="compressionBudget">Memory budget / FP16 token 数</label><input id="compressionBudget" type="number" value="1024" min="1" max="10000000" required>
       <div class="field-pair"><div><label for="compressionRecent">Recent 保护帧数</label><input id="compressionRecent" type="number" value="2" min="1" max="128" required></div><div><label for="compressionTopk">检索帧数上限</label><input id="compressionTopk" type="number" value="64" min="1" max="512" required></div></div>
       <label for="compressionMaxSegment">每段最多帧数</label><input id="compressionMaxSegment" type="number" value="32" min="1" max="128" required>
-      <p class="field-note">同一模型顺序运行全 FP16 与压缩缓存；使用上方的 EMA 和 summary 参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
+      <p class="field-note">同一模型顺序运行原精度与压缩缓存；使用上方的 EMA 和 summary 参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
     </div>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
@@ -58,13 +61,13 @@
     <section class="panel"><div class="panel-heading"><div><h2>压缩前后显存</h2><p id="compressionMemoryNote" class="muted"></p></div></div><div id="compressionMemoryTable" class="compression-scroll"></div><div id="compressionMemoryChart"></div><label for="compressionFrame">选择输入进度</label><input id="compressionFrame" type="range" min="0" max="0" value="0"><p id="compressionFrameReadout" class="spatial-readout" aria-live="polite"></p><p class="tiny">持久 KV 统计去重后的张量 storage，含量化参数与位置索引；CUDA 分配量包含模型和工作缓冲。峰值单独测量。预算仅在段提交完成后强制满足。</p></section>
     <section id="compressionFrameStatesPanel" class="panel">
       <div class="panel-heading"><div><h2>每帧缓存状态</h2><p id="compressionFrameStatesMeta" class="muted"></p></div><button id="compressionFrameStatesCsv" type="button" class="text-button">↓ 当前状态 CSV</button></div>
-      <div class="cache-state-controls"><label for="compressionStateSide">缓存版本<select id="compressionStateSide"><option value="after">压缩后</option><option value="before">压缩前 · 全 FP16</option></select></label><label for="compressionStateLayer">语言模型层<select id="compressionStateLayer"><option value="all">全部层 · 每层平均</option></select></label><button id="compressionStateFinal" class="text-button" type="button">查看最终状态</button></div>
+      <div class="cache-state-controls"><label for="compressionStateSide">缓存版本<select id="compressionStateSide"><option value="after">压缩后</option><option value="before">压缩前 · 原精度</option></select></label><label for="compressionStateLayer">语言模型层<select id="compressionStateLayer"><option value="all">全部层 · 每层平均</option></select></label><button id="compressionStateFinal" class="text-button" type="button">查看最终状态</button></div>
       <div class="cache-playback-controls">
         <button id="compressionStatePrev" class="text-button" type="button">← 上一步</button><button id="compressionStatePlay" class="text-button" type="button" aria-pressed="false">播放</button><button id="compressionStateNext" class="text-button" type="button">下一步 →</button>
         <label for="compressionStateSpeed">回放速度<select id="compressionStateSpeed"><option value="1000">1× · 每步 1 秒</option><option value="500">2×</option><option value="250">4×</option></select></label>
         <label id="compressionStateFollowLabel" class="check-label" hidden><input id="compressionStateFollow" type="checkbox" checked> 实时跟随最新状态</label>
       </div><label for="compressionStateProgress" class="tiny">缓存状态进度（与上方显存曲线同步）</label><input id="compressionStateProgress" type="range" min="0" max="0" value="0"><p id="compressionStatePlaybackStatus" class="tiny" aria-live="polite"></p>
-      <div class="cache-state-legend"><span><i class="cache-bit-16"></i>FP16</span><span><i class="cache-bit-8"></i>8bit</span><span><i class="cache-bit-4"></i>4bit</span><span><i class="cache-bit-2"></i>2bit</span><span><i class="cache-bit-deleted"></i>已删除</span></div>
+      <div class="cache-state-legend"><span><i class="cache-bit-16"></i>原精度</span><span><i class="cache-bit-8"></i>8bit</span><span><i class="cache-bit-4"></i>4bit</span><span><i class="cache-bit-2"></i>2bit</span><span><i class="cache-bit-deleted"></i>已删除</span></div>
       <p class="tiny">同一 segment 使用相同底色，左侧色线标记分段；底色与精度色条含义不同。与进度滑块联动，各层独立压缩；全部层视图展示每层平均数量及层间范围，不把跨层计数当作单帧 token 数。K/V 共用的一个 token 位置计一次，sink 不计入帧。平均位宽仅统计剩余 token，不含量化参数与填充。</p>
       <div id="compressionFrameStates" class="compression-scroll"></div>
     </section>
@@ -78,7 +81,7 @@
       <p id="compressionHitsReadout" class="spatial-readout" aria-live="polite">悬停或聚焦曲线上的点查看命中次数。</p>
       <details><summary>命中数值明细</summary><div id="compressionHitsTable" class="compression-scroll"></div></details>
     </section>
-    <section class="panel"><div class="panel-heading"><h2>多问题 · 压缩前后回答</h2><span id="compressionAnswerStatus" class="tag"></span></div><label for="compressionAnswerQuestion">查看问题</label><select id="compressionAnswerQuestion"></select><p id="compressionQuestion" class="answer-question"></p><p id="compressionContext" class="muted"></p><div class="answer-columns"><div><div class="eyebrow">BEFORE / 全 FP16</div><p id="compressionBeforeAnswer" class="answer-text"></p><p id="compressionBeforeMeta" class="tiny"></p></div><div class="reference-answer"><div class="eyebrow">AFTER / 压缩缓存</div><p id="compressionAfterAnswer" class="answer-text"></p><p id="compressionAfterMeta" class="tiny"></p></div></div><details><summary>参考答案（不参与推理）</summary><p id="compressionReference"></p></details></section>
+    <section class="panel"><div class="panel-heading"><h2>多问题 · 压缩前后回答</h2><span id="compressionAnswerStatus" class="tag"></span></div><label for="compressionAnswerQuestion">查看问题</label><select id="compressionAnswerQuestion"></select><p id="compressionQuestion" class="answer-question"></p><p id="compressionContext" class="muted"></p><div class="answer-columns"><div><div class="eyebrow">BEFORE / 原精度</div><p id="compressionBeforeAnswer" class="answer-text"></p><p id="compressionBeforeMeta" class="tiny"></p></div><div class="reference-answer"><div class="eyebrow">AFTER / 压缩缓存</div><p id="compressionAfterAnswer" class="answer-text"></p><p id="compressionAfterMeta" class="tiny"></p></div></div><details><summary>参考答案（不参与推理）</summary><p id="compressionReference"></p></details></section>
     <section class="panel"><div class="panel-heading"><h2>本次使用的相同采样帧</h2></div><div id="compressionFrames" class="frame-grid"></div></section>
     <details class="panel"><summary>对照设置与统计口径</summary><pre id="compressionMethod"></pre></details>
   </div>

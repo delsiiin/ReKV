@@ -10,7 +10,7 @@ from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionP
 from model.patch import patch_hf
 from observation.engine import INIT_PROMPT, question_inputs, greedy_token_ids
 from observation.segments import SUMMARY_SYSTEM, summary_prompt, selected_vision_features, capture_queries
-from .attention import EncodeLayer, RetrieveLayer, streaming_attention_forward
+from .attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
 from .cache import StreamingKVCache
 from .segments import OnlineSegmenter
 from .profiling import stage, measure
@@ -47,8 +47,9 @@ class OneVisionEngine:
                 device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
         else:
             self.model, self.processor = model, processor
-        if self.model.dtype != torch.float16:
-            raise ValueError('Compressed KV comparison requires a float16 model')
+        if self.model.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError('Streaming model requires float16, bfloat16 or float32')
+        self.dtype = self.model.dtype
         self.decoder = self.model.model.language_model
         self._model_parameter_bytes = sum(p.numel()*p.element_size() for p in self.model.parameters())
         self.device = self.decoder.get_input_embeddings().weight.device
@@ -58,7 +59,8 @@ class OneVisionEngine:
         self.sink_tokens = self.prefix.shape[1]
         local = config['recent_frames']*self.frame_tokens
         patch_hf(self.decoder, attention_factory=streaming_attention_forward,
-                 n_local=local, n_init=self.sink_tokens, fattn=str(device).startswith('cuda'))
+                 n_local=local, n_init=self.sink_tokens,
+                 fattn=str(device).startswith('cuda') and self.dtype != torch.float32)
         self.features, self.frame_info = [], []
         self.cache = None
         self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.)
@@ -78,7 +80,8 @@ class OneVisionEngine:
         output = self.decoder(input_ids=self.prefix, use_cache=True, return_dict=True)
         sink = tuple((k[0], v[0]) for k, v in output.past_key_values)
         self.cache = StreamingKVCache(sink, self.config['budget_tokens'], self.frame_tokens,
-                                      self.config['recent_frames'], self.config['group_size'], profiler=self.profiler)
+                                      self.config['recent_frames'], self.config['group_size'], profiler=self.profiler,
+                                      dtype=self.dtype)
         self.segmenter = OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
                                          self.config['max_segment_frames'])
         self.features, self.frame_info = [], []
@@ -108,7 +111,7 @@ class OneVisionEngine:
         closed_seconds = 0.
         with measure(self.profiler, 'vision_encoding'):
             pixels = self.processor.video_processor(videos=[image], do_sample_frames=False,
-                        return_tensors='pt').pixel_values_videos.to(self.device, torch.float16)
+                        return_tensors='pt').pixel_values_videos.to(self.device, self.dtype)
             output = self.model.model.get_video_features(pixel_values=pixels,
                         vision_feature_layer=self.model.config.vision_feature_layer,
                         vision_feature_select_strategy=self.model.config.vision_feature_select_strategy,
@@ -138,10 +141,16 @@ class OneVisionEngine:
             parts = [frame.layers[layer].materialize() for frame in recent]
             key = torch.cat([sink_k]+[x[0] for x in parts], 1)[None]
             value = torch.cat([sink_v]+[x[1] for x in parts], 1)[None]
-            contexts.append(EncodeLayer((key, value)))
+            positions = torch.cat([torch.arange(sink_k.shape[1], device=self.device)] +
+                                  [part[2].long()+frame.rope_start for frame, part in zip(recent, parts)])
+            contexts.append(EncodeLayer(RotaryCache(key, value, positions),
+                                        capture_scores=self.compression_enabled))
         self._set_window('encode')
         self.decoder(inputs_embeds=feature, past_key_values=contexts, use_cache=True, return_dict=True)
-        self.cache.append_frame(timestamp, [context.captured for context in contexts])
+        self.cache.append_frame(timestamp, [context.captured for context in contexts],
+                                score_keys=[context.score_key for context in contexts] if self.compression_enabled else None,
+                                rope_start=contexts[0].position_start)
+        del contexts
         if not self.compression_enabled:
             self.cache.close_uncompressed_segment(return_stats=False)
             self.timings['encode_seconds'] += time.monotonic()-began

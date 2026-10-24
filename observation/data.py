@@ -1,4 +1,4 @@
-"""RVS records and bounded decoding of the exact frames passed to the model."""
+"""RVS records and decoding of sampled frames with an optional stopping count."""
 import json
 import math
 from pathlib import Path
@@ -47,14 +47,16 @@ class RVSDataset:
                 for r in self.records.values()]
 
 
-def sample_indices(total, source_fps, sample_fps, kind, start_time=0, max_frames=8):
-    """Match ReKVStreamVQA sampling, then select a bounded prefix from start_time."""
+def sample_indices(total, source_fps, sample_fps, kind, start_time=0, max_frames=None):
+    """Match ReKVStreamVQA sampling, then optionally stop after max_frames samples."""
     if total < 1 or not math.isfinite(source_fps) or source_fps <= 0:
         raise ValueError("Invalid source video length or FPS")
     if not math.isfinite(sample_fps) or sample_fps <= 0:
         raise ValueError("Sample FPS must be positive")
-    if not math.isfinite(start_time) or start_time < 0 or max_frames < 1:
-        raise ValueError("Start must be nonnegative and max_frames must be positive")
+    if not math.isfinite(start_time) or start_time < 0:
+        raise ValueError("Start must be nonnegative")
+    if max_frames is not None and (type(max_frames) is not int or max_frames < 1):
+        raise ValueError('max_frames must be a positive integer or None')
     if kind == 'npy':
         if sample_fps > 1:
             raise ValueError("RVS movie arrays contain 1 FPS; sample_fps must be <= 1")
@@ -87,7 +89,7 @@ def decode_frames(path, params, destination):
         fps, kind = float(source.get_avg_fps()), 'video'
     total = len(source)
     indices, available = sample_indices(total, fps, params['sample_fps'], kind,
-                                        params['start_time'], params['max_frames'])
+                                        params['start_time'], params.get('max_frames'))
     images = np.asarray(source[indices]) if kind == 'npy' else source.get_batch(indices).asnumpy()
     frames = []
     for index, (source_index, pixels) in enumerate(zip(indices, images)):
