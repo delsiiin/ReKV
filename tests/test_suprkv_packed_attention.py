@@ -7,10 +7,10 @@ import unittest
 import torch
 
 from model.attention.rope import RotaryEmbeddingESM
-from model.streaming.attention import RetrieveLayer, RotaryCache, streaming_attention_forward
-from model.streaming.cache import CacheSnapshot, Frame, LayerFrame
-from model.streaming.packed_attention import PackedRotaryCache
-from model.streaming.quantization import PackedKV
+from model.suprkv.attention import RetrieveLayer, RotaryCache, streaming_attention_forward
+from model.suprkv.cache import CacheSnapshot, Frame, LayerFrame
+from model.suprkv.packed_attention import PackedRotaryCache
+from model.suprkv.quantization import PackedKV
 
 
 class PackedChannelTests(unittest.TestCase):
@@ -103,7 +103,7 @@ class PackedAttentionTests(unittest.TestCase):
 
     @torch.inference_mode()
     def test_split_k_real_head_sizes_and_all_masked_padding(self):
-        from model.streaming.packed_attention import AttentionChunk, coalesce
+        from model.suprkv.packed_attention import AttentionChunk, coalesce
         for dim in (128, 256):
             rope = RotaryEmbeddingESM(dim).cuda()
             chunks = []

@@ -6,9 +6,9 @@ import time
 
 import torch
 
-from model.streaming.onevision import OneVisionEngine
-from model.streaming.profiling import StageProfiler
-from model.streaming.runtime import StreamingConfig
+from model.suprkv.onevision import OneVisionEngine
+from model.suprkv.profiling import StageProfiler
+from model.suprkv.runtime import StreamingConfig
 
 
 STAGES = [

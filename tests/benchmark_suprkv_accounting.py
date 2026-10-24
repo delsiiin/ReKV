@@ -2,8 +2,8 @@
 
 No model load, summary generation or quantization is timed.
 
-python tests/benchmark_streaming_accounting.py --baseline /tmp/cache-before.py
-The optional baseline is a saved, pre-change model/streaming/cache.py.
+python tests/benchmark_suprkv_accounting.py --baseline /tmp/cache-before.py
+The optional baseline is a saved, pre-change model/suprkv/cache.py.
 """
 import argparse
 from dataclasses import replace
@@ -18,11 +18,11 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-from model.streaming.cache import StreamingKVCache
+from model.suprkv.cache import StreamingKVCache
 
 
 def load_baseline(path):
-    name = 'model.streaming._accounting_benchmark_baseline'
+    name = 'model.suprkv._accounting_benchmark_baseline'
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module

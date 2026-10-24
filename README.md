@@ -116,6 +116,6 @@ python -m video_qa.run_eval \
 
 Our code is based on [InfLLM](https://github.com/thunlp/InfLLM), [StreamingLLM](https://github.com/mit-han-lab/streaming-llm), and [Flash-VStream](https://github.com/IVGSZ/Flash-VStream).
 
-## Budgeted online KV compression
+## suprKV: Summary-guided progressive KV compression
 
-An optional single-model, GPU-resident OneVision backend (one process, sequential encoding and QA, no KV offload) supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/streaming/README.md). The original evaluation entrypoints remain available; enable the new stream runner with `python -m video_qa.rekv_stream_vqa --compressed --help`.
+The optional suprKV OneVision backend uses one GPU-resident model for sequential encoding and QA, with no KV offload. It supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/suprkv/README.md). Run `python -m video_qa.suprkv_stream_vqa --help` for the suprKV entrypoint; the original `python -m video_qa.rekv_stream_vqa --compressed` entrypoint remains available.

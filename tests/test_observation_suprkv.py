@@ -9,11 +9,11 @@ import torch
 import numpy as np
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from observation.compression import compare, retrieval_statistics
+from observation.suprkv import compare, retrieval_statistics
 from observation.engine import Cancelled, ObservationEngine
 from observation.server import validate_params, ObservationService
-from model.streaming.cache import tensor_storage_bytes
-from model.streaming.profiling import StageProfiler
+from model.suprkv.cache import tensor_storage_bytes
+from model.suprkv.profiling import StageProfiler
 
 
 class CompressionParameterTests(unittest.TestCase):
@@ -150,7 +150,7 @@ class CompressionParameterTests(unittest.TestCase):
 
     def test_profile_nested_stages_are_exclusive(self):
         profiler = StageProfiler('cpu')
-        with patch('model.streaming.profiling.time.perf_counter', side_effect=[0., 1., 3., 5.]):
+        with patch('model.suprkv.profiling.time.perf_counter', side_effect=[0., 1., 3., 5.]):
             with profiler.measure('parent'):
                 with profiler.measure('child'):
                     pass
@@ -258,7 +258,7 @@ class CompressionModelTests(unittest.TestCase):
     def test_paired_comparison_reuses_one_model_and_restores_observation(self):
         decoder = self.llm.model
         native = decoder(torch.tensor([[1, 2, 3]]), use_cache=False).last_hidden_state.clone()
-        with patch('model.streaming.onevision.LlavaOnevisionForConditionalGeneration.from_pretrained',
+        with patch('model.suprkv.onevision.LlavaOnevisionForConditionalGeneration.from_pretrained',
                    side_effect=AssertionError('Must reuse the Observation model')):
             result = compare(self.observer, list(range(4)), self.frames, self.record, self.params,
                              lambda *_: None, lambda: None)['compression_experiment']

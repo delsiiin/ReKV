@@ -3,9 +3,9 @@ from dataclasses import replace
 import numpy as np
 import torch
 
-from model.streaming.quantization import PackedKV, pack, unpack
-from model.streaming.segments import OnlineSegmenter, summary_scores
-from model.streaming.cache import StreamingKVCache, LayerFrame, footprint
+from model.suprkv.quantization import PackedKV, pack, unpack
+from model.suprkv.segments import OnlineSegmenter, summary_scores
+from model.suprkv.cache import StreamingKVCache, LayerFrame, footprint
 from observation.segments import segment_by_ema, vision_frame_distances, mean_segment_attention
 
 

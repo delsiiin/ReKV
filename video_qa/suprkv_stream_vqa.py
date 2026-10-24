@@ -1,10 +1,10 @@
-"""Single-process sequential-video replay for compressed ReKV."""
+"""Single-process sequential-video replay with suprKV compression."""
 import argparse
 import json
 import math
 from pathlib import Path
 
-from model.streaming.runtime import StreamingConfig, StreamingRuntime
+from model.suprkv.runtime import StreamingConfig, StreamingRuntime
 
 
 def sampled_frames(path, fps=1., max_frames=0):

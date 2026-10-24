@@ -8,11 +8,11 @@ import torch
 
 from model.attention.rope import RotaryEmbeddingESM
 from model.attention.dot_production_attention.torch_impl import TorchMultiStageDotProductionAttention
-from model.streaming.attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
-from model.streaming.cache import StreamingKVCache
-from model.streaming.quantization import PackedKV
-from model.streaming.rotary import rotate_at
-from model.streaming.segments import summary_scores
+from model.suprkv.attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
+from model.suprkv.cache import StreamingKVCache
+from model.suprkv.quantization import PackedKV
+from model.suprkv.rotary import rotate_at
+from model.suprkv.segments import summary_scores
 
 
 def reference_rotate(x, positions, rope):
@@ -226,7 +226,7 @@ class PostRoPETests(unittest.TestCase):
     @torch.inference_mode()
     def test_onevision_append_stores_rotated_keys_across_recent_frame_rollover(self):
         from transformers import Qwen2Config, Qwen2Model
-        from model.streaming.onevision import OneVisionEngine
+        from model.suprkv.onevision import OneVisionEngine
         from unittest.mock import patch
         for compressed in (True, False):
             decoder = Qwen2Model(Qwen2Config(vocab_size=32, hidden_size=32, intermediate_size=48,
@@ -248,7 +248,7 @@ class PostRoPETests(unittest.TestCase):
             hook = decoder.layers[0].self_attn.k_proj.register_forward_hook(
                 lambda module, args, output: observed.append(output.detach().clone()))
             try:
-                with patch('model.streaming.onevision.selected_vision_features', return_value=torch.zeros(1, 4, 32)):
+                with patch('model.suprkv.onevision.selected_vision_features', return_value=torch.zeros(1, 4, 32)):
                     for i, expected_start in enumerate((2, 198, 392, 392)):
                         engine.append_frame(None, float(i))
                         frame = engine.cache.frames[i]

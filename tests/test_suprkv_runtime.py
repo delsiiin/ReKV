@@ -2,8 +2,8 @@ import os
 import unittest
 import torch
 
-from model.streaming.cache import StreamingKVCache
-from model.streaming.runtime import StreamingConfig, StreamingRuntime
+from model.suprkv.cache import StreamingKVCache
+from model.suprkv.runtime import StreamingConfig, StreamingRuntime
 
 
 class FakeWorker:
@@ -117,8 +117,8 @@ class ModelBridgeTests(unittest.TestCase):
     def test_qwen_ragged_layers_native_summary_and_encoding(self):
         from transformers import Qwen2Config, Qwen2Model
         from model.patch import patch_hf
-        from model.streaming.attention import streaming_attention_forward, EncodeLayer, RetrieveLayer
-        from model.streaming.onevision import native_decoder
+        from model.suprkv.attention import streaming_attention_forward, EncodeLayer, RetrieveLayer
+        from model.suprkv.onevision import native_decoder
         model = Qwen2Model(Qwen2Config(vocab_size=32, hidden_size=32, intermediate_size=48,
             num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2)).half().eval()
         patch_hf(model, attention_factory=streaming_attention_forward, n_local=64, n_init=2, fattn=False)
@@ -157,8 +157,8 @@ class SequentialModelTests(unittest.TestCase):
         from types import SimpleNamespace
         from transformers import Qwen2Config, Qwen2Model
         from model.patch import patch_hf
-        from model.streaming.onevision import OneVisionEngine, native_decoder
-        from model.streaming.attention import streaming_attention_forward
+        from model.suprkv.onevision import OneVisionEngine, native_decoder
+        from model.suprkv.attention import streaming_attention_forward
         torch.manual_seed(19)
         decoder = Qwen2Model(Qwen2Config(vocab_size=32, hidden_size=32, intermediate_size=48,
             num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2)).half().eval()

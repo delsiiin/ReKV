@@ -1,4 +1,6 @@
-# 在线视频 KV 压缩
+# suprKV：摘要引导的渐进式 KV 缓存压缩
+
+Python 包为 `model.suprkv`，独立命令行入口为 `video_qa.suprkv_stream_vqa`；测试与性能基准文件统一使用 `suprkv` 命名。
 
 采用 ReKV 单进程顺序执行方式的单模型、GPU 常驻压缩后端，当前支持本地 LLaVA-OneVision Qwen2 checkpoint、单路视频、一个在途问题。原有评测命令不变。新增入口支持逐帧视频回放和按时间到来的问题；Python API 支持外部实时帧源。
 
@@ -10,20 +12,20 @@
 在 `rekv` 环境、项目根目录运行：
 
 ```bash
-python -m video_qa.rekv_stream_vqa --compressed \
+python -m video_qa.suprkv_stream_vqa \
   --video data/rvs/ego/videos/9198b9a4-8d8f-4ba6-9924-4c86982d890a.mp4 \
   --device cuda:0 \
   --budget-tokens 4096 --max-segment-frames 32 \
   --question-time 2 --question 'What is the person doing?' \
-  --max-frames 8 --output results/streaming-kv/result.json
+  --max-frames 8 --output results/suprkv/result.json
 ```
 
-也可以直接运行 `python -m video_qa.compressed_stream_vqa`。`--questions path.json` 接受按时间升序排列的 `[{"time": 2.0, "question": "..."}, ...]`；不指定时间时在视频结束后提问。问题快照不会包含晚于该问题的帧。每个问题都回答完毕后再编码后续帧，不在答案生成期间插入视频编码。
+原入口 `python -m video_qa.rekv_stream_vqa --compressed` 同样可用。`--questions path.json` 接受按时间升序排列的 `[{"time": 2.0, "question": "..."}, ...]`；不指定时间时在视频结束后提问。问题快照不会包含晚于该问题的帧。每个问题都回答完毕后再编码后续帧，不在答案生成期间插入视频编码。
 
 模型在调用方进程中加载一次，视频编码、段总结和问答使用同一个对象顺序调用。没有推理子进程、IPC 队列或异步解码调度。设备编号使用 **PyTorch/CUDA 的逻辑编号**，默认 `--device cuda:0`。旧的 `--encode-device/--qa-device` 仅接受相同设备作为兼容别名；不同设备会明确报错。输入为 `.npy` 时沿用 RVS 每秒一帧的约定；MP4 按实际视频 FPS 采样。
 
 ```python
-from model.streaming.runtime import StreamingConfig, StreamingRuntime
+from model.suprkv.runtime import StreamingConfig, StreamingRuntime
 
 if __name__ == '__main__':
     config = StreamingConfig(device='cuda:0', budget_tokens=4096)
@@ -89,10 +91,10 @@ q16     = clamp(round((x+offset)/scale16), 0, 65535)
 
 `cache.audit_accounting()` 可显式运行原始递归统计，核验持久字节、tensor/CUDA 字节、快照工作内存和持久帧集合；它用于测试或低频诊断，不在正常预算路径调用。通过 `cache.frames[id] = replace(...)`、`del`、`pop` 等操作更新不可变记录会自动更新账本；整体替换 `cache.frames` 属于兼容路径，会重建账本。入库后张量的形状和 storage 应保持不变。持久映射按实际保留的容器容量计费，因此元数据字节可能与旧版每次新建临时 dict 的结果略有差异。账本与索引自身的 CPU 管理结构由进程 RSS 反映，不包含在受管理 KV 预算中。
 
-正确性测试：`python -m unittest discover -s tests -p 'test_streaming_accounting.py'`。可用下面的合成基准比较管理路径；`--baseline` 接受修改前保存的 `model/streaming/cache.py`，省略时仅测当前实现。默认每帧 8 个 token、28 层，主要复现对象数量；`--replay` 额外计时逐帧入库、token 评分、每两帧提交及报告。测量不包含模型前向、summary 生成或量化，不能作为整模型加速比例。
+正确性测试：`python -m unittest discover -s tests -p 'test_suprkv_accounting.py'`。可用下面的合成基准比较管理路径；`--baseline` 接受修改前保存的 `model/suprkv/cache.py`，省略时仅测当前实现。默认每帧 8 个 token、28 层，主要复现对象数量；`--replay` 额外计时逐帧入库、token 评分、每两帧提交及报告。测量不包含模型前向、summary 生成或量化，不能作为整模型加速比例。
 
 ```bash
-python tests/benchmark_streaming_accounting.py \
+python tests/benchmark_suprkv_accounting.py \
   --baseline /tmp/cache-before.py --frames 128 --repeats 5 --replay
 ```
 
@@ -142,10 +144,10 @@ CUDA 上的量化、降位、反量化默认使用 Triton；CPU 或不支持的�
 变长形状的性能回归需计入首次编译，不能只测预热后的固定矩阵。可从 observation 结果中提取每层实际保留长度，回放首次量化、后续降位及反量化；`--cache-dir` 指向新的目录时包含冷编译，脚本也报告每阶段的 kernel 变体数。此回放使用随机 BF16 KV，重放最终量化帧层的形状和位宽，不重放视频模型或全部预算事件。
 
 ```bash
-python tests/benchmark_streaming_quantization.py \
+python tests/benchmark_suprkv_quantization.py \
   --observation-result results/rvs_observation/RUN_ID/result.json \
   --cache-dir /tmp/rekv-quantization-fresh-cache
-python -m unittest discover -s tests -p 'test_streaming_quantization_dispatch.py' -v
+python -m unittest discover -s tests -p 'test_suprkv_quantization_dispatch.py' -v
 ```
 
 一次已保存 observation 的 3,304 个量化帧层包含 42 种长度（70–114 token）。RTX 4090 上用独立冷缓存回放：修复前首次 INT8 量化 23.43 秒、继续降位 4.58 秒、反量化 17.56 秒；修复后分别为 2.76、0.73、1.11 秒。量化/降位/反量化变体由 84/83/156 降为 1/1/4；重复回放不新增变体。该数据用于定位并验证编译回归，不代表完整模型加速倍数。
@@ -155,7 +157,7 @@ python -m unittest discover -s tests -p 'test_streaming_quantization_dispatch.py
 完整问答融合路径需要显式启用：
 
 ```bash
-python -m video_qa.compressed_stream_vqa --video VIDEO --packed-attention
+python -m video_qa.suprkv_stream_vqa --video VIDEO --packed-attention
 ```
 
 Python 接口使用 `StreamingConfig(packed_attention=True)`；直接注入模型的 `OneVisionEngine` 配置字典也接受 `packed_attention=True`。默认值为 `False`，因为已驻留浮点 KV 的连续 decode 仍可能比压缩路径更快。
@@ -167,9 +169,9 @@ Python 接口使用 `StreamingConfig(packed_attention=True)`；直接注入模�
 合成基准（不加载模型，不包含 JIT；同步后的主机延迟中位数，峰值为该次调用相对已驻留输入的新增 PyTorch 分配）：
 
 ```bash
-python tests/benchmark_streaming_packed.py --device cuda:1 --tokens 4096 --frames 16 --bits 4 --repeats 20
-python -m unittest discover -s tests -p 'test_streaming_packed_attention.py' -v
-python -m unittest discover -s tests -p 'test_streaming_quantization.py' -v
+python tests/benchmark_suprkv_packed.py --device cuda:1 --tokens 4096 --frames 16 --bits 4 --repeats 20
+python -m unittest discover -s tests -p 'test_suprkv_packed_attention.py' -v
+python -m unittest discover -s tests -p 'test_suprkv_quantization.py' -v
 ```
 
 本机 RTX 4090，PyTorch 2.10.0+cu130，FP16 输入、4-bit KV、16 个 Q head / 4 个 KV head、head_dim=128、4096 个缓存 token / 16 个块、单 token query，预热 3 次后取 20 次中位数：
@@ -190,10 +192,10 @@ attention 参考使用已经加速的 Triton 反量化，拼接后一次性旋�
 
 闭段评分按层批量处理同段各帧：每层 summary Q 的 FP32 转换、文本 token 均值和 GQA 分组均值只计算一次，Q/K 有限值检查合并为每层一次主机同步。单帧和批量评分都在 FP32 中聚合、点积和计算帧内均值，评分内部禁用 autocast，保留 RoPE 前 K 和原有 GQA 映射；持久 KV 精度不受影响。各帧仍使用自己的分数均值划分高低分区。分类先计算高低分位置，再复用索引提取 K/V；索引提取产生独立 storage，不再额外 clone。任一层评分失败仍回退整个段，并释放评分 Key；批量临时张量只保留一层，预算执行前释放。相较此前 FP64，极接近阈值的 token 可能因舍入改变分区。
 
-`test_streaming_scoring.py` 对照逐帧评分，覆盖 CPU/CUDA、FP16/BF16/FP32/FP64 输入统一输出 FP32、1/2/8/32 帧、均值相等的 token、非有限输入、整段失败回退、快照与账本；另用显式 GQA 展开的 FP64 参考验证数值误差，并检查 autocast 下仍输出 FP32。数值对照采用 `rtol=1e-5, atol=1e-6`。闭段微基准可以使用修改前保存的 `cache.py` 对比：
+`test_suprkv_scoring.py` 对照逐帧评分，覆盖 CPU/CUDA、FP16/BF16/FP32/FP64 输入统一输出 FP32、1/2/8/32 帧、均值相等的 token、非有限输入、整段失败回退、快照与账本；另用显式 GQA 展开的 FP64 参考验证数值误差，并检查 autocast 下仍输出 FP32。数值对照采用 `rtol=1e-5, atol=1e-6`。闭段微基准可以使用修改前保存的 `cache.py` 对比：
 
 ```bash
-python tests/benchmark_streaming_scoring.py --baseline /tmp/rekv-scoring-cache-before.py
+python tests/benchmark_suprkv_scoring.py --baseline /tmp/rekv-scoring-cache-before.py
 ```
 
 以下为切换 FP32 前的历史 FP64 评分基准，不代表当前 FP32 版本的耗时。RTX 4090、28 层、每帧 196 token、4 个 KV head、head_dim=128、BF16 缓存、32 个 summary token；每组预热 2 次，交替执行新旧版本，取 5 次中位数，计时前后同步 CUDA：
@@ -209,7 +211,7 @@ python tests/benchmark_streaming_scoring.py --baseline /tmp/rekv-scoring-cache-b
 该基准包含评分、分区和缓存登记，不包含模型前向、summary 生成或量化，不能作为端到端加速比例；不同段长的独立测量也会受系统调度影响。批量处理会增加临时显存：本次 32 帧闭段的峰值增量相比原实现多约 42 MiB，持久缓存内容不变。省略 `--baseline` 仅测当前版本。
 
 ```bash
-python -m unittest discover -s tests -p 'test_streaming_*.py' -v
+python -m unittest discover -s tests -p 'test_suprkv_*.py' -v
 python -m unittest discover -s tests -v
 ```
 

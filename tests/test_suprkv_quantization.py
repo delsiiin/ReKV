@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from model.streaming.quantization import PackedKV, pack
+from model.suprkv.quantization import PackedKV, pack
 
 
 class PackedMatmulTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Synchronized segment-commit microbenchmark; no model, summary or quantization.
 
 Save the previous cache.py before editing, then run:
-python tests/benchmark_streaming_scoring.py --baseline /tmp/rekv-scoring-cache-before.py
+python tests/benchmark_suprkv_scoring.py --baseline /tmp/rekv-scoring-cache-before.py
 """
 import argparse
 import importlib.util
@@ -15,11 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from model.streaming.cache import StreamingKVCache
+from model.suprkv.cache import StreamingKVCache
 
 
 def load_baseline(path):
-    name = 'model.streaming._scoring_benchmark_baseline'
+    name = 'model.suprkv._scoring_benchmark_baseline'
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module

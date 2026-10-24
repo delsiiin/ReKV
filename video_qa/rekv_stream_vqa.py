@@ -69,7 +69,7 @@ class ReKVStreamVQA(BaseVQA):
 if __name__ == "__main__":
     import sys
     if '--compressed' in sys.argv:
-        from video_qa.compressed_stream_vqa import main
+        from video_qa.suprkv_stream_vqa import main
         main([arg for arg in sys.argv[1:] if arg != '--compressed'])
     else:
         work(ReKVStreamVQA)

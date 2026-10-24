@@ -7,9 +7,9 @@ from unittest.mock import patch
 
 import torch
 
-from model.streaming.cache import StreamingKVCache, footprint
-from model.streaming.accounting import MemoryLedger
-from model.streaming.quantization import PackedKV
+from model.suprkv.cache import StreamingKVCache, footprint
+from model.suprkv.accounting import MemoryLedger
+from model.suprkv.quantization import PackedKV
 
 
 def make_cache(device='cpu', frames=0, layers=2):
@@ -166,8 +166,8 @@ class AccountingTests(unittest.TestCase):
         cache = make_cache(frames=8)
         cache.close_uncompressed_segment()
         cache.memory_stats()
-        with patch('model.streaming.cache.footprint', side_effect=AssertionError('Full scan')), \
-                patch('model.streaming.cache.tensor_storage_bytes', side_effect=AssertionError('Full scan')), \
+        with patch('model.suprkv.cache.footprint', side_effect=AssertionError('Full scan')), \
+                patch('model.suprkv.cache.tensor_storage_bytes', side_effect=AssertionError('Full scan')), \
                 patch.object(torch.Tensor, 'untyped_storage', side_effect=AssertionError('Storage scan')):
             for _ in range(10):
                 cache.persistent_bytes()

@@ -3,8 +3,8 @@ import unittest
 
 import torch
 
-from model.streaming.cache import LayerFrame, StreamingKVCache
-from model.streaming.segments import segment_summary_scores, summary_scores
+from model.suprkv.cache import LayerFrame, StreamingKVCache
+from model.suprkv.segments import segment_summary_scores, summary_scores
 
 
 class SegmentScoringTests(unittest.TestCase):

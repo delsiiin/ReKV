@@ -3,14 +3,14 @@ import unittest
 
 import torch
 
-from model.streaming.quantization import PackedKV
+from model.suprkv.quantization import PackedKV
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
 class QuantizationDispatchTests(unittest.TestCase):
     @torch.inference_mode()
     def test_ragged_shapes_reuse_compiled_kernels(self):
-        from model.streaming import packed_kernels as kernels
+        from model.suprkv import packed_kernels as kernels
         functions = (kernels._quantize, kernels._shrink, kernels._decode)
         def variants():
             return tuple(len(f.device_caches[torch.cuda.current_device()][0]) for f in functions)

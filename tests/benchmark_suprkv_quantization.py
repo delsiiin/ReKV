@@ -33,11 +33,11 @@ def main():
     if args.cache_dir:
         os.environ['TRITON_CACHE_DIR'] = args.cache_dir
     import torch
-    from model.streaming import packed_kernels
-    from model.streaming.quantization import PackedKV
+    from model.suprkv import packed_kernels
+    from model.suprkv.quantization import PackedKV
     if args.baseline_dir:
-        packed_kernels = load_module('model.streaming.packed_kernels', args.baseline_dir/'packed_kernels_before.py')
-        PackedKV = load_module('model.streaming._baseline_quantization', args.baseline_dir/'quantization_before.py').PackedKV
+        packed_kernels = load_module('model.suprkv.packed_kernels', args.baseline_dir/'packed_kernels_before.py')
+        PackedKV = load_module('model.suprkv._baseline_quantization', args.baseline_dir/'quantization_before.py').PackedKV
     if args.observation_result:
         result = json.loads(args.observation_result.read_text())['compression_experiment']
         states = result['runs']['after']['timeline'][-1]['frame_states']['frames']

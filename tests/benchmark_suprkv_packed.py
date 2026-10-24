@@ -1,6 +1,6 @@
 """Synthetic CUDA latency/memory comparison; excludes model weights and JIT.
 
-python tests/benchmark_streaming_packed.py --device cuda:1 --tokens 4096
+python tests/benchmark_suprkv_packed.py --device cuda:1 --tokens 4096
 """
 import argparse
 import json
@@ -14,9 +14,9 @@ import torch
 
 from model.attention.rope import RotaryEmbeddingESM
 from model.attention.dot_production_attention import get_multi_stage_dot_production_attention
-from model.streaming.packed_attention import AttentionChunk, PackedRotaryCache, coalesce
-from model.streaming.quantization import PackedKV
-from model.streaming.rotary import rotate_at
+from model.suprkv.packed_attention import AttentionChunk, PackedRotaryCache, coalesce
+from model.suprkv.quantization import PackedKV
+from model.suprkv.rotary import rotate_at
 
 
 def measure(fn, repeats):

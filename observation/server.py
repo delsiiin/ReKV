@@ -136,7 +136,7 @@ class ObservationService:
             paths += sorted(p for p in model_path.iterdir() if p.is_file())
         signature = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
         code = hashlib.sha256()
-        for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/streaming').glob('*.py')) + [ROOT/'model/patch.py']):
+        for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/suprkv').glob('*.py')) + [ROOT/'model/patch.py']):
             code.update(p.read_bytes())
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         value = dict(params=params, files=signature, code=code.hexdigest(), versions=versions,
@@ -211,7 +211,7 @@ class ObservationService:
             check_cancel()
             self.select_dtype(params['dtype'])
             if params['mode'] == 'compression':
-                from observation.compression import compare
+                from observation.suprkv import compare
                 revision = 0
                 def publish_snapshot(side, point):
                     nonlocal revision
@@ -353,7 +353,7 @@ def handler_for(service):
                 static = {'/': ('index.html', 'text/html; charset=utf-8'),
                           '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
                           '/attention.js': ('attention.js', 'application/javascript; charset=utf-8'),
-                          '/compression.js': ('compression.js', 'application/javascript; charset=utf-8'),
+                          '/suprkv.js': ('suprkv.js', 'application/javascript; charset=utf-8'),
                           '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if path in static:
                     filename, mime = static[path]
