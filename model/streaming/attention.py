@@ -1,8 +1,10 @@
 """ReKV attention with per-layer ragged retrieval and device-resident compressed KV."""
 from dataclasses import dataclass
+import importlib.util
 import torch
 from model.attention.dot_production_attention import get_multi_stage_dot_production_attention
 from .rotary import rotate_at
+from .packed_attention import PackedRotaryCache
 
 
 @dataclass
@@ -37,7 +39,7 @@ class RetrieveLayer:
     profiler: object = None
 
 
-def streaming_attention_forward(n_local, n_init, fattn=True, **kwargs):
+def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=False, **kwargs):
     Attn, _ = get_multi_stage_dot_production_attention(fattn)
 
     def forward(self, query, key_value, position_bias, use_cache, past_key_value,
@@ -49,11 +51,37 @@ def streaming_attention_forward(n_local, n_init, fattn=True, **kwargs):
         v = project_v(key_value).view(batch, -1, num_heads_kv, dim_head).transpose(1, 2).contiguous()
         retrieving = isinstance(past_key_value, RetrieveLayer)
         encoding = isinstance(past_key_value, EncodeLayer)
-        if retrieving:
-            pk, pv, ids, positions = past_key_value.snapshot.retrieve_layer(
+        # QA normally fits in its deliberately enlarged window. Keep compressed
+        # payloads through prefill and decode; fall back to the established
+        # sliding/sink implementation if the window is exceeded.
+        packed_past = past_key_value if isinstance(past_key_value, PackedRotaryCache) else None
+        if (retrieving and packed_attention and q.is_cuda and batch == 1
+                and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and torch.version.cuda is not None and dim_head <= 256
+                and 0 < position_bias.inv_freq.numel()*2 <= dim_head
+                and importlib.util.find_spec('triton') is not None
+                and not torch.is_grad_enabled()):
+            packed_past, ids = past_key_value.snapshot.retrieve_layer(
                 past_key_value.layer, q, past_key_value.topk, past_key_value.profiler,
-                position_bias=position_bias, with_rope_positions=True)
+                position_bias=position_bias, packed=True)
             past_key_value.hits.update(ids)
+        if packed_past is not None:
+            total = packed_past.length + k.shape[-2]
+            if total <= window and not torch.is_grad_enabled():
+                positions = torch.arange(packed_past.length, total, device=q.device)
+                current = packed_past.append(rotate_at(k, positions, position_bias), v, position_bias)
+                result = current.attend(q, position_bias)
+                result = result.transpose(1, 2).reshape(batch, length, num_heads*dim_head)
+                return attention_out(result), packed_past if retrieving else current
+            pk, pv, positions = packed_past.materialize()
+            if not retrieving:
+                past_key_value = RotaryCache(pk, pv, positions)
+        if retrieving:
+            if packed_past is None:
+                pk, pv, ids, positions = past_key_value.snapshot.retrieve_layer(
+                    past_key_value.layer, q, past_key_value.topk, past_key_value.profiler,
+                    position_bias=position_bias, with_rope_positions=True)
+                past_key_value.hits.update(ids)
         elif encoding:
             if not isinstance(past_key_value.past, RotaryCache):
                 raise ValueError('Streaming encoding requires post-RoPE keys with explicit positions')
@@ -86,7 +114,11 @@ def streaming_attention_forward(n_local, n_init, fattn=True, **kwargs):
         # full target rotation again to an already rotated cached key.
         lk = rotate_at(lk, target_positions-cached_positions[local_start:], position_bias)
         lq = rotate_at(q, target_positions[-length:], position_bias)
-        attn = Attn(lq.shape, lq.dtype, lq.device)
+        # The existing flash implementation only supports these head sizes.
+        # Keep the packed backend's larger/non-power-of-two heads usable when
+        # crossing back to the dense sliding-window path.
+        attn_type = Attn if dim_head in (16, 32, 64, 128) else get_multi_stage_dot_production_attention(False)[0]
+        attn = attn_type(lq.shape, lq.dtype, lq.device)
         attn.append(lq, lk, lv, sliding_window=window)
         if total > window:
             iq = rotate_at(q, torch.full((length,), window-1, device=q.device), position_bias)

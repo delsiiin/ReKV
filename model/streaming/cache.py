@@ -105,8 +105,8 @@ class LayerFrame:
         if not self.high_indices.numel() or self.bits == 2:
             return self
         if self.bits == 16:
-            key = PackedKV.quantize(self.high_k, group_size, axis='channel').shrink()
-            value = PackedKV.quantize(self.high_v, group_size, axis='token').shrink()
+            key = PackedKV.quantize(self.high_k, group_size, axis='channel', bits=8)
+            value = PackedKV.quantize(self.high_v, group_size, axis='token', bits=8)
         else:
             key, value = self.high_k.shrink(), self.high_v.shrink()
         return replace(self, high_k=key, high_v=value, bits=key.bits)
@@ -156,7 +156,7 @@ class CacheSnapshot:
     recent_ids: tuple
 
     def retrieve_layer(self, layer, query, topk=64, profiler=None, *,
-                       position_bias=None, with_rope_positions=False):
+                       position_bias=None, with_rope_positions=False, packed=False):
         """Select stable frame IDs, then materialize a ragged per-layer sequence."""
         if topk < len(self.recent_ids):
             raise ValueError('topk must accommodate the recent frames')
@@ -187,6 +187,12 @@ class CacheSnapshot:
         selected.sort(key=lambda f: (f.timestamp, f.frame_id))
         device = query.device
         with measure(profiler, 'cache_materialization'):
+            if packed:
+                if position_bias is None:
+                    raise ValueError('Packed retrieval requires explicit RoPE')
+                from .packed_attention import from_frames
+                return (from_frames(self.sink[layer], selected, layer, position_bias, query.dtype),
+                        tuple(f.frame_id for f in selected))
             keys, values = [self.sink[layer][0].to(device)], [self.sink[layer][1].to(device)]
             positions = []
             rope_positions = [torch.arange(keys[0].shape[1], device=device)] if with_rope_positions else None

@@ -128,6 +128,63 @@ python tests/benchmark_streaming_accounting.py \
 
 ## 验证
 
+### 压缩 KV 的 CUDA 融合路径
+
+`packed_kernels.py` 参考 KIVI 的按需解包、反量化后直接乘加思路，用 Triton 编译 CUDA kernel；无需编译或安装 `kivi_gemv`。它保持本项目的 INT16 容器、MSB-first 位序、FP32 scale/offset、`code * scale - offset` 和逐级 16→8→4→2 位降精度。K 按 channel 分组，V 按 token 分组，尾组保留原有参数。反量化先舍入到模型 dtype，再参与乘法。
+
+CUDA 上的量化、降位、反量化默认使用 Triton；CPU 或不支持的输入保留 PyTorch 路径。`backend='torch'` 可强制数值参考实现，`backend='triton'` 可显式要求 GPU kernel。新增 `packed.matmul(left, transpose=True)` 计算 QK，`transpose=False` 计算 PV，支持 GQA 和 FP16/BF16/FP32；短 query 使用 split-K GEMV，多行 query 使用分块 GEMM，不创建完整浮点 KV。单独调用这些接口不会改变 attention 后端。
+
+量化、降位和独立反量化的 token 数、打包长度、参数组数及输入步长使用运行时参数，并关闭这些参数的值/对齐特化。逐帧、逐层高分区长度变化会复用同一个 kernel，不再为每种长度编译一份。dtype、位宽、分组大小等格式仍可以产生不同 kernel。首次压缩直接调用 `quantize(..., bits=8)`：kernel 内先计算 INT16 code，再执行完全相同的整数降位算式，直接写出 INT8 载荷；不分配中间 INT16 缓存。后续降位同时写出新的 code 和 scale。CPU/PyTorch 参考仍逐级执行，量化数值、尾组规则及缓存预算策略保持一致。
+
+变长形状的性能回归需计入首次编译，不能只测预热后的固定矩阵。可从 observation 结果中提取每层实际保留长度，回放首次量化、后续降位及反量化；`--cache-dir` 指向新的目录时包含冷编译，脚本也报告每阶段的 kernel 变体数。此回放使用随机 BF16 KV，重放最终量化帧层的形状和位宽，不重放视频模型或全部预算事件。
+
+```bash
+python tests/benchmark_streaming_quantization.py \
+  --observation-result results/rvs_observation/RUN_ID/result.json \
+  --cache-dir /tmp/rekv-quantization-fresh-cache
+python -m unittest discover -s tests -p 'test_streaming_quantization_dispatch.py' -v
+```
+
+一次已保存 observation 的 3,304 个量化帧层包含 42 种长度（70–114 token）。RTX 4090 上用独立冷缓存回放：修复前首次 INT8 量化 23.43 秒、继续降位 4.58 秒、反量化 17.56 秒；修复后分别为 2.76、0.73、1.11 秒。量化/降位/反量化变体由 84/83/156 降为 1/1/4；重复回放不新增变体。该数据用于定位并验证编译回归，不代表完整模型加速倍数。
+
+也通过 observation 原服务复跑了保存结果 `ba9c334156f75e33ae3f3f8b` 的完整参数：`ego:0`、150 帧、0.5 FPS、BF16、预算 8192、top-k 32、9 个问题。复跑在 RTX PRO 5000 72GB 上使用新的 Triton 缓存目录，包含首次编译时间。与原保存结果相比，量化阶段从 31.65 秒降到 2.95 秒，KV 读取/反量化/拼接从 21.40 秒降到 2.74 秒。所有回答文本、检索帧、整个时间线的帧层状态及持久字节数（449,224,164）完全相同。历史运行与复跑的其他阶段也有时延变化，不能将完整运行时差全部归因于本次 kernel 修改。
+
+完整问答融合路径需要显式启用：
+
+```bash
+python -m video_qa.compressed_stream_vqa --video VIDEO --packed-attention
+```
+
+Python 接口使用 `StreamingConfig(packed_attention=True)`；直接注入模型的 `OneVisionEngine` 配置字典也接受 `packed_attention=True`。默认值为 `False`，因为已驻留浮点 KV 的连续 decode 仍可能比压缩路径更快。
+
+启用后，检索按位宽合并不可变缓存的副本，只复制压缩码和参数，不重新量化。K 的帧尾补齐到 group 边界，补齐位置不参与 softmax。问答缓存持有这些压缩副本、位置/旋转参数及一个浮点生成尾部；首次查询文本仍不写回视频缓存。融合 kernel 完成反量化、Key 的 RoPE 位置差旋转、QK、在线 softmax 和 PV，并通过 split-K 合并多个分块结果，不分配完整浮点 KV 或完整 attention logits。混合位宽、未压缩 low/sink、GQA 和帧内删 token 均保留原位置语义。
+
+这条路径用于单 batch、head_dim ≤ 256、CUDA/Triton 的推理。问答总长度在 local window 内时保持压缩；超出 window 时恢复已有 sliding-window/sink 路径。CPU、训练和缺少 Triton 的情况使用原路径。默认问答 window 已包含检索 token、生成 token 和额外余量。分块归约与原 attention 的浮点运算顺序不同，验证使用 dtype 对应误差容限，不要求 attention 输出逐位相同。
+
+合成基准（不加载模型，不包含 JIT；同步后的主机延迟中位数，峰值为该次调用相对已驻留输入的新增 PyTorch 分配）：
+
+```bash
+python tests/benchmark_streaming_packed.py --device cuda:1 --tokens 4096 --frames 16 --bits 4 --repeats 20
+python -m unittest discover -s tests -p 'test_streaming_packed_attention.py' -v
+python -m unittest discover -s tests -p 'test_streaming_quantization.py' -v
+```
+
+本机 RTX 4090，PyTorch 2.10.0+cu130，FP16 输入、4-bit KV、16 个 Q head / 4 个 KV head、head_dim=128、4096 个缓存 token / 16 个块、单 token query，预热 3 次后取 20 次中位数：
+
+| 操作 | 参考路径 | 融合路径 |
+| --- | ---: | ---: |
+| QK（参考包含 PyTorch 解包和 GQA 展开） | 0.377 ms | 0.149 ms |
+| PV（参考包含 PyTorch 解包和 GQA 展开） | 0.341 ms | 0.127 ms |
+| 准备缓存并执行一次 attention | 2.399 ms | 0.882 ms |
+| 上一行的新增分配峰值 | 44.000 MiB | 4.425 MiB |
+| 缓存已准备后的单次 attention | 0.269 ms | 0.646 ms |
+
+attention 参考使用已经加速的 Triton 反量化，拼接后一次性旋转 K，再运行现有 flash attention；融合路径包含压缩块合并。两者共用预先构造的输入和位置表。这里完整压缩 attention 的收益主要是首次准备和工作显存，持续 decode 仍有代价，因此保持可选。16-token query 的 PV GEMM 在同次测试中为 0.349 ms（参考）和 0.355 ms（融合），并非所有形状都会加速。
+
+尾组的准备成本也不可忽略：改成 16 块 × 196 token（`--tokens 3136 --frames 16 --bits 4 --queries 1`）后，准备加 attention 为 2.346 ms（dense）与 3.785 ms（packed），新增峰值分别为 33.781 MiB 与 8.438 MiB；缓存已准备后的单次 attention 为 0.240 ms 与 0.625 ms。当前补齐与复制由 PyTorch 发起，196-token 帧的这组测试没有延迟收益，主要节省工作显存，不能直接套用 256-token 整组块的加速比例。
+
+基准区分「反量化后 attention」「准备压缩副本后 attention」和两种已经准备好的 decode 路径，避免把一次性反量化成本计入每个 decode token。它不包含帧检索评分、输入/位置表构造、Python 模型前向、真实视频或完整回答，不能作为端到端速度结论。压缩块合并会暂时增加压缩副本和尾组 padding，实际收益与帧数、保留 token 数、分组大小及生成长度有关。
+
 闭段评分按层批量处理同段各帧：每层 summary Q 的 FP32 转换、文本 token 均值和 GQA 分组均值只计算一次，Q/K 有限值检查合并为每层一次主机同步。单帧和批量评分都在 FP32 中聚合、点积和计算帧内均值，评分内部禁用 autocast，保留 RoPE 前 K 和原有 GQA 映射；持久 KV 精度不受影响。各帧仍使用自己的分数均值划分高低分区。分类先计算高低分位置，再复用索引提取 K/V；索引提取产生独立 storage，不再额外 clone。任一层评分失败仍回退整个段，并释放评分 Key；批量临时张量只保留一层，预算执行前释放。相较此前 FP64，极接近阈值的 token 可能因舍入改变分区。
 
 `test_streaming_scoring.py` 对照逐帧评分，覆盖 CPU/CUDA、FP16/BF16/FP32/FP64 输入统一输出 FP32、1/2/8/32 帧、均值相等的 token、非有限输入、整段失败回退、快照与账本；另用显式 GQA 展开的 FP64 参考验证数值误差，并检查 autocast 下仍输出 FP32。数值对照采用 `rtol=1e-5, atol=1e-6`。闭段微基准可以使用修改前保存的 `cache.py` 对比：

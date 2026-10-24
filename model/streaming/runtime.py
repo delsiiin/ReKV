@@ -18,6 +18,7 @@ class StreamingConfig:
     recent_frames: int = 2
     topk: int = 64
     group_size: int = 128
+    packed_attention: bool = False
     ema_alpha: float = .2
     min_segment_frames: int = 1
     max_segment_frames: int = 32

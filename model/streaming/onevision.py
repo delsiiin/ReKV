@@ -60,6 +60,7 @@ class OneVisionEngine:
         local = config['recent_frames']*self.frame_tokens
         patch_hf(self.decoder, attention_factory=streaming_attention_forward,
                  n_local=local, n_init=self.sink_tokens,
+                 packed_attention=config.get('packed_attention', False),
                  fattn=str(device).startswith('cuda') and self.dtype != torch.float32)
         self.features, self.frame_info = [], []
         self.cache = None

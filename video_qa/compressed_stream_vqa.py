@@ -45,6 +45,8 @@ def main(argv=None):
     parser.add_argument('--output', help='Write answers and memory/timing statistics as JSON')
     parser.add_argument('--fps', type=float, default=1.)
     parser.add_argument('--max-frames', type=int, default=0)
+    parser.add_argument('--packed-attention', action='store_true',
+                        help='Keep quantized KV through QA using fused CUDA attention')
     defaults = StreamingConfig()
     for field in ('model_path', 'device', 'encode_device', 'qa_device', 'budget_tokens', 'recent_frames', 'topk',
                   'group_size', 'ema_alpha', 'min_segment_frames', 'max_segment_frames',

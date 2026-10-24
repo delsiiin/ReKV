@@ -311,6 +311,8 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 
 该模式调用实际 `model/streaming` 压缩算法：RoPE 后 K 按 channel 量化、V 按 token 量化，首次原精度→INT16→INT8，再按预算降位/删除；不 offload。结束或取消时恢复 observation 原生前向，原注意力及 segment 观察保持可用。相同 dtype 的任务复用模型，切换 dtype 时先释放旧模型再加载；每次对照的两侧共用同一模型。计算任务仍由原服务的单工作线程串行执行。
 
+首次 INT8 压缩在 CUDA kernel 内完成 INT16 code 计算与整数降位，不再分配中间 INT16 缓存；后续降位同时更新 code 与 scale。量化/降位/反量化的变长 token 数与步长使用运行时参数，避免各帧、各层保留长度不同而反复编译。完整压缩 attention 在本模式中仍默认关闭。本次已复现并修复量化和 KV 读取的变长形状编译回归；固定形状预热基准不能反映这项成本，复现方法见 `model/streaming/README.md` 的变长回放说明。
+
 计时不含模型加载和视频解码，属于单次、基线先执行的配对测量；首次 kernel 初始化会影响耗时。两侧测量前各自清理 allocator 缓存并重置峰值，避免把第一侧的显存峰值带到第二侧。单侧 OOM 或预算过小会单独显示错误，不伪造节省值。取消任务不发布完整结果。
 
 API 沿用 `POST /api/jobs`，设置 `mode="compression"` 及 `compression_budget_tokens`、`compression_recent_frames`、`compression_topk`、`compression_max_segment_frames`。结果 `compression_experiment` 包含 `runs.before/after`、`memory`、`stages`、逐帧 `timeline` 和提交记录。JSON 导出包含全部口径和配置。缓存指纹包含压缩算法源码及参数，修改量化或策略代码后自动重新计算。
