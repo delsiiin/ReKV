@@ -4,10 +4,10 @@ import os
 import math
 import argparse
 
+import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
-from decord import VideoReader, cpu
 from transformers import (
     logging,
     LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor,
@@ -17,7 +17,8 @@ import logzero
 from logzero import logger
 
 from model import llava_onevision_rekv, video_llava_rekv, longva_rekv
-from video_qa.sampling import load_samples, nonnegative_int, split_samples
+from video_qa.sampling import load_samples, nonnegative_int, sampled_frames, split_samples
+from video_qa.model_paths import MODEL_PATHS
 
 
 MODELS = {
@@ -25,29 +26,29 @@ MODELS = {
         'load_func': llava_onevision_rekv.load_model,
         'model_class': LlavaOnevisionForConditionalGeneration,
         'processor_class': LlavaOnevisionProcessor,
-        'model_path': 'llava-hf/llava-onevision-qwen2-0.5b-ov-hf',
+        'model_path': MODEL_PATHS['llava_ov_0.5b'],
     },
     'llava_ov_7b': {
         'load_func': llava_onevision_rekv.load_model,
         'model_class': LlavaOnevisionForConditionalGeneration,
         'processor_class': LlavaOnevisionProcessor,
-        'model_path': 'llava-hf/llava-onevision-qwen2-7b-ov-hf',
+        'model_path': MODEL_PATHS['llava_ov_7b'],
     },
     'llava_ov_72b': {
         'load_func': llava_onevision_rekv.load_model,
         'model_class': LlavaOnevisionForConditionalGeneration,
         'processor_class': LlavaOnevisionProcessor,
-        'model_path': 'llava-hf/llava-onevision-qwen2-72b-ov-hf',
+        'model_path': MODEL_PATHS['llava_ov_72b'],
     },
     'video_llava_7b': {
         'load_func': video_llava_rekv.load_model,
         'model_class': VideoLlavaForConditionalGeneration,
         'processor_class': VideoLlavaProcessor,
-        'model_path': 'LanguageBind/Video-LLaVA-7B-hf',
+        'model_path': MODEL_PATHS['video_llava_7b'],
     },
     'longva_7b': {
         'load_func': longva_rekv.load_model,
-        'model_path': 'lmms-lab/LongVA-7B',
+        'model_path': MODEL_PATHS['longva_7b'],
     },
 }
 
@@ -87,10 +88,10 @@ class BaseVQA:
         return chunks[k]
 
     def load_video(self, video_path):
-        vr = VideoReader(video_path, ctx=cpu(0))
-        fps = round(vr.get_avg_fps())
-        frame_idx = [i for i in range(0, len(vr), int(fps / self.sample_fps))]
-        video = vr.get_batch(frame_idx).asnumpy()
+        frames = [frame for _, frame in sampled_frames(video_path, self.sample_fps)]
+        if not frames:
+            raise ValueError(f'Video has no sampled frames: {video_path}')
+        video = np.stack(frames)
         logger.debug(f'video shape: {video.shape}')
         return video
     

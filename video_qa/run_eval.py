@@ -4,6 +4,8 @@ import subprocess
 import multiprocessing
 
 from video_qa.sampling import load_samples, nonnegative_int
+from video_qa.model_paths import MODEL_PATHS, SUPRKV_MODELS
+from video_qa.suprkv_stream_vqa import add_suprkv_arguments, config_overrides
 
 
 def exec(cmd, sub=False, device=None):
@@ -20,6 +22,9 @@ def exec(cmd, sub=False, device=None):
 
 def get_eval_settings(args, dataset, anno_path):
     save_dir = f"results/{args.model}/{dataset}/{args.retrieve_size}-{args.sample_fps}"
+    if getattr(args, 'method', 'rekv') == 'suprkv':
+        budget = getattr(args, 'budget_tokens', None) or 4096
+        save_dir = f"results/suprkv/{args.model}/{dataset}/{args.retrieve_size}-{args.sample_fps}/budget_{budget}"
     if args.max_samples:
         save_dir += f"/samples_{args.max_samples}"
     # Scoring existing results must not require the source annotations.
@@ -277,19 +282,46 @@ def eval_cgbench(args):
     exec(f"python video_qa/eval/eval_multiple_choice.py --save_dir {save_dir}")
 
 
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="llava_ov_7b", choices=['llava_ov_0.5b', 'llava_ov_7b', 'llava_ov_72b', 'video_llava_7b', 'longva_7b'])
-    parser.add_argument("--dataset", type=str, default=None, choices=['mlvu', 'qaego4d', 'egoschema', 'activitynet_qa', 'rvs_ego', 'rvs_movie', 'cgbench'])
-    parser.add_argument("--num_chunks", type=int, default=1)
-    parser.add_argument("--max_samples", type=nonnegative_int, default=0,
+    parser.add_argument('--method', choices=['rekv', 'suprkv'], default='rekv')
+    parser.add_argument("--model", type=str, default="llava_ov_7b", choices=MODEL_PATHS)
+    parser.add_argument("--dataset", type=str, required=True, choices=['mlvu', 'qaego4d', 'egoschema', 'activitynet_qa', 'rvs_ego', 'rvs_movie', 'cgbench'])
+    parser.add_argument("--num_chunks", '--num-chunks', type=int, default=1)
+    parser.add_argument("--max_samples", '--max-samples', type=nonnegative_int, default=0,
                         help="Maximum video samples across all chunks; 0 uses the full dataset.")
-    parser.add_argument("--only_eval", action="store_true")
-    parser.add_argument("--sample_fps", type=float, default=1)
-    parser.add_argument("--n_local", type=int, default=15000)
-    parser.add_argument("--retrieve_size", type=int, default=64)
+    parser.add_argument("--only_eval", '--only-eval', action="store_true")
+    parser.add_argument("--sample_fps", '--sample-fps', type=float, default=1)
+    parser.add_argument("--n_local", type=int, default=None,
+                        help='ReKV local attention window (default: 15000); not a SuPr-KV cache budget.')
+    parser.add_argument("--retrieve_size", '--retrieve-size', type=int, default=64)
     parser.add_argument("--debug", type=str, default='false')
-    args = parser.parse_args()
+    parser.add_argument('--anno_path', '--anno-path', help='SuPr-KV annotation override')
+    parser.add_argument('--save_dir', '--save-dir', help='SuPr-KV output directory override')
+    parser.add_argument('--skip_eval', '--skip-eval', action='store_true',
+                        help='SuPr-KV: generate and merge predictions without running the scorer')
+    add_suprkv_arguments(parser)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.method == 'suprkv':
+        if args.model not in SUPRKV_MODELS:
+            parser.error('SuPr-KV supports only LLaVA-OneVision Qwen2 models')
+        if args.n_local is not None:
+            parser.error('--n_local is ReKV-specific; configure SuPr-KV with --budget_tokens and --recent_frames')
+        from video_qa.suprkv_stream_vqa import launch_evaluation
+        try:
+            launch_evaluation(args)
+        except ValueError as error:
+            parser.error(str(error))
+        return
+    if config_overrides(args) or args.packed_attention or args.anno_path or args.save_dir or args.skip_eval:
+        parser.error('SuPr-KV options require --method suprkv')
+    if args.n_local is None:
+        args.n_local = 15000
     func_dic = {
         'mlvu': eval_mlvu,
         'qaego4d': eval_qaego4d,
@@ -302,3 +334,7 @@ if __name__ == "__main__":
     if args.dataset in func_dic:
         print(f'Execute {args.dataset} evaluation')
         func_dic[args.dataset](args)
+
+
+if __name__ == "__main__":
+    main()

@@ -74,6 +74,18 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
 
 ## Evaluation
 
+ReKV and SuPr-KV share the original ReKV sampling rules in
+`video_qa/sampling.py`: regular videos use a fixed stride of
+`int(round(source_fps) / sample_fps)`, and 1-FPS NPY videos use
+`np.linspace(0, total - 1, int(total * sample_fps), dtype=int)`.
+These frame selections also match Observation before its start-time/frame-count
+filters. RVS questions use the original ReKV array boundary:
+`video[:int(end_time * sample_fps)]`. Only newly visible sampled frames are
+encoded between questions. ReKV batches those frames; SuPr-KV encodes them
+individually and answers using the resulting cache without a second timestamp
+filter. The boundary is an array index, not a guarantee that source timestamps
+are strictly less than the annotated `end_time`.
+
 For a local HTML experiment showing RVS sampled frames, last-32-token attention
 importance and frame-conditional entropy, run `bash run_observation.sh` in the
 `rekv` environment and open `http://127.0.0.1:8765`.
@@ -118,4 +130,6 @@ Our code is based on [InfLLM](https://github.com/thunlp/InfLLM), [StreamingLLM](
 
 ## suprKV: Summary-guided progressive KV compression
 
-The optional suprKV OneVision backend uses one GPU-resident model for sequential encoding and QA, with no KV offload. It supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/suprkv/README.md). Run `python -m video_qa.suprkv_stream_vqa --help` for the suprKV entrypoint; the original `python -m video_qa.rekv_stream_vqa --compressed` entrypoint remains available.
+The optional suprKV OneVision backend uses one GPU-resident model for sequential encoding and QA, with no KV offload. It supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/suprkv/README.md). Dataset evaluation uses `python -m video_qa.run_eval --method suprkv`; run `python -m video_qa.run_eval --help` for available options.
+
+Run `bash run_suprkv.sh` to evaluate all annotated RVS-Ego videos, or use `python -m video_qa.run_eval --method suprkv --model llava_ov_7b --dataset rvs_ego --num_chunks 1 --max_samples 0 --sample_fps 0.5 --retrieve_size 64 --budget_tokens 4096`. SuPr-KV shares ReKV's dataset, sampling, retrieval, sample-limit and worker arguments; `--budget_tokens` is a separate cache budget, not an alias for ReKV's `--n_local`. All seven dataset routes are supported, with one model per GPU worker and compatible CSV/scoring output. Add `--skip_eval` to generate predictions without invoking the scorer.
