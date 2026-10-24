@@ -230,7 +230,13 @@ class OneVisionEngine:
         del past
         tokens, reason = greedy_token_ids(self.decoder, self.model.lm_head, output,
                          self.config['max_new_tokens'], {self.tokenizer.eos_token_id}, getattr(self, 'check_cancel', lambda: None))
-        return dict(answer=self.tokenizer.decode(tokens, skip_special_tokens=True).strip(),
+        answer = self.tokenizer.decode(
+            tokens,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=False,
+            clean_up_tokenization_spaces=True,
+        )
+        return dict(answer=answer,
                     hit_frames=sorted(hits), finish_reason=reason, qa_seconds=time.monotonic()-began,
                     inference_pid=os.getpid(),
                     process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,

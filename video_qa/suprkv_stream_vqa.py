@@ -80,9 +80,9 @@ def add_suprkv_arguments(parser):
     parser.add_argument('--max_segment_frames', '--max-segment-frames', type=int, default=None,
                         help='Maximum sampled frames per segment before summarization and compression (default: 32).')
     parser.add_argument('--summary_max_new_tokens', '--summary-max-new-tokens', type=int, default=None,
-                        help='Maximum tokens generated for segment summaries used to score KV importance (default: 256).')
+                        help='Maximum tokens generated for segment summaries used to score KV importance (default: 128).')
     parser.add_argument('--max_new_tokens', '--max-new-tokens', type=int, default=None,
-                        help='Maximum tokens generated for each answer (default: 128).')
+                        help='Maximum tokens generated for each answer (default: 256).')
     parser.add_argument('--packed_attention', '--packed-attention', action='store_true',
                         help='Enable the attention kernel that reads low-bit KV directly (disabled by default).')
 

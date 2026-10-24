@@ -186,7 +186,7 @@ def build_parser(method='rekv'):
     parser.add_argument("--anno_path", '--anno-path', type=str, required=True)
     parser.add_argument("--model", type=str, default="llava_ov_7b")
     parser.add_argument("--retrieve_size", '--retrieve-size', type=int, default=64)
-    parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=(method == 'rekv'))
+    parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=False)
     if method == 'suprkv':
         from video_qa.suprkv_stream_vqa import add_suprkv_arguments
         add_suprkv_arguments(parser)
