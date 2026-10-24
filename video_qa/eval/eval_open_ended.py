@@ -39,8 +39,8 @@ class GPTService:
         self.model_name = "deepseek-flash"
         self.max_tokens = 2048
         self.client = openai.OpenAI(
-            base_url="https://api.deepseek.com",  # TODO
-            api_key="sk-42d37923fe644dbd87e4da4d341634f5",  # TODO
+            base_url="",  # TODO
+            api_key="",  # TODO
         )
 
     def _gpt_response(self, user_prompt):
