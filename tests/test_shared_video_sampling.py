@@ -10,11 +10,13 @@ from observation.data import sample_indices
 from video_qa.rekv_offline_vqa import ReKVOfflineVQA
 from video_qa.rekv_stream_vqa import ReKVStreamVQA
 from video_qa.sampling import sampled_frames
-from video_qa.suprkv_stream_vqa import evaluate_sample
+from video_qa.suprkv_stream_vqa import SuPrKVStreamVQA
+from types import SimpleNamespace
 
 
 class RecordingModel:
     def __init__(self):
+        self.config = SimpleNamespace()
         self.frames = []
         self.questions = []
         self.batches = []
@@ -46,6 +48,9 @@ class RecordingModel:
 
     def close_segment(self):
         pass
+
+    def memory_stats(self):
+        return {}
 
     def ask(self, question, cutoff=None):
         if cutoff is not None and cutoff < self.last_timestamp:
@@ -89,8 +94,14 @@ class SharedVideoSamplingTests(unittest.TestCase):
         analyzer = (ReKVStreamVQA if streaming else ReKVOfflineVQA)(
             anno=[sample], save_dir=self.temporary.name, sample_fps=fps, qa_model=rekv)
         analyzer.analyze_a_video(sample)
-        evaluate_sample(suprkv, sample, fps, 64, streaming, sampled_frames)
-        self.assertEqual(rekv.questions, suprkv.questions)
+        if streaming:
+            candidate = SuPrKVStreamVQA(anno=[sample], save_dir=self.temporary.name,
+                                       sample_fps=fps, qa_model=suprkv)
+            candidate.analyze_a_video(sample)
+            self.assertEqual(rekv.questions, suprkv.questions)
+        else:
+            expected = tuple(int(frame[0, 0, 0]) for _, frame in sampled_frames(sample['video_path'], fps))
+            self.assertEqual(rekv.questions, [expected] * len(sample['conversations']))
         self.assertEqual(len(analyzer.record[(64, 1)]), len(sample['conversations']))
         return rekv
 
@@ -103,8 +114,9 @@ class SharedVideoSamplingTests(unittest.TestCase):
                 self.assertEqual([time for time, _ in sampled], expected)
                 observation_indices, _ = sample_indices(count, 1., fps, 'npy')
                 self.assertEqual(observation_indices, expected)
-                model = self.compare_inputs(self.sample(self.path, [100, 100]), fps, False)
-                self.assertEqual(model.questions, [tuple(expected)] * 2)
+                for streaming in (True, False):
+                    model = self.compare_inputs(self.sample(self.path, [100, 100]), fps, streaming)
+                    self.assertEqual(model.questions, [tuple(expected)] * 2)
 
     def test_streaming_original_array_slices_without_duplicate_frames(self):
         model = self.compare_inputs(self.sample(self.path, [0, 2, 2, 5, 6, 100, 100]), .5, True)
@@ -156,7 +168,8 @@ class SharedVideoSamplingTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'chronological'):
                     analyzer.analyze_a_video(sample)
                 with self.assertRaisesRegex(ValueError, 'chronological'):
-                    evaluate_sample(RecordingModel(), sample, .5, 64, True, sampled_frames)
+                    SuPrKVStreamVQA(anno=[sample], save_dir=self.temporary.name,
+                                    sample_fps=.5, qa_model=RecordingModel()).analyze_a_video(sample)
 
 
 if __name__ == '__main__':

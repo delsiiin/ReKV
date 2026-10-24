@@ -175,23 +175,33 @@ def str2bool(value):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-def work(QA_CLASS):
-    logging.set_verbosity_error()
-
+def build_parser(method='rekv'):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sample_fps", type=float, default=1)
-    parser.add_argument("--num_chunks", type=int, default=1)
-    parser.add_argument("--max_samples", type=nonnegative_int, default=0,
+    parser.add_argument("--sample_fps", '--sample-fps', type=float, default=1)
+    parser.add_argument("--num_chunks", '--num-chunks', type=int, default=1)
+    parser.add_argument("--max_samples", '--max-samples', type=nonnegative_int, default=0,
                         help="Maximum video samples before chunking; 0 uses the full dataset.")
-    parser.add_argument("--chunk_idx", type=int, default=0)
-    parser.add_argument("--save_dir", type=str, required=True)
-    parser.add_argument("--anno_path", type=str, required=True)
+    parser.add_argument("--chunk_idx", '--chunk-idx', type=int, default=0)
+    parser.add_argument("--save_dir", '--save-dir', type=str, required=True)
+    parser.add_argument("--anno_path", '--anno-path', type=str, required=True)
     parser.add_argument("--model", type=str, default="llava_ov_7b")
-    parser.add_argument("--n_local", type=int, default=15000)
-    parser.add_argument("--retrieve_size", type=int, default=64)
-    parser.add_argument("--retrieve_chunk_size", type=int, default=1)
-    parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
-    args = parser.parse_args()
+    parser.add_argument("--retrieve_size", '--retrieve-size', type=int, default=64)
+    parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=(method == 'rekv'))
+    if method == 'suprkv':
+        from video_qa.suprkv_stream_vqa import add_suprkv_arguments
+        add_suprkv_arguments(parser)
+        parser.add_argument('--device', default='cuda:0')
+        parser.set_defaults(retrieve_chunk_size=1)
+    else:
+        parser.add_argument("--n_local", type=int, default=15000)
+        parser.add_argument("--retrieve_chunk_size", type=int, default=1)
+    return parser
+
+
+def work(QA_CLASS, method='rekv', argv=None):
+    logging.set_verbosity_error()
+    parser = build_parser(method)
+    args = parser.parse_args(argv)
 
     if not args.debug:
         logzero.loglevel(logging.INFO)
@@ -211,26 +221,36 @@ def work(QA_CLASS):
         parser.error("chunk_idx must be between 0 and num_chunks - 1")
 
     # VideoQA model
-    model_path = MODELS[args.model]['model_path']
-    load_func = MODELS[args.model]['load_func']
-    logger.info(f"Loading VideoQA model: {model_path}")
-    videoqa_model, videoqa_processor = load_func(
-        model_path=model_path,
-        n_local=args.n_local,
-        topk=args.retrieve_size,
-        chunk_size=args.retrieve_chunk_size,
-    )
+    if method == 'suprkv':
+        from model.suprkv.runtime import StreamingRuntime
+        from video_qa.suprkv_stream_vqa import make_config
+        videoqa_model = StreamingRuntime(make_config(args))
+        videoqa_processor = None
+    else:
+        model_path = MODELS[args.model]['model_path']
+        load_func = MODELS[args.model]['load_func']
+        logger.info(f"Loading VideoQA model: {model_path}")
+        videoqa_model, videoqa_processor = load_func(
+            model_path=model_path,
+            n_local=args.n_local,
+            topk=args.retrieve_size,
+            chunk_size=args.retrieve_chunk_size,
+        )
 
-    retrieve_analyzer = QA_CLASS(
-        anno=anno,
-        sample_fps=args.sample_fps,
-        qa_model=videoqa_model,
-        qa_processor=videoqa_processor,
-        retrieve_size=args.retrieve_size,
-        chunk_size=args.retrieve_chunk_size,
-        num_chunks=args.num_chunks,
-        chunk_idx=args.chunk_idx,
-        save_dir=args.save_dir,
-    )
+    try:
+        retrieve_analyzer = QA_CLASS(
+            anno=anno,
+            sample_fps=args.sample_fps,
+            qa_model=videoqa_model,
+            qa_processor=videoqa_processor,
+            retrieve_size=args.retrieve_size,
+            chunk_size=args.retrieve_chunk_size,
+            num_chunks=args.num_chunks,
+            chunk_idx=args.chunk_idx,
+            save_dir=args.save_dir,
+        )
 
-    retrieve_analyzer.analyze(debug=args.debug)
+        retrieve_analyzer.analyze(debug=args.debug)
+    finally:
+        if method == 'suprkv':
+            videoqa_model.close()

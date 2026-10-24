@@ -17,13 +17,13 @@ def exec(cmd, sub=False, device=None):
     else:
         my_env = os.environ.copy()
         my_env["CUDA_VISIBLE_DEVICES"] = device
-        subprocess.run(cmd, env=my_env)
+        subprocess.run(cmd, env=my_env, check=True)
 
 
 def get_eval_settings(args, dataset, anno_path):
     save_dir = f"results/{args.model}/{dataset}/{args.retrieve_size}-{args.sample_fps}"
     if getattr(args, 'method', 'rekv') == 'suprkv':
-        budget = getattr(args, 'budget_tokens', None) or 4096
+        budget = getattr(args, 'budget_tokens', None) or 8192
         save_dir = f"results/suprkv/{args.model}/{dataset}/{args.retrieve_size}-{args.sample_fps}/budget_{budget}"
     if args.max_samples:
         save_dir += f"/samples_{args.max_samples}"
@@ -180,15 +180,15 @@ def eval_activitynet_qa(args):
 def eval_rvs_ego(args):
     anno_path = "data/rvs/ego/ego4d_oe.json"
     num_chunks, save_dir = get_eval_settings(args, "rvs_ego", anno_path)
-    solver = "rekv_stream_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_stream_vqa" if method == 'suprkv' else "rekv_stream_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -196,11 +196,21 @@ def eval_rvs_ego(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         exec(f"rm -rf {save_dir}/tmp")
@@ -212,18 +222,19 @@ def eval_rvs_ego(args):
     # eval
     exec(f"python video_qa/eval/eval_open_ended.py --pred_path {save_dir}/results.csv --output_dir {save_dir}/tmp --output_json {save_dir}/results.json")
 
+
 def eval_rvs_movie(args):
     anno_path = "data/rvs/movie/movienet_oe.json"
     num_chunks, save_dir = get_eval_settings(args, "rvs_movie", anno_path)
-    solver = "rekv_stream_vqa"
+    method = getattr(args, 'method', 'rekv')
+    solver = "suprkv_stream_vqa" if method == 'suprkv' else "rekv_stream_vqa"
     if not args.only_eval:
         # QA
         processes = []
         for idx in range(0, num_chunks):
-            cmd = ["python", f"video_qa/{solver}.py",
+            cmd = ["python", "-m", f"video_qa.{solver}",
                     "--model", args.model,
                     "--sample_fps", str(args.sample_fps),
-                    "--n_local", str(args.n_local),
                     "--retrieve_size", str(args.retrieve_size),
                     "--save_dir", save_dir,
                     "--anno_path", anno_path,
@@ -231,11 +242,21 @@ def eval_rvs_movie(args):
                     "--max_samples", str(args.max_samples),
                     "--num_chunks", str(num_chunks),
                     "--chunk_idx", str(idx)]
-            p = multiprocessing.Process(target=exec, args=(cmd, True, f'{4*idx},{4*idx+1},{4*idx+2},,{4*idx+3}' if args.model=='llava_ov_72b' else str(idx)))  # llava_ov_72b needs 4x 80GB GPUs
+            if method == 'suprkv':
+                for name, value in config_overrides(args).items():
+                    cmd.extend(['--' + name, str(value)])
+                if args.packed_attention:
+                    cmd.append('--packed_attention')
+            else:
+                cmd.extend(['--n_local', str(args.n_local)])
+            device = f'{4*idx},{4*idx+1},{4*idx+2},{4*idx+3}' if method == 'rekv' and args.model == 'llava_ov_72b' else str(idx)
+            p = multiprocessing.Process(target=exec, args=(cmd, True, device))
             processes.append(p)
             p.start()
         for p in processes:
             p.join()
+        if any(p.exitcode != 0 for p in processes):
+            raise RuntimeError(f'{method} workers failed; results were not merged or scored')
         # merge results
         exec(f"> {save_dir}/results.csv")
         exec(f"rm -rf {save_dir}/tmp")
@@ -246,6 +267,7 @@ def eval_rvs_movie(args):
             exec(f"rm {save_dir}/{num_chunks}_{idx}.csv")
     # eval
     exec(f"python video_qa/eval/eval_open_ended.py --pred_path {save_dir}/results.csv --output_dir {save_dir}/tmp --output_json {save_dir}/results.json")
+
 
 def eval_cgbench(args):
     anno_path = "data/cgbench/full_mc.json"
@@ -296,10 +318,6 @@ def build_parser():
                         help='ReKV local attention window (default: 15000); not a SuPr-KV cache budget.')
     parser.add_argument("--retrieve_size", '--retrieve-size', type=int, default=64)
     parser.add_argument("--debug", type=str, default='false')
-    parser.add_argument('--anno_path', '--anno-path', help='SuPr-KV annotation override')
-    parser.add_argument('--save_dir', '--save-dir', help='SuPr-KV output directory override')
-    parser.add_argument('--skip_eval', '--skip-eval', action='store_true',
-                        help='SuPr-KV: generate and merge predictions without running the scorer')
     add_suprkv_arguments(parser)
     return parser
 
@@ -312,13 +330,9 @@ def main(argv=None):
             parser.error('SuPr-KV supports only LLaVA-OneVision Qwen2 models')
         if args.n_local is not None:
             parser.error('--n_local is ReKV-specific; configure SuPr-KV with --budget_tokens and --recent_frames')
-        from video_qa.suprkv_stream_vqa import launch_evaluation
-        try:
-            launch_evaluation(args)
-        except ValueError as error:
-            parser.error(str(error))
-        return
-    if config_overrides(args) or args.packed_attention or args.anno_path or args.save_dir or args.skip_eval:
+        if args.dataset not in ('rvs_ego', 'rvs_movie'):
+            parser.error('SuPr-KV supports only streaming datasets: rvs_ego, rvs_movie')
+    elif config_overrides(args) or args.packed_attention:
         parser.error('SuPr-KV options require --method suprkv')
     if args.n_local is None:
         args.n_local = 15000
@@ -333,7 +347,10 @@ def main(argv=None):
     }
     if args.dataset in func_dic:
         print(f'Execute {args.dataset} evaluation')
-        func_dic[args.dataset](args)
+        try:
+            func_dic[args.dataset](args)
+        except ValueError as error:
+            parser.error(str(error))
 
 
 if __name__ == "__main__":

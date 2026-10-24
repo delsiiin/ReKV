@@ -1,17 +1,15 @@
-"""Dataset coverage, temporal isolation and launcher failures without model weights."""
+"""Streaming output, temporal isolation and evaluation launcher failures without model weights."""
 import csv
 from contextlib import redirect_stderr
-import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from video_qa import run_eval, suprkv_stream_vqa
+from video_qa import base, run_eval, suprkv_stream_vqa
 from video_qa.suprkv_stream_vqa import make_config
 
 
@@ -25,10 +23,7 @@ class FakeRuntime:
         self.startup = {'model_instances': 1, 'execution_mode': 'sequential'}
         self.instances.append(self)
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
+    def close(self):
         self.events.append(('close',))
 
     def reset(self):
@@ -55,7 +50,7 @@ class FakeRuntime:
 
 
 def frames(path, fps):
-    return iter((timestamp, 'image') for timestamp in (0., 2., 4., 6.))
+    yield from ((timestamp, 'image') for timestamp in (0., 2., 4., 6.))
 
 
 class SuPrKVEvalTests(unittest.TestCase):
@@ -70,31 +65,41 @@ class SuPrKVEvalTests(unittest.TestCase):
             dict(question='next time', answer='ground truth', end_time=5),
         ]) for i in range(5)]
         self.annotation.write_text(json.dumps(self.samples))
+        default_annotation = self.directory / 'data/rvs/ego/ego4d_oe.json'
+        default_annotation.parent.mkdir(parents=True)
+        default_annotation.write_text(json.dumps(self.samples))
+        previous_directory = Path.cwd()
+        os.chdir(self.directory)
+        self.addCleanup(os.chdir, previous_directory)
         FakeRuntime.instances = []
 
+    def worker_argv(self, *extra):
+        return ['--anno_path', str(self.annotation), '--save_dir', str(self.directory),
+                '--sample_fps', '0.5', *extra]
+
     def worker_args(self, *extra):
-        return suprkv_stream_vqa.build_worker_parser().parse_args([
-            '--dataset', 'rvs_ego', '--anno_path', str(self.annotation),
-            '--save_dir', str(self.directory), '--sample_fps', '0.5', *extra])
+        return base.build_parser('suprkv').parse_args(self.worker_argv(*extra))
 
     def launcher_args(self, *extra):
         return run_eval.build_parser().parse_args([
-            '--method', 'suprkv', '--dataset', 'rvs_ego',
-            '--anno_path', str(self.annotation), '--save_dir', str(self.directory),
-            '--skip_eval', *extra])
+            '--method', 'suprkv', '--dataset', 'rvs_ego', *extra])
 
-    def run_worker(self, args):
-        # Dataset orchestration tests also run in an environment without torch.
-        with patch.object(suprkv_stream_vqa, 'make_config', return_value=SimpleNamespace(topk=64)):
-            suprkv_stream_vqa.run_worker(args, FakeRuntime, frames)
+    def run_worker(self, *extra):
+        with patch('model.suprkv.runtime.StreamingRuntime', FakeRuntime), \
+                patch.object(suprkv_stream_vqa, 'sampled_frames', frames):
+            base.work(suprkv_stream_vqa.SuPrKVStreamVQA, method='suprkv',
+                      argv=self.worker_argv(*extra))
 
-    def read_results(self):
-        with (self.directory / 'results.csv').open(newline='') as result:
+    def analyzer(self, runtime, sample):
+        return suprkv_stream_vqa.SuPrKVStreamVQA(
+            anno=[sample], save_dir=str(self.directory), sample_fps=.5, qa_model=runtime)
+
+    def read_results(self, filename='1_0.csv'):
+        with (self.directory / filename).open(newline='') as result:
             return list(csv.DictReader(result))
 
     def test_full_dataset_all_questions_model_loaded_once_per_worker(self):
-        self.run_worker(self.worker_args())
-        suprkv_stream_vqa.merge_results(self.directory, 1)
+        self.run_worker()
         rows = self.read_results()
         self.assertEqual(len(rows), 15)
         self.assertEqual([row['video_id'] for row in rows], [str(i) for i in range(5) for _ in range(3)])
@@ -105,127 +110,141 @@ class SuPrKVEvalTests(unittest.TestCase):
 
     def test_global_limit_before_partition_no_duplicates(self):
         for index in range(2):
-            self.run_worker(self.worker_args('--max_samples', '3', '--num_chunks', '2', '--chunk_idx', str(index)))
-        suprkv_stream_vqa.merge_results(self.directory, 2)
-        rows = self.read_results()
+            self.run_worker('--max_samples', '3', '--num_chunks', '2', '--chunk_idx', str(index))
+        rows = self.read_results('2_0.csv') + self.read_results('2_1.csv')
         self.assertEqual([row['video_id'] for row in rows], [str(i) for i in range(3) for _ in range(3)])
         self.assertEqual(len(FakeRuntime.instances), 2)
 
     def test_streaming_uses_rekv_array_boundary_and_reuses_same_cutoff(self):
-        runtime = FakeRuntime(None)
-        suprkv_stream_vqa.evaluate_sample(runtime, self.samples[0], .5, 64, True, frames)
+        runtime = FakeRuntime(make_config(self.worker_args('--device', 'cpu')))
+        with patch.object(suprkv_stream_vqa, 'sampled_frames', frames):
+            self.analyzer(runtime, self.samples[0]).analyze_a_video(self.samples[0])
         self.assertEqual([event[3] for event in runtime.events if event[0] == 'ask'],
                          [(0.,), (0.,), (0., 2.)])
         self.assertTrue(all(event[2] is None for event in runtime.events if event[0] == 'ask'))
         self.assertNotIn(('frame', 4.), runtime.events)
         self.assertNotIn(('frame', 6.), runtime.events)
 
-    def test_offline_encodes_full_video_and_preserves_choice_schema(self):
-        question = dict(question='pick', answer='second', choices=['first', 'second'], question_type='plotQA')
-        sample = dict(video_id='choice', video_path='choice.mp4', conversations=[question])
-        runtime = FakeRuntime(None)
-        rows = suprkv_stream_vqa.evaluate_sample(runtime, sample, .5, 64, False, frames)
-        self.assertEqual(runtime.events[-1][3], (0., 2., 4., 6.))
-        self.assertEqual(runtime.events[-2], ('commit',))
-        self.assertIn('(B) second', runtime.events[-1][1])
-        self.assertEqual(rows[0]['qa_acc'], 100.)
-        self.assertEqual(rows[0]['correct_choice'], 'B')
-        self.assertEqual(rows[0]['pred_choice'], 'B')
-        self.assertEqual(rows[0]['task'], 'plotQA')
-        question['answer'] = None
-        row = suprkv_stream_vqa.answer_row(runtime, sample, question, 64)
-        self.assertIsNone(row['answer'])
-        self.assertEqual(row['qa_acc'], '')
+    def test_stream_worker_writes_rekv_fields_and_separate_method_stats(self):
+        self.run_worker('--max_samples', '2')
+        with (self.directory / '1_0.csv').open(newline='') as output:
+            reader = csv.DictReader(output)
+            self.assertEqual(reader.fieldnames, ['video_id', 'question', 'answer', 'pred_answer',
+                                                 'retrieve_size', 'chunk_size'])
+            rows = list(reader)
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(row['pred_answer'] == '(B)chosen' for row in rows))
+        self.assertTrue(all(row['retrieve_size'] == '64' and row['chunk_size'] == '1' for row in rows))
+        stats = [json.loads(line) for line in (self.directory / '1_0.stats.jsonl').read_text().splitlines()]
+        self.assertEqual([entry['video_id'] for entry in stats], ['0', '1'])
+        self.assertTrue(all(entry['config']['budget_tokens'] == 8192 for entry in stats))
+        self.assertTrue(all(entry['memory'] == {'frames': 2} for entry in stats))
+        self.assertFalse((self.directory / 'results.csv').exists())
 
-    def test_every_dataset_worker_writes_scorer_compatible_rows(self):
-        for dataset, (_, scorer) in suprkv_stream_vqa.DATASETS.items():
-            with self.subTest(dataset=dataset):
-                samples = json.loads(json.dumps(self.samples[:2]))
-                if scorer != 'open_ended':
-                    for sample in samples:
-                        for question in sample['conversations']:
-                            question['choices'] = ['incorrect', 'ground truth']
-                self.annotation.write_text(json.dumps(samples))
-                self.run_worker(self.worker_args('--dataset', dataset))
-                suprkv_stream_vqa.merge_results(self.directory, 1)
-                rows = self.read_results()
-                self.assertEqual(len(rows), 6)
-                if scorer != 'open_ended':
-                    self.assertTrue(all(row['qa_acc'] == '100.0' for row in rows))
+    def test_offline_datasets_rejected_before_launch(self):
+        for dataset in ('mlvu', 'qaego4d', 'egoschema', 'activitynet_qa', 'cgbench'):
+            with self.subTest(dataset=dataset), redirect_stderr(io.StringIO()), \
+                    patch.object(run_eval.multiprocessing, 'Process') as launch:
+                with self.assertRaises(SystemExit):
+                    run_eval.main(['--method', 'suprkv', '--dataset', dataset])
+                launch.assert_not_called()
 
-    def test_invalid_timestamps_fail_before_loading_model(self):
-        self.samples[0]['conversations'][1]['end_time'] = 1
-        self.annotation.write_text(json.dumps(self.samples))
-        with self.assertRaisesRegex(ValueError, 'chronological'):
-            self.run_worker(self.worker_args())
-        self.assertEqual(FakeRuntime.instances, [])
+    def test_invalid_timestamps_do_not_encode_frames_and_close_model(self):
+        for cutoff in (1, -1, float('nan'), float('inf')):
+            with self.subTest(cutoff=cutoff):
+                self.samples[0]['conversations'][1]['end_time'] = cutoff
+                self.annotation.write_text(json.dumps(self.samples))
+                with self.assertRaisesRegex(ValueError, 'chronological'):
+                    self.run_worker()
+                self.assertEqual(FakeRuntime.instances[-1].events, [('close',)])
 
-    def test_launcher_respects_visible_devices_and_forwards_parameters(self):
+    def test_debug_and_repeated_runs_write_only_current_stats(self):
+        self.run_worker()
+        self.run_worker('--debug', 'true')
+        with (self.directory / '1_0.csv').open(newline='') as output:
+            self.assertEqual(len(list(csv.DictReader(output))), 3)
+        self.assertEqual(len((self.directory / '1_0.stats.jsonl').read_text().splitlines()), 1)
+
+    def test_launcher_forwards_parameters_and_uses_rekv_merge_commands(self):
         args = self.launcher_args('--max_samples', '2', '--num_chunks', '8',
-                                  '--budget-tokens', '8192', '--packed-attention', '--sample_fps', '0.5')
-        process = Mock()
-        process.wait.return_value = 0
-        process.poll.return_value = 0
-        with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '3,5'}), \
-                patch.object(suprkv_stream_vqa.subprocess, 'Popen', return_value=process) as launch, \
-                patch.object(suprkv_stream_vqa, 'merge_results') as merge:
-            suprkv_stream_vqa.launch_evaluation(args)
+                                  '--budget-tokens', '8192', '--packed-attention', '--sample_fps', '0.5',
+                                  '--model-path', '/custom/model', '--recent-frames', '3',
+                                  '--group-size', '64', '--ema-alpha', '0.3',
+                                  '--min-segment-frames', '2', '--max-segment-frames', '16',
+                                  '--summary-max-new-tokens', '128', '--max-new-tokens', '64')
+        process = Mock(exitcode=0)
+        with patch.object(run_eval.multiprocessing, 'Process', return_value=process) as launch, \
+                patch.object(run_eval, 'exec') as execute:
+            run_eval.eval_rvs_ego(args)
+        _, directory = run_eval.get_eval_settings(args, args.dataset, 'data/rvs/ego/ego4d_oe.json')
         self.assertEqual(launch.call_count, 2)
         for index, call in enumerate(launch.call_args_list):
-            command = call.args[0]
+            command, sub, device = call.kwargs['args']
+            self.assertIs(call.kwargs['target'], execute)
+            self.assertTrue(sub)
+            self.assertEqual(device, str(index))
             self.assertEqual(command[command.index('--num_chunks') + 1], '2')
             self.assertEqual(command[command.index('--max_samples') + 1], '2')
-            self.assertEqual(command[command.index('--budget_tokens') + 1], '8192')
             self.assertEqual(command[command.index('--sample_fps') + 1], '0.5')
+            self.assertEqual(command[command.index('--anno_path') + 1], 'data/rvs/ego/ego4d_oe.json')
+            self.assertEqual(command[command.index('--save_dir') + 1], directory)
             self.assertIn('--packed_attention', command)
-            self.assertEqual(call.kwargs['env']['CUDA_VISIBLE_DEVICES'], ['3', '5'][index])
-        merge.assert_called_once_with(str(self.directory), 2)
+            worker_args = base.build_parser('suprkv').parse_args(command[3:])
+            self.assertEqual(suprkv_stream_vqa.config_overrides(worker_args),
+                             suprkv_stream_vqa.config_overrides(args))
+        commands = [call.args[0] for call in execute.call_args_list]
+        self.assertIn(f'rm -rf {directory}/tmp', commands)
+        self.assertIn(f'head -n 1 {directory}/2_0.csv > {directory}/results.csv', commands)
+        for index in range(2):
+            self.assertIn(f'tail -n +2 {directory}/2_{index}.csv >> {directory}/results.csv', commands)
+            self.assertIn(f'rm {directory}/2_{index}.csv', commands)
+        self.assertIn(f'--pred_path {directory}/results.csv', commands[-1])
 
     def test_worker_failure_never_merges_or_scores_partial_results(self):
-        process = Mock()
-        process.wait.return_value = 1
-        process.poll.return_value = 1
-        with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}), \
-                patch.object(suprkv_stream_vqa.subprocess, 'Popen', return_value=process), \
-                patch.object(suprkv_stream_vqa, 'merge_results') as merge, \
-                patch.object(suprkv_stream_vqa.subprocess, 'run') as score:
-            with self.assertRaisesRegex(RuntimeError, 'workers failed'):
-                suprkv_stream_vqa.launch_evaluation(self.launcher_args())
-        merge.assert_not_called()
-        score.assert_not_called()
+        for dataset in ('rvs_ego', 'rvs_movie'):
+            with self.subTest(dataset=dataset), \
+                    patch.object(run_eval, 'get_eval_settings', return_value=(1, str(self.directory))), \
+                    patch.object(run_eval.multiprocessing, 'Process', return_value=Mock(exitcode=1)), \
+                    patch.object(run_eval, 'exec') as execute:
+                with self.assertRaisesRegex(RuntimeError, 'workers failed'):
+                    getattr(run_eval, f'eval_{dataset}')(self.launcher_args('--dataset', dataset))
+                execute.assert_not_called()
 
-    def test_new_predictions_invalidate_old_open_ended_scores(self):
-        cache = self.directory / 'tmp'
-        cache.mkdir()
-        (cache / 'old.json').write_text('{}')
-        process = Mock()
-        process.wait.return_value = 0
-        process.poll.return_value = 0
-        with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}), \
-                patch.object(suprkv_stream_vqa.subprocess, 'Popen', return_value=process), \
-                patch.object(suprkv_stream_vqa, 'merge_results'):
-            suprkv_stream_vqa.launch_evaluation(self.launcher_args())
-        self.assertFalse(cache.exists())
-
-    def test_insufficient_visible_devices_rejected_before_launch(self):
-        with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}), \
-                patch.object(suprkv_stream_vqa.subprocess, 'Popen') as launch:
-            with self.assertRaisesRegex(ValueError, 'visible GPUs'):
-                suprkv_stream_vqa.launch_evaluation(self.launcher_args('--num_chunks', '2'))
-        launch.assert_not_called()
+    def test_merge_preserves_multiline_rows_and_clears_old_scores(self):
+        for dataset in ('rvs_ego', 'rvs_movie'):
+            with self.subTest(dataset=dataset):
+                for index in range(2):
+                    self.run_worker('--max_samples', '3', '--num_chunks', '2', '--chunk_idx', str(index))
+                cache = self.directory / 'tmp'
+                cache.mkdir()
+                (cache / 'old.json').write_text('{}')
+                original_exec = run_eval.exec
+                def execute(command):
+                    if not command.startswith('python '):
+                        original_exec(command)
+                with patch.object(run_eval, 'get_eval_settings', return_value=(2, str(self.directory))), \
+                        patch.object(run_eval.multiprocessing, 'Process', return_value=Mock(exitcode=0)), \
+                        patch.object(run_eval, 'exec', side_effect=execute) as commands:
+                    getattr(run_eval, f'eval_{dataset}')(self.launcher_args('--dataset', dataset))
+                rows = self.read_results('results.csv')
+                self.assertEqual(len(rows), 9)
+                self.assertEqual(rows[0]['question'], 'first\nquestion')
+                self.assertFalse(cache.exists())
+                self.assertFalse((self.directory / '2_0.csv').exists())
+                self.assertFalse((self.directory / '2_1.csv').exists())
+                self.assertIn('eval_open_ended.py', commands.call_args.args[0])
 
     def test_only_eval_uses_existing_results_and_correct_scorer(self):
-        for dataset, (_, scorer) in suprkv_stream_vqa.DATASETS.items():
+        for dataset in ('rvs_ego', 'rvs_movie'):
             with self.subTest(dataset=dataset), \
-                    patch.object(suprkv_stream_vqa.subprocess, 'Popen') as launch, \
-                    patch.object(suprkv_stream_vqa.subprocess, 'run') as score, \
+                    patch.object(run_eval.multiprocessing, 'Process') as launch, \
+                    patch.object(run_eval, 'exec') as execute, \
                     patch.object(run_eval, 'load_samples', side_effect=AssertionError('no annotation needed')):
                 args = self.launcher_args('--dataset', dataset, '--only_eval')
-                args.skip_eval = False
-                suprkv_stream_vqa.launch_evaluation(args)
+                getattr(run_eval, f'eval_{dataset}')(args)
                 launch.assert_not_called()
-                self.assertIn(f'video_qa.eval.eval_{scorer}', score.call_args.args[0])
-                self.assertTrue(score.call_args.kwargs['check'])
+                execute.assert_called_once()
+                self.assertIn('video_qa/eval/eval_open_ended.py', execute.call_args.args[0])
 
     def test_cli_spellings_and_separate_results(self):
         hyphenated = self.worker_args('--sample-fps', '.5', '--retrieve-size', '32', '--budget-tokens', '8192')
@@ -238,26 +257,27 @@ class SuPrKVEvalTests(unittest.TestCase):
 
     def test_rekv_specific_parameter_and_unsupported_model_are_rejected(self):
         for extra in (['--n_local', '15000'], ['--model', 'longva_7b']):
-            with self.subTest(extra=extra), patch.object(suprkv_stream_vqa, 'launch_evaluation') as launch, \
+            with self.subTest(extra=extra), patch.object(run_eval, 'eval_rvs_ego') as launch, \
                     redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     run_eval.main(['--method', 'suprkv', '--dataset', 'rvs_ego', *extra])
                 launch.assert_not_called()
 
-    @unittest.skipUnless(importlib.util.find_spec('torch'), 'requires the rekv environment')
     def test_shared_model_resolution_and_actual_runtime_defaults(self):
         from model.suprkv.runtime import StreamingConfig
         config = make_config(self.worker_args('--device', 'cpu'))
         self.assertEqual(config, StreamingConfig(device='cpu'))
+        _, directory = run_eval.get_eval_settings(self.launcher_args(), 'rvs_ego', self.annotation)
+        self.assertTrue(directory.endswith(f'/budget_{config.budget_tokens}'))
         config = make_config(self.worker_args('--device', 'cpu', '--model', 'llava_ov_0.5b',
                                              '--retrieve_size', '32', '--budget-tokens', '8192'))
         self.assertIn('0.5b', config.model_path)
         self.assertEqual(config.topk, 32)
         self.assertEqual(config.budget_tokens, 8192)
-        config = make_config(self.worker_args('--device', 'cpu', '--model_path', '/custom/model'),
-                             max_new_tokens=256)
+        config = make_config(self.worker_args('--device', 'cpu', '--model_path', '/custom/model',
+                                             '--max_new_tokens', '128'))
         self.assertEqual(config.model_path, '/custom/model')
-        self.assertEqual(config.max_new_tokens, 256)
+        self.assertEqual(config.max_new_tokens, 128)
 
 
 if __name__ == '__main__':

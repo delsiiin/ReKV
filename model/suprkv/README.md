@@ -1,6 +1,6 @@
 # suprKV：摘要引导的渐进式 KV 缓存压缩
 
-Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --method suprkv`。`video_qa.suprkv_stream_vqa` 集中定义参数、数据集 worker 和评测调度，作为分片 worker 的命令行入口；测试与性能基准文件统一使用 `suprkv` 命名。
+Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --method suprkv`。`video_qa.suprkv_stream_vqa` 中的 `SuPrKVStreamVQA` 与原 `ReKVStreamVQA` 一样继承 `BaseVQA`，复用 `work()` 加载数据和模型、`analyze()` 遍历视频和保存 CSV。`video_qa.run_eval` 中的 `eval_rvs_ego` 和 `eval_rvs_movie` 分别实现各自的启动、合并和评分流程，并按 `--method` 选择 ReKV 或 SuPr-KV；测试与性能基准文件统一使用 `suprkv` 命名。
 
 采用 ReKV 单进程顺序执行方式的单模型、GPU 常驻压缩后端，支持 LLaVA-OneVision Qwen2 checkpoint。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
 
@@ -8,7 +8,7 @@ Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --met
 
 ### 数据集评测
 
-在 `rekv` 环境、项目根目录执行 `bash run_suprkv.sh`，默认遍历 `rvs_ego` 标注文件中的全部视频及问题。也可以直接运行：
+在 `rekv` 环境、项目根目录执行 `bash run_suprkv.sh`，按脚本配置运行 RVS-Ego。下面的命令通过 `--max_samples 0` 遍历全部视频及问题：
 
 ```bash
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -28,18 +28,36 @@ python -m video_qa.run_eval \
 
 `--model`、`--dataset`、`--num_chunks`、`--max_samples`、`--sample_fps`、`--retrieve_size`、`--debug` 和 `--only_eval` 复用 ReKV 的含义。`--max_samples 0` 表示标注文件中的全部视频；非零值在分片前全局截取，保留每个视频的全部问题。`--debug true` 则仅处理每个分片的首个视频。
 
-支持 `qaego4d`、`egoschema`、`cgbench`、`mlvu`、`activitynet_qa`、`rvs_ego`、`rvs_movie`，使用 ReKV 相同的默认标注路径和评分脚本。RVS 按标注中的 `end_time` 顺序回答，累计编码采样数组 `video[:int(end_time * sample_fps)]`，每次只编码新增部分；其他数据集编码完整视频后回答全部问题。选择题输出包含 `pred_choice`、`correct_choice`、`qa_acc` 和任务类型；无公开答案时保留空值。
+SuPr-KV 入口仅支持 `rvs_ego`、`rvs_movie` 两个流式开放问答数据集，使用 ReKV 相同的默认标注路径和评分脚本。按标注中的 `end_time` 顺序回答，累计编码采样数组 `video[:int(end_time * sample_fps)]`，每次只编码新增部分。CSV 字段与 ReKV 流式输出一致：`video_id`、`question`、`answer`、`pred_answer`、`retrieve_size`、`chunk_size`（固定为 1）。SuPr-KV 新增的运行配置与缓存统计单独保存在 `.stats.jsonl` 中。
 
-每个 worker 仅加载一次模型，在视频之间调用 `reset()`。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，按 `CUDA_VISIBLE_DEVICES` 中的顺序分配；例如 `CUDA_VISIBLE_DEVICES=2,3` 配合 `--num_chunks 2`。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的 checkpoint；仅支持 OneVision Qwen2 系列。
+每个 worker 仅加载一次模型，在视频之间调用 `reset()`。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，沿用原 ReKV 的编号方式，由 worker 索引分配 GPU（第 0 个 worker 使用 GPU 0，以此类推）。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的 checkpoint；仅支持 OneVision Qwen2 系列。
 
 `--n_local` 是 ReKV 的局部注意力窗口，不能作为 SuPr-KV 预算使用；SuPr-KV 模式会明确拒绝该参数。使用 `--budget_tokens` 设置压缩缓存预算、`--recent_frames` 设置保护的最近帧数。SuPr-KV 扩展参数同时接受下划线和连字符写法。
 
-默认结果目录为 `results/suprkv/<model>/<dataset>/<retrieve_size>-<sample_fps>/budget_<budget_tokens>/`，限量运行追加 `samples_<max_samples>/`。每个分片保存 `<num_chunks>_<chunk_idx>.csv` 和逐视频缓存统计 `.stats.jsonl`，成功完成全部分片后合并为 `results.csv`，再调用原评分脚本。worker 失败时停止合并和评分。不同实验可用 `--save_dir` 指定独立目录，`--anno_path` 可覆盖默认标注文件。
+默认结果目录为 `results/suprkv/<model>/<dataset>/<retrieve_size>-<sample_fps>/budget_<budget_tokens>/`，限量运行追加 `samples_<max_samples>/`。每个分片保存 `<num_chunks>_<chunk_idx>.csv` 和逐视频缓存统计 `.stats.jsonl`，成功完成全部分片后按原 ReKV 的 `head/tail/rm` 流程合并为 `results.csv`、删除分片 CSV，再调用原评分脚本；`.stats.jsonl` 保留。worker 失败时停止合并和评分。直接调用 worker 时，与 ReKV 一样通过必填的 `--anno_path` 和 `--save_dir` 指定标注文件和结果目录；数据集名称仅由 `run_eval` 使用。
 
-开放式问答评分沿用原项目的 GPT 评分配置；只生成答案可加 `--skip_eval`（或 `bash run_suprkv.sh --skip_eval`），之后用相同参数加 `--only_eval` 单独评分。新预测合并后会清理该结果目录下旧的评分缓存 `tmp/`，避免复用旧答案的分数。
+`run_eval` 的开放式问答评分沿用原项目的 GPT 评分配置，生成答案后自动评分；用相同参数加 `--only_eval` 可对已有结果单独评分。新预测合并后会清理该结果目录下旧的评分缓存 `tmp/`，避免复用旧答案的分数。
+
+只生成流式预测、不合并或评分时，直接调用 worker：
+
+```bash
+python -m video_qa.suprkv_stream_vqa \
+  --anno_path data/rvs/ego/ego4d_oe.json \
+  --save_dir results/suprkv_stream \
+  --sample_fps 0.5 \
+  --budget_tokens 8192
+```
+
+`add_suprkv_arguments()` 逐项声明方法参数并提供作用说明，可用 `python -m video_qa.suprkv_stream_vqa --help` 查看。默认缓存预算为 8192 个 FP16 等效 token，问答和片段摘要分别最多生成 256 个新 token。
 
 默认从 Hugging Face 加载 `llava-hf/llava-onevision-qwen2-7b-ov-hf`，首次使用自动下载并缓存。
 可用 `--model_path` 指定其他 OneVision 模型 ID 或本地目录，用 `HF_HOME` 指定模型缓存目录。ReKV 与 SuPr-KV 共用 `video_qa/sampling.py`，采用原 ReKV 的采样规则：NPY 视为每秒一帧，使用 `np.linspace(0, 总帧数 - 1, int(总帧数 × sample_fps), dtype=int)`；MP4 使用 `int(round(原视频平均FPS) / sample_fps)` 的固定整数步长。这与 observation 在开始时间过滤、帧数限制之前的正常采样结果一致。MP4 时间戳仍由帧索引除以未取整的平均 FPS 估算，并非逐帧容器时间戳。两种方法的 RVS 问答均恢复原 ReKV 的 `int(end_time * sample_fps)` 数组切片边界，右边界不包含在内，超出视频长度时自然截断。ReKV 按问题批量编码新增帧，SuPr-KV 逐帧编码；重复边界不重复编码。SuPr-KV 回答时使用已编码帧的缓存快照，不再按标注时间做第二次过滤，因为数组切片选中的源帧时间可能等于或超过 `end_time`。
+
+### 与 ReKV 的代码对应
+
+- `video_qa/base.py`：共用参数、数据分片、模型加载入口、视频遍历和 CSV 保存。
+- `video_qa/suprkv_stream_vqa.py`：与 `rekv_stream_vqa.py` 对应，只实现流式编码和问答；另存方法配置与缓存统计。
+- `model/suprkv`：KV 保留在 GPU，负责分段摘要、重要性评分、压缩和检索；问答脚本不处理量化或缓存内部状态。
 
 ### Worker 运行时接口
 
@@ -62,7 +80,7 @@ if __name__ == '__main__':
 
 ## 算法
 
-- 分段复用 observation 的投影/池化前视觉特征距离、历史 EMA 阈值、首对帧 warmup；默认 `alpha=.2`、`min_segment_frames=1`。达到 `max_segment_frames=32` 或 summary 上下文容量上限时闭段，不重置 EMA。
+- 分段复用 observation 的投影/池化前视觉特征距离、历史 EMA 阈值、首对帧 warmup；运行配置默认 `alpha=.2`、`min_segment_frames=4`。达到 `max_segment_frames=32` 或 summary 上下文容量上限时闭段，不重置 EMA。
 - summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与暂存的 **RoPE 前 K** 的点积均值，不做 softmax，不跨层平均。大于或等于该层帧内均值的 token 归为高分区，其余归为低分区。分区掩码作用于 **RoPE 后 K 和原始 V**；V 不应用 RoPE。summary 为空/计算失败时全帧按高分保留并记录原因。
 - 持久缓存、量化载荷和问题快照中的 K 均为编码时局部 attention 使用的 RoPE 后 K。RoPE 前 K 仅作为分区评分工作内存，段提交成功或评分失败后均释放；不进入快照。未启用压缩的基线也存储 RoPE 后 K，但不保留评分副本。
 - sink 为初始化提示词；最新两帧是 recent，始终使用原始模型精度。未闭合段全精度暂存并可检索。各层的标签在段提交时固定。
