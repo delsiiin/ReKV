@@ -7,7 +7,7 @@ import time
 import torch
 
 from .quantization import PackedKV
-from .segments import summary_scores
+from .segments import summary_scores, segment_summary_scores
 from .profiling import measure
 from .accounting import MemoryLedger, TrackedDict
 from .rotary import rotate_at
@@ -85,12 +85,20 @@ class LayerFrame:
         """Use pre-RoPE scores to select rows from the post-RoPE KV payload."""
         if score_key.shape != self.high_k.shape:
             raise ValueError('Scoring key must match the unpartitioned frame')
-        scores = summary_scores(query, score_key)
+        return self.classify_scores(summary_scores(query, score_key))
+
+    def classify_scores(self, scores):
+        """Partition with this frame's mean; indexed payloads own their storage."""
         high = scores >= scores.mean()
-        return replace(self, high_indices=self.high_indices[high].clone(),
-                       high_k=self.high_k[:, high].clone(), high_v=self.high_v[:, high].clone(),
-                       low_indices=self.high_indices[~high].clone(),
-                       low_k=self.high_k[:, ~high].clone(), low_v=self.high_v[:, ~high].clone())
+        # Boolean indexing would rediscover these positions for all six payloads.
+        high_rows = high.nonzero(as_tuple=True)[0]
+        low_rows = (~high).nonzero(as_tuple=True)[0]
+        return replace(self, high_indices=self.high_indices.index_select(0, high_rows),
+                       high_k=self.high_k.index_select(1, high_rows),
+                       high_v=self.high_v.index_select(1, high_rows),
+                       low_indices=self.high_indices.index_select(0, low_rows),
+                       low_k=self.high_k.index_select(1, low_rows),
+                       low_v=self.high_v.index_select(1, low_rows))
 
     def shrink(self, group_size):
         """Lower the retained high region by one precision level."""
@@ -432,6 +440,22 @@ class StreamingKVCache:
         self._refresh_accounting()
         return self._persistent_ledger.total
 
+    def _classify_segment(self, pending, queries):
+        # Keep temporary scoring tensors scoped here so they are released before
+        # budget enforcement, including when a later layer fails validation.
+        frame_keys = [self._score_keys.get(frame.frame_id) for frame in pending]
+        if any(keys is None for keys in frame_keys):
+            raise ValueError('Missing pre-RoPE scoring keys')
+        classified = [[] for _ in pending]
+        for layer, query in enumerate(queries):
+            keys = [row[layer] for row in frame_keys]
+            if any(key.shape != frame.layers[layer].high_k.shape for frame, key in zip(pending, keys)):
+                raise ValueError('Scoring key must match the unpartitioned frame')
+            scores = segment_summary_scores(query, keys)
+            for frame, row, frame_scores in zip(pending, classified, scores):
+                row.append(frame.layers[layer].classify_scores(frame_scores))
+        return {frame.frame_id: tuple(row) for frame, row in zip(pending, classified)}
+
     def close_segment(self, queries, error=''):
         began = time.monotonic()
         pending = [self.frames[i] for i in self._open_ids]
@@ -442,12 +466,7 @@ class StreamingKVCache:
             try:
                 if queries is None or len(queries) != len(self.sink):
                     raise ValueError(error or 'summary_empty')
-                for frame in pending:
-                    score_keys = self._score_keys.get(frame.frame_id)
-                    if score_keys is None:
-                        raise ValueError('Missing pre-RoPE scoring keys')
-                    classified[frame.frame_id] = tuple(x.classify(q, key)
-                        for x, q, key in zip(frame.layers, queries, score_keys))
+                classified = self._classify_segment(pending, queries)
             except (ValueError, RuntimeError) as exc:
                 error = (error or str(exc))[:256]
                 classified = {f.frame_id: f.layers for f in pending}
@@ -457,7 +476,6 @@ class StreamingKVCache:
                                                      closed=True, score_error=error)
             # Drop local references before budgeting; snapshots explicitly own older versions.
             del pending, classified
-            score_keys = None
         self.segment_id += 1
         self.version += 1
         self.last_event = dict(version=self.version, quantized=0, dropped_low=0, evicted=0,

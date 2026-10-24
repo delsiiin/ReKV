@@ -128,6 +128,26 @@ python tests/benchmark_streaming_accounting.py \
 
 ## 验证
 
+闭段评分按层批量处理同段各帧：每层 summary Q 的 FP32 转换、文本 token 均值和 GQA 分组均值只计算一次，Q/K 有限值检查合并为每层一次主机同步。单帧和批量评分都在 FP32 中聚合、点积和计算帧内均值，评分内部禁用 autocast，保留 RoPE 前 K 和原有 GQA 映射；持久 KV 精度不受影响。各帧仍使用自己的分数均值划分高低分区。分类先计算高低分位置，再复用索引提取 K/V；索引提取产生独立 storage，不再额外 clone。任一层评分失败仍回退整个段，并释放评分 Key；批量临时张量只保留一层，预算执行前释放。相较此前 FP64，极接近阈值的 token 可能因舍入改变分区。
+
+`test_streaming_scoring.py` 对照逐帧评分，覆盖 CPU/CUDA、FP16/BF16/FP32/FP64 输入统一输出 FP32、1/2/8/32 帧、均值相等的 token、非有限输入、整段失败回退、快照与账本；另用显式 GQA 展开的 FP64 参考验证数值误差，并检查 autocast 下仍输出 FP32。数值对照采用 `rtol=1e-5, atol=1e-6`。闭段微基准可以使用修改前保存的 `cache.py` 对比：
+
+```bash
+python tests/benchmark_streaming_scoring.py --baseline /tmp/rekv-scoring-cache-before.py
+```
+
+以下为切换 FP32 前的历史 FP64 评分基准，不代表当前 FP32 版本的耗时。RTX 4090、28 层、每帧 196 token、4 个 KV head、head_dim=128、BF16 缓存、32 个 summary token；每组预热 2 次，交替执行新旧版本，取 5 次中位数，计时前后同步 CUDA：
+
+| 段长 | 原逐帧闭段 | 按层批量闭段 |
+| --- | ---: | ---: |
+| 1 帧 | 36.26 ms | 28.90 ms |
+| 2 帧 | 62.60 ms | 35.71 ms |
+| 4 帧 | 110.91 ms | 33.52 ms |
+| 8 帧 | 141.24 ms | 55.47 ms |
+| 32 帧 | 577.82 ms | 225.10 ms |
+
+该基准包含评分、分区和缓存登记，不包含模型前向、summary 生成或量化，不能作为端到端加速比例；不同段长的独立测量也会受系统调度影响。批量处理会增加临时显存：本次 32 帧闭段的峰值增量相比原实现多约 42 MiB，持久缓存内容不变。省略 `--baseline` 仅测当前版本。
+
 ```bash
 python -m unittest discover -s tests -p 'test_streaming_*.py' -v
 python -m unittest discover -s tests -v
