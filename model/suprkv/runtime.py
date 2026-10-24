@@ -14,16 +14,16 @@ class StreamingConfig:
     # Compatibility aliases: different devices cannot share one model instance.
     encode_device: str | None = None
     qa_device: str | None = None
-    budget_tokens: int = 4096
+    budget_tokens: int = 8192
     recent_frames: int = 2
     topk: int = 64
     group_size: int = 128
     packed_attention: bool = False
     ema_alpha: float = .2
-    min_segment_frames: int = 1
+    min_segment_frames: int = 4
     max_segment_frames: int = 32
-    summary_max_new_tokens: int = 192
-    max_new_tokens: int = 128
+    summary_max_new_tokens: int = 256
+    max_new_tokens: int = 256
 
     def __post_init__(self):
         aliases = [v for v in (self.encode_device, self.qa_device) if v is not None]

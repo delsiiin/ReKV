@@ -18,6 +18,8 @@ python -m video_qa.run_eval \
     --dataset "$dataset" \
     --sample_fps 0.5 \
     --retrieve_size 64 \
-    --budget_tokens 4096 \
+    --budget_tokens 8192 \
     --max_segment_frames 32 \
+    --recent_frames 2 \
+    --min_segment_frames 4 \
     "$@"
