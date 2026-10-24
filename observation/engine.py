@@ -1,4 +1,4 @@
-"""Uncompressed causal prefill of local LLaVA-OneVision with a window observer."""
+"""Uncompressed causal prefill of LLaVA-OneVision with a window observer."""
 import importlib.metadata
 from contextlib import nullcontext
 import math
@@ -87,7 +87,7 @@ def install_observer(decoder, callback, *, window=WINDOW_SIZE,
 
 class ObservationEngine:
     def __init__(self, model_path, device='cuda:0', dtype='float16'):
-        self.model_path = str(Path(model_path).resolve())
+        self.model_path = str(model_path)
         self.device, self.dtype_name = device, dtype
         self.model = self.processor = None
 
@@ -97,10 +97,10 @@ class ObservationEngine:
         from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
         if self.device.startswith('cuda') and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available; check the rekv environment or use --device cpu --dtype float32")
-        progress('loading_model', '加载本地 LLaVA-OneVision 模型（首次计算）', 0.12)
-        processor = LlavaOnevisionProcessor.from_pretrained(self.model_path, local_files_only=True)
+        progress('loading_model', '加载 LLaVA-OneVision 模型（首次使用时从 Hugging Face 下载）', 0.12)
+        processor = LlavaOnevisionProcessor.from_pretrained(self.model_path)
         model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-            self.model_path, local_files_only=True, dtype=getattr(torch, self.dtype_name),
+            self.model_path, dtype=getattr(torch, self.dtype_name),
             device_map=self.device, attn_implementation='sdpa', low_cpu_mem_usage=True,
         ).eval()
         if model.config.text_config.model_type != 'qwen2':

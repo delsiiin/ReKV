@@ -102,7 +102,7 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
         return output
 
 
-def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
+def load_model(model_path='llava-hf/llava-onevision-qwen2-7b-ov-hf',
                n_init=None, n_local=None, topk=64, chunk_size=1):
     device = 'cuda'
     n_frame_tokens = 196

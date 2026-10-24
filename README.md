@@ -20,7 +20,7 @@ Through comprehensive experimentation, we validate the efficacy and practicality
 .
 ├── data        processed benchmarks
 ├── model       code for integrating ReKV with various Video-LLMs
-├── model_zoo   pretrained Video-LLM checkpoints
+├── model_zoo   optional local Video-LLM checkpoints
 ├── results     evaluation results
 └── video_qa    code for StreamingVQA & OfflineVQA
 ```
@@ -31,7 +31,7 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
 
 - Clone this repo: `git clone https://github.com/Becomebright/ReKV.git`
 - Prepare the conda environment: `bash prepare.sh`
-- Download pretrained Video-LLMs under `model_zoo/`
+- Pretrained Video-LLMs are loaded by Hugging Face model ID and downloaded automatically on first use (then reused from the Hugging Face cache). No manual download to `model_zoo/` is required. Set `HF_HOME` to customize the cache location. Supported models:
   - [llava-onevision-qwen2-0.5b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-0.5b-ov-hf)
   - [llava-onevision-qwen2-7b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf)
   - [llava-onevision-qwen2-72b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-72b-ov-hf)

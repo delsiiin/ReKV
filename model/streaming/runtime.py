@@ -9,7 +9,7 @@ import torch
 
 @dataclass(frozen=True)
 class StreamingConfig:
-    model_path: str = 'model_zoo/llava-onevision-qwen2-7b-ov-hf'
+    model_path: str = 'llava-hf/llava-onevision-qwen2-7b-ov-hf'
     device: str = 'cuda:0'
     # Compatibility aliases: different devices cannot share one model instance.
     encode_device: str | None = None

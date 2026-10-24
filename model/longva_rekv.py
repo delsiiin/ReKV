@@ -108,7 +108,7 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
         return output
 
 
-def load_model(model_path='model_zoo/LongVA-7B',
+def load_model(model_path='lmms-lab/LongVA-7B',
                n_init=None, n_local=8000, topk=32, chunk_size=1):
     n_frame_tokens = 144
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)

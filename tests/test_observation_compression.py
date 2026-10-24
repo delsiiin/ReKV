@@ -17,6 +17,22 @@ from model.streaming.profiling import StageProfiler
 
 
 class CompressionParameterTests(unittest.TestCase):
+    def test_observation_loads_hub_id_without_resolving_as_local_path(self):
+        model_id = 'llava-hf/llava-onevision-qwen2-7b-ov-hf'
+        engine = ObservationEngine(model_id, device='cpu', dtype='float32')
+        with patch('transformers.LlavaOnevisionProcessor.from_pretrained') as processor_load, \
+             patch('transformers.LlavaOnevisionForConditionalGeneration.from_pretrained') as model_load:
+            model = model_load.return_value.eval.return_value
+            model.config.text_config.model_type = 'qwen2'
+            engine.load(lambda *args: None)
+            engine.load(lambda *args: None)
+            processor_load.assert_called_once_with(model_id)
+            model_load.assert_called_once_with(
+                model_id, dtype=torch.float32, device_map='cpu',
+                attn_implementation='sdpa', low_cpu_mem_usage=True,
+            )
+            self.assertIs(engine.model, model)
+
     def test_dtype_validation_and_unlimited_frame_parameters(self):
         dataset = SimpleNamespace(get=lambda _: dict(conversations=[dict(question='q')]))
         for dtype in ('float16', 'bfloat16', 'float32'):
@@ -122,6 +138,13 @@ class CompressionParameterTests(unittest.TestCase):
                     return value+b'\n# changed quantizer' if path.name=='quantization.py' else value
                 with patch.object(Path, 'read_bytes', changed):
                     self.assertNotEqual(key, service.cache_key(params))
+                # Hub IDs need no local config and must identify distinct cached results.
+                service.args.model_path = 'llava-hf/llava-onevision-qwen2-7b-ov-hf'
+                hub_key = service.cache_key(params)
+                self.assertNotEqual(key, hub_key)
+                self.assertEqual(hub_key, service.cache_key(params))
+                service.args.model_path = 'llava-hf/llava-onevision-qwen2-0.5b-ov-hf'
+                self.assertNotEqual(hub_key, service.cache_key(params))
             finally:
                 service.close()
 

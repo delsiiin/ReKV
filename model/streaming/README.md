@@ -4,6 +4,9 @@
 
 ## 运行
 
+默认从 Hugging Face 加载 `llava-hf/llava-onevision-qwen2-7b-ov-hf`，首次使用自动下载并缓存。
+可用 `--model-path` 指定其他 OneVision 模型 ID 或本地目录，用 `HF_HOME` 指定模型缓存目录。
+
 在 `rekv` 环境、项目根目录运行：
 
 ```bash

@@ -41,9 +41,9 @@ class OneVisionEngine:
         if (model is None) != (processor is None):
             raise ValueError('Provide both model and processor, or neither')
         if model is None:
-            self.processor = LlavaOnevisionProcessor.from_pretrained(config['model_path'], local_files_only=True)
+            self.processor = LlavaOnevisionProcessor.from_pretrained(config['model_path'])
             self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-                config['model_path'], local_files_only=True, dtype=torch.float16,
+                config['model_path'], dtype=torch.float16,
                 device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
         else:
             self.model, self.processor = model, processor

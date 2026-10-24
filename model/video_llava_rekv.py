@@ -115,7 +115,7 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         return output
 
 
-def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
+def load_model(model_path='LanguageBind/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
     device = 'cuda'
     n_frame_tokens = 257
     processor = VideoLlavaProcessor.from_pretrained(model_path)

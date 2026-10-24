@@ -126,17 +126,21 @@ class ObservationService:
     def cache_key(self, params):
         record = self.dataset.get(params['sample_id'])
         paths = [self.dataset.video_path(record), self.dataset.annotations[params['sample_id']]]
-        model_path = Path(self.args.model_path).resolve()
-        if not (model_path / 'config.json').is_file():
-            raise ValueError(f'Local model config not found: {model_path}')
-        paths += sorted(p for p in model_path.iterdir() if p.is_file())
+        model_source = str(self.args.model_path)
+        model_path = Path(model_source)
+        if model_path.is_dir():
+            model_path = model_path.resolve()
+            if not (model_path / 'config.json').is_file():
+                raise ValueError(f'Local model config not found: {model_path}')
+            model_source = str(model_path)
+            paths += sorted(p for p in model_path.iterdir() if p.is_file())
         signature = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
         code = hashlib.sha256()
         for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/streaming').glob('*.py')) + [ROOT/'model/patch.py']):
             code.update(p.read_bytes())
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         value = dict(params=params, files=signature, code=code.hexdigest(), versions=versions,
-                     device=self.args.device)
+                     device=self.args.device, model_source=model_source)
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:24]
 
     def submit(self, raw):
@@ -314,7 +318,7 @@ def handler_for(service):
             path = unquote(parsed.path)
             try:
                 if path == '/api/config':
-                    return self.send_json(dict(model_path=str(Path(service.args.model_path).resolve()),
+                    return self.send_json(dict(model_path=str(service.args.model_path),
                                                device=service.args.device, dtype=service.args.dtype, dtypes=DTYPES,
                                                data_root=str(service.dataset.root), window_size=32,
                                                default_video_window_size=32))
@@ -403,7 +407,8 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--data-root', type=Path, default=ROOT / 'data/rvs')
-    parser.add_argument('--model-path', type=Path, default=ROOT / 'model_zoo/llava-onevision-qwen2-7b-ov-hf')
+    parser.add_argument('--model-path', default='llava-hf/llava-onevision-qwen2-7b-ov-hf',
+                        help='Hugging Face model ID or local model directory')
     parser.add_argument('--cache-dir', type=Path, default=ROOT / 'results/rvs_observation')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--dtype', choices=DTYPES, default='float16', help='Default dtype selected in the web UI')

@@ -8,8 +8,9 @@ bash run_observation.sh
 # 浏览器打开 http://127.0.0.1:8765
 ```
 
-服务默认读取 `data/rvs` 的 ego / movie 全部标注，使用本地
-`model_zoo/llava-onevision-qwen2-7b-ov-hf`，默认在 `cuda:0` 上以 FP16 运行；网页可选择 FP16、BF16 或 FP32。
+服务默认读取 `data/rvs` 的 ego / movie 全部标注，从 Hugging Face 加载
+`llava-hf/llava-onevision-qwen2-7b-ov-hf`，首次使用自动下载并缓存，可通过 `HF_HOME` 设置模型缓存目录。
+默认在 `cuda:0` 上以 FP16 运行；网页可选择 FP16、BF16 或 FP32。
 HTML、CSS、JavaScript 和计算结果均在本地，无 CDN 或前端构建步骤。
 需要现有环境中的 torch、transformers 5.5.4、accelerate、numpy、Pillow、decord。
 直接双击 HTML 无法执行模型计算，需要上述 Python 服务。
@@ -281,13 +282,18 @@ GQA 根据 query head 对应的 KV head 展开后统计；所有 attention heads
 结果保存到 `results/rvs_observation/<fingerprint>/`：每帧 JPEG 与 `result.json`。
 JSON 包含完整样本、输入参数、采样策略、token 布局、每层及全部层平均的重要性、
 帧统计、空间映射、模型回答、模型路径 / dtype / 层数 / head 数、软件版本及耗时。
-缓存指纹包含参数、数据 / checkpoint 文件路径大小和修改时间、观察代码及关键依赖版本。
+缓存指纹包含参数、模型 ID、数据文件路径大小和修改时间、观察代码及关键依赖版本；使用本地模型时还包含 checkpoint 文件信息。
 相同配置复用结果。服务只运行一个 GPU 计算任务，另允许少量排队任务；切换样本时取消旧任务。
 取消在阶段或层边界生效，首次模型加载期间需等待加载结束。模型在服务进程内复用，
 退出服务会释放显存。用 `Ctrl+C` 退出。
 
-模型路径、数据根目录和缓存目录可通过 `--model-path` / `--data-root` / `--cache-dir` 设置。
-当前适配 LLaVA-OneVision Qwen2（Transformers 5）；不自动下载模型，不支持其他 Video-LLM。
+模型 ID（也兼容本地目录）、数据根目录和结果缓存目录可通过 `--model-path` / `--data-root` / `--cache-dir` 设置，例如：
+
+```bash
+bash run_observation.sh --model-path llava-hf/llava-onevision-qwen2-0.5b-ov-hf
+```
+
+当前适配 LLaVA-OneVision Qwen2（Transformers 5），不支持其他 Video-LLM。
 
 验证核心数学口径和与原生 attention 的一致性：
 

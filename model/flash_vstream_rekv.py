@@ -137,7 +137,7 @@ class FlashVStream_ReKV(VStreamLlamaForCausalLM, Abstract_ReKV):
     #         self.question_answering(prompt)
 
 
-def load_model(model_path='/home/shangzhedi/shangzhedi/Flash-VStream-Base/checkpoints-finetune/base-7b-finetune-uniform-16/checkpoint-5900',
+def load_model(model_path='IVGSZ/Flash-VStream-7b',
                n_init=None, n_local=4000, topk=16, chunk_size=1):
     n_frame_tokens = 64
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
