@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from logzero import logger
 
@@ -48,7 +50,8 @@ class Abstract_ReKV:
             end_idx = start_idx + encode_chunk_size
             chunk_video = video[start_idx:end_idx]
             self._encode_video_chunk(chunk_video)
-            logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
 
         # Handle remaining frames
         remaining_frames = num_frames % encode_chunk_size
@@ -58,7 +61,8 @@ class Abstract_ReKV:
             remaining_video = video[start_idx:end_idx]
             self._encode_video_chunk(remaining_video)
         
-        logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f'KV-Cache RAM usage: {self.calc_memory_usage() / (1024**3):.1f} GB')
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128):

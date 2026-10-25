@@ -81,10 +81,19 @@ ReKV and SuPr-KV share the original ReKV sampling rules in
 These frame selections also match Observation before its start-time/frame-count
 filters. RVS questions use the original ReKV array boundary:
 `video[:int(end_time * sample_fps)]`. Only newly visible sampled frames are
-encoded between questions. ReKV batches those frames; SuPr-KV encodes them
-individually and answers using the resulting cache without a second timestamp
+encoded between questions. Both methods read and encode one sampled frame at a
+time, then answer using the resulting cache without a second timestamp
 filter. The boundary is an array index, not a guarantee that source timestamps
 are strictly less than the annotated `end_time`.
+
+ReKV offline evaluation also reads and encodes one frame at a time, completing
+the video before answering its questions. Neither ReKV evaluation entry point
+materializes the whole video or question interval as a raw-frame array. This
+aligns input buffering with SuPr-KV; ReKV still retains its full historical CPU
+KV cache with the same `n_local` and retrieval settings. No SuPr-KV quantization,
+pruning, eviction, or GPU cache budget is applied to ReKV. Historical KV RAM
+therefore continues to grow with video length. Single-frame forwards can differ
+slightly from batched forwards due to floating-point arithmetic.
 
 For a local HTML experiment showing RVS sampled frames, last-32-token attention
 importance and frame-conditional entropy, run `bash run_observation.sh` in the

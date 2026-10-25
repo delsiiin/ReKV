@@ -2,6 +2,7 @@ import torch
 from logzero import logger
 
 from video_qa.base import BaseVQA, work
+from video_qa.sampling import sampled_frames
 
 
 class ReKVOfflineVQA(BaseVQA):
@@ -29,17 +30,19 @@ class ReKVOfflineVQA(BaseVQA):
 
     @torch.inference_mode()
     def analyze_a_video(self, video_sample):
-        # load and preprocess video frames for QA
-        video_path = video_sample['video_path']
-        video = self.load_video(video_path)
-        if not isinstance(video, torch.Tensor):
-            video_tensor = torch.from_numpy(video)
-        else:
-            video_tensor = video
-
         self.qa_model.clear_cache()
         self.qa_model.encode_init_prompt()
-        self.qa_model.encode_video(video_tensor)
+        frames = sampled_frames(video_sample['video_path'], self.sample_fps)
+        try:
+            encoded_count = 0
+            for _, frame in frames:
+                self.qa_model.encode_video(torch.from_numpy(frame).unsqueeze(0))
+                encoded_count += 1
+                del frame
+            if not encoded_count:
+                raise ValueError(f"Video has no sampled frames: {video_sample['video_path']}")
+        finally:
+            frames.close()
 
         for sample in video_sample['conversations']:
             logger.debug(f'sample: {sample}')

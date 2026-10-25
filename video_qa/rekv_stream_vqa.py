@@ -2,7 +2,6 @@ import math
 from itertools import islice
 
 import torch
-import numpy as np
 from logzero import logger
 
 from video_qa.base import BaseVQA, work
@@ -39,11 +38,12 @@ class ReKVStreamVQA(BaseVQA):
                 logger.debug(f'sample: {sample}')
                 # Original ReKV slice: video[encoded_count:int(end_time * fps)].
                 end_idx = int(cutoff * self.sample_fps)
-                batch = [frame for _, frame in islice(frames, max(0, end_idx - encoded_count))]
-                if batch:
-                    self.qa_model.encode_video(torch.from_numpy(np.stack(batch)))
-                    encoded_count += len(batch)
-                del batch
+                # Match SuPr-KV's read-one/encode-one input buffering while
+                # retaining ReKV's full historical CPU KV cache.
+                for _, frame in islice(frames, max(0, end_idx - encoded_count)):
+                    self.qa_model.encode_video(torch.from_numpy(frame).unsqueeze(0))
+                    encoded_count += 1
+                    del frame
 
                 qa_results = self.video_open_qa(sample['question'], max_new_tokens=256)
                 self.record[(self.retrieve_size, self.chunk_size)].append({

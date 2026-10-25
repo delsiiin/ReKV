@@ -208,6 +208,39 @@ class TransformersCompatibilityTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), 'ReKV ContextManager requires CUDA')
     @torch.no_grad()
+    def test_single_frame_encoding_preserves_full_cpu_history(self):
+        native = Qwen2ForCausalLM(tiny_config(Qwen2Config)).cuda().eval()
+        frame_ids = torch.arange(3, 19, device='cuda').reshape(1, -1)
+        histories = []
+        logits = []
+        for batch_tokens in (8, 2):  # Four frames per call versus one frame per call.
+            model = patch(copy.deepcopy(native), n_local=8, pin_memory=True)
+            caches = model(torch.tensor([[1, 2]], device='cuda'), use_cache=True).past_key_values
+            for start in range(0, frame_ids.shape[1], batch_tokens):
+                output = model(frame_ids[:, start:start + batch_tokens],
+                               past_key_values=caches, use_cache=True)
+                self.assertIs(output.past_key_values[0], caches[0])
+            torch.cuda.synchronize()
+            for cache in caches:
+                self.assertEqual(cache.n_local, 8)
+                self.assertEqual(cache.length, 18)
+                self.assertEqual(cache.num_global_block, 8)
+                self.assertTrue(all(t.device.type == 'cpu' and t.is_pinned()
+                                    for block in cache.global_blocks[0] for t in block.cpu_data))
+                cache.set_retrieval()
+                cache.set_retrieved_block_indices([[0, 7]])
+            histories.append(caches)
+            # Retrieve both the oldest and newest frames after exceeding n_local.
+            logits.append(model(torch.tensor([[20]], device='cuda'),
+                                past_key_values=caches, use_cache=True).logits)
+        for left, right in zip(*histories):
+            for a, b in zip(left.global_blocks[0], right.global_blocks[0]):
+                for expected, actual in zip(a.cpu_data, b.cpu_data):
+                    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+        torch.testing.assert_close(logits[0], logits[1], atol=2e-6, rtol=2e-5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'ReKV ContextManager requires CUDA')
+    @torch.no_grad()
     def test_cuda_encoding_retrieval_and_decoding(self):
         for config_class, model_class in [
             (LlamaConfig, LlamaForCausalLM), (MistralConfig, MistralForCausalLM),

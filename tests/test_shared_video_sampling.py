@@ -2,7 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -122,7 +122,71 @@ class SharedVideoSamplingTests(unittest.TestCase):
         model = self.compare_inputs(self.sample(self.path, [0, 2, 2, 5, 6, 100, 100]), .5, True)
         self.assertEqual(model.questions, [(), (0,), (0,), (0, 2), (0, 2, 4),
                                            (0, 2, 4, 6, 9), (0, 2, 4, 6, 9)])
-        self.assertEqual(model.batches, [[0], [2], [4], [6, 9]])
+        self.assertEqual(model.batches, [[0], [2], [4], [6], [9]])
+
+    def test_rekv_encodes_each_frame_before_decoding_the_next(self):
+        for streaming in (True, False):
+            with self.subTest(streaming=streaming):
+                model = RecordingModel()
+                sample = self.sample('long.mp4', [130, 130, 150, 300])
+                closed = []
+
+                def source(path, fps):
+                    try:
+                        for index in range(150):
+                            self.assertEqual(len(model.frames), index)
+                            yield index, np.full((1, 1, 3), index, dtype=np.uint16)
+                    finally:
+                        closed.append(True)
+
+                cls = ReKVStreamVQA if streaming else ReKVOfflineVQA
+                module = 'rekv_stream_vqa' if streaming else 'rekv_offline_vqa'
+                analyzer = cls(anno=[sample], save_dir=self.temporary.name,
+                               sample_fps=1, qa_model=model)
+                with patch(f'video_qa.{module}.sampled_frames', source), \
+                        patch.object(analyzer, 'load_video', side_effect=AssertionError('eager loading')):
+                    analyzer.analyze_a_video(sample)
+                counts = (130, 130, 150, 150) if streaming else (150,) * 4
+                self.assertEqual(model.questions, [tuple(range(n)) for n in counts])
+                self.assertEqual(model.batches, [[index] for index in range(150)])
+                self.assertEqual(closed, [True])
+
+    def test_rekv_releases_decoder_after_encoding_or_decoding_failure(self):
+        for streaming in (True, False):
+            for fail_encoding in (True, False):
+                with self.subTest(streaming=streaming, fail_encoding=fail_encoding):
+                    model = RecordingModel()
+                    sample = self.sample(self.path, [10])
+                    closed = []
+
+                    def source(path, fps):
+                        try:
+                            yield 0, self.video[0]
+                            raise RuntimeError('decode failed')
+                        finally:
+                            closed.append(True)
+
+                    cls = ReKVStreamVQA if streaming else ReKVOfflineVQA
+                    module = 'rekv_stream_vqa' if streaming else 'rekv_offline_vqa'
+                    analyzer = cls(anno=[sample], save_dir=self.temporary.name,
+                                   sample_fps=1, qa_model=model)
+                    if fail_encoding:
+                        model.encode_video = Mock(side_effect=RuntimeError('encode failed'))
+                    with patch(f'video_qa.{module}.sampled_frames', source):
+                        with self.assertRaisesRegex(RuntimeError, 'encode failed' if fail_encoding else 'decode failed'):
+                            analyzer.analyze_a_video(sample)
+                    self.assertEqual(closed, [True])
+                    self.assertEqual(model.questions, [])
+
+    def test_offline_rekv_rejects_empty_video(self):
+        np.save(self.path, self.video[:0])
+        sample = self.sample(self.path, [1])
+        model = RecordingModel()
+        analyzer = ReKVOfflineVQA(anno=[sample], save_dir=self.temporary.name,
+                                 sample_fps=1, qa_model=model)
+        with self.assertRaisesRegex(ValueError, 'no sampled frames'):
+            analyzer.analyze_a_video(sample)
+        self.assertEqual(model.questions, [])
 
     def test_array_boundary_keeps_selected_frames_beyond_annotation_time(self):
         np.save(self.path, self.video[:5])
