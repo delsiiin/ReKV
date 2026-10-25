@@ -61,14 +61,14 @@ M_{payload}+M_{recent}+M_{prefix}+M_{QA}
 
 | 位置（相对仓库根目录） | 已观察到的行为 | 对方案的影响 |
 | --- | --- | --- |
-| `model/attention/kv_cache_manager.py:32`，`MemoryUnit` | 历史 KV 保存 CPU 副本，按需加载 GPU | 主设置需要 GPU packed store，不能只给 `cpu_data` 加量化 |
+| `model/rekv/attention/kv_cache_manager.py:32`，`MemoryUnit` | 历史 KV 保存 CPU 副本，按需加载 GPU | 主设置需要 GPU packed store，不能只给 `cpu_data` 加量化 |
 | 同文件 `ContextManager.init`，约 313–325 行 | `global_buffer` 与 `CudaCache` 都按原 dtype 分配 | 要替换全精度池和大展开缓冲，才能获得显存收益 |
 | 同文件 `VectorTensor`、`block_k` | 帧代表向量在 GPU 上随帧数增长；容量倍增 | 索引也必须限额，并统计扩容峰值 |
 | 同文件 `get_cosine_similarity`，约 172 行 | 实际执行 FP32 点积，函数内部没有归一化 | 分段用余弦时应显式归一化；检索沿用原点积时应明确区分 |
 | 同文件 `_calc_block_topk`、`_append_global` | 以帧级 block 为基础，支持固定 `chunk_size` 聚合 | 变长语义段需要独立目录，不能直接用固定 chunk 算术索引 |
-| `model/attention/rekv_attention.py` | 问答路径拼接历史 KV，并按 `n_local` 等参数处理窗口 | 需区分编码近期窗口与问答历史可见范围，防止新方法选中的远期 KV 被再次截断 |
-| `model/attention/dot_production_attention/triton_impl.py` | 已有多阶段注意力累积；`get_score=True` 会保留 Q/K 引用供后处理 | 可作为分块读取切入点；采集注意力统计时避免长期保留反量化块 |
-| `model/abstract_rekv.py:67` | 内存日志取第一层 CPU KV 字节再乘层数 | 无法衡量 GPU 峰值；异构层配置下也需逐层实算 |
+| `model/rekv/attention/rekv_attention.py` | 问答路径拼接历史 KV，并按 `n_local` 等参数处理窗口 | 需区分编码近期窗口与问答历史可见范围，防止新方法选中的远期 KV 被再次截断 |
+| `model/rekv/attention/dot_production_attention/triton_impl.py` | 已有多阶段注意力累积；`get_score=True` 会保留 Q/K 引用供后处理 | 可作为分块读取切入点；采集注意力统计时避免长期保留反量化块 |
+| `model/rekv/abstract_rekv.py:67` | 内存日志取第一层 CPU KV 字节再乘层数 | 无法衡量 GPU 峰值；异构层配置下也需逐层实算 |
 | `video_qa/rekv_stream_vqa.py` | 按问题 `end_time` 编码视频前缀，进入问答 | 可添加 arrival/evidence 时间字段和策略日志；需要核对数据时间语义 |
 
 本地 `llava-onevision-qwen2-7b-ov-hf/config.json` 显示 28 层、28 个 query heads、4 个 KV heads、hidden size 3584，即 head dim 128。当前适配器设定每帧 196 个 token。因此 BF16 双 K/V 的**理论 payload** 为：

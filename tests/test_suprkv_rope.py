@@ -6,8 +6,8 @@ import weakref
 
 import torch
 
-from model.attention.rope import RotaryEmbeddingESM
-from model.attention.dot_production_attention.torch_impl import TorchMultiStageDotProductionAttention
+from model.rekv.attention.rope import RotaryEmbeddingESM
+from model.rekv.attention.dot_production_attention.torch_impl import TorchMultiStageDotProductionAttention
 from model.suprkv.attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
 from model.suprkv.cache import StreamingKVCache
 from model.suprkv.quantization import PackedKV

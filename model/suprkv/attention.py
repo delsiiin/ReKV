@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 import importlib.util
 import torch
-from model.attention.dot_production_attention import get_multi_stage_dot_production_attention
+from model.rekv.attention.dot_production_attention import get_multi_stage_dot_production_attention
 from .rotary import rotate_at
 from .packed_attention import PackedRotaryCache
 

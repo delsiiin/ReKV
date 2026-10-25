@@ -34,7 +34,7 @@ flowchart TD
 
    每个视频开始时，先清空上一个视频的缓存，再执行 `encode_init_prompt()`，生成系统提示词和对话前缀的 KV。这些初始 token 会长期保留。
 
-   对应：[模型加载](model/llava_onevision_rekv.py#L105)、[注意力替换](model/patch.py#L35)。
+   对应：[模型加载](model/rekv/llava_onevision_rekv.py#L105)、[注意力替换](model/rekv/patch.py#L35)。
 
 2. **视频编码：分批输入，使用局部因果注意力**
 
@@ -54,7 +54,7 @@ flowchart TD
 
    当前 `n_local=15000`，约对应 76 帧视觉 token。视频持续增长时，每个 token 的直接注意力范围仍受这个窗口限制。
 
-   对应：[流式编码调度](video_qa/rekv_stream_vqa.py#L35)、[分批编码](model/abstract_rekv.py#L32)、[窗口注意力](model/attention/kv_cache_manager.py#L518)。
+   对应：[流式编码调度](video_qa/rekv_stream_vqa.py#L35)、[分批编码](model/rekv/abstract_rekv.py#L32)、[窗口注意力](model/rekv/attention/kv_cache_manager.py#L518)。
 
 3. **缓存管理：保留完整 KV，另建轻量检索索引**
 
@@ -85,7 +85,7 @@ flowchart TD
 
    **均值向量只负责选择帧；真正用于回答的仍是该帧完整的 K、V。**
 
-   对应：[帧归档和代表向量生成](model/attention/kv_cache_manager.py#L569)。
+   对应：[帧归档和代表向量生成](model/rekv/attention/kv_cache_manager.py#L569)。
 
 4. **问题到来：先进行一次专门的检索前向**
 
@@ -116,7 +116,7 @@ flowchart TD
 
    默认 `chunk_size=1`，直接选最高分的 `topk` 帧；若设为更大值，则先将相邻帧组成片段，对片段分数取平均后选择。选中结果最终按帧索引排序，保留时间先后关系。视频帧数不足预算时，保留全部帧。
 
-   对应：[问题检索入口](model/llava_onevision_rekv.py#L33)、[检索评分与选择](model/attention/kv_cache_manager.py#L422)。
+   对应：[问题检索入口](model/rekv/llava_onevision_rekv.py#L33)、[检索评分与选择](model/rekv/attention/kv_cache_manager.py#L422)。
 
 5. **加载检索结果：构造当前问题的上下文**
 
@@ -140,7 +140,7 @@ flowchart TD
 
    此外，缓存保存的是未施加 RoPE 的 K；使用时根据当前拼接序列重新施加位置编码。因此，检索结果保留帧的先后顺序，但不会保留原始帧间的完整时间间隔。
 
-   对应：[检索 KV 加载](model/attention/kv_cache_manager.py#L343)、[检索与普通解码分支](model/attention/rekv_attention.py#L65)。
+   对应：[检索 KV 加载](model/rekv/attention/kv_cache_manager.py#L343)、[检索与普通解码分支](model/rekv/attention/rekv_attention.py#L65)。
 
 6. **回答生成：完整提示词 Prefill，再逐 token 解码**
 
@@ -158,7 +158,7 @@ flowchart TD
 
    问题和答案的 KV 只更新本次回答缓存，不写回长期视频缓存。下一个问题会重新检索；后续视频帧则继续接到原始视频状态上。这也是视频编码能够被多个问题复用的原因。
 
-   对应：[Prefill 与解码循环](model/llava_onevision_rekv.py#L56)。
+   对应：[Prefill 与解码循环](model/rekv/llava_onevision_rekv.py#L56)。
 
 当前配置中，几个容易混淆的参数含义如下：
 

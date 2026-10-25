@@ -136,7 +136,7 @@ class ObservationService:
             paths += sorted(p for p in model_path.iterdir() if p.is_file())
         signature = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
         code = hashlib.sha256()
-        for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/suprkv').glob('*.py')) + [ROOT/'model/patch.py']):
+        for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/suprkv').glob('*.py')) + [ROOT/'model/rekv/patch.py']):
             code.update(p.read_bytes())
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         value = dict(params=params, files=signature, code=code.hexdigest(), versions=versions,

@@ -91,7 +91,7 @@ class StreamingRuntime:
 
     def get_prompt(self, query, mc=False):
         """Use the same OneVision chat suffix as ReKV's evaluation workers."""
-        from model.llava_onevision_rekv import LlavaOneVision_ReKV
+        from model.rekv.llava_onevision_rekv import LlavaOneVision_ReKV
         return LlavaOneVision_ReKV.get_prompt(self, query, mc=mc)
 
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):

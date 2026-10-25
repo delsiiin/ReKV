@@ -7,7 +7,7 @@ import os
 import torch
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
-from model.patch import patch_hf
+from model.rekv.patch import patch_hf
 from observation.engine import INIT_PROMPT, question_inputs, greedy_token_ids
 from observation.segments import SUMMARY_SYSTEM, summary_prompt, selected_vision_features, capture_queries
 from .attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward

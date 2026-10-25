@@ -1,39 +1,33 @@
 import torch
+from transformers import LlavaOnevisionProcessor, LlavaOnevisionForConditionalGeneration
 from logzero import logger
 
-from transformers import AutoTokenizer
-from longva.model import LlavaQwenForCausalLM
-
-from model.patch import patch_hf
-from model.abstract_rekv import Abstract_ReKV
+from model.rekv.patch import patch_hf
+from model.rekv.abstract_rekv import Abstract_ReKV
 
 
-class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
-    def __init__(self, config, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
-        LlavaQwenForCausalLM.__init__(self, config)
-        processor = getattr(self.get_model().get_vision_tower(), "image_processor", None)
+class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV):
+    def __init__(self, config, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size):
+        LlavaOnevisionForConditionalGeneration.__init__(self, config)
         Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
 
     def get_prompt(self, query, mc=False):
-        prompt =  f"\n{query}<|im_end|>\n<|im_start|>assistant\n"
+        prompt =  f"\n{query}<|im_end|><|im_start|>assistant\n"
         if mc:
             prompt += 'Best option: ('
         return prompt
 
-    def _get_video_features(self, pixel_values_videos):  # (Nv, 3, H, W)
-        video_features = self.get_model().get_vision_tower()(pixel_values_videos)  # (Nv, 576, 1024)
-        video_features = self.get_model().mm_projector(video_features)  # (Nv, 576, 3584)
-        video_features = self.get_2dPool(video_features)  # (Nv, 144, 3584)
-        video_features = video_features.flatten(0, 1).unsqueeze(0)  # (1, Nv*144, 3584)
-        return video_features
+    @property
+    def language_model(self):
+        return self.model.language_model
 
-    def _encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
-        pixel_values_videos = self.processor.preprocess(video_chunk, return_tensors="pt").pixel_values.to(self.device, self.dtype)  # (Nv, 3, H, W)
-        video_features = self._get_video_features(pixel_values_videos)  # (1, Nv*144, D)
-        assert self.n_local >= video_features.shape[1], f'n_local: {self.n_local}, video_features: {video_features.shape[1]}'
-
-        output = self.language_model(inputs_embeds=video_features, past_key_values=self.kv_cache, use_cache=True, return_dict=True)
-        self.kv_cache = output.past_key_values
+    def _get_video_features(self, pixel_values_videos):
+        return self.model.get_video_features(
+            pixel_values=pixel_values_videos,
+            vision_feature_layer=self.config.vision_feature_layer,
+            vision_feature_select_strategy=self.config.vision_feature_select_strategy,
+            return_dict=True,
+        ).pooler_output
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
@@ -69,7 +63,7 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
                 inputs_embeds = self.get_input_embeddings()(input_ids)
                 out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
                 past_key_values = out.past_key_values
-                logits = self.lm_head(out['last_hidden_state'])
+                logits = self.lm_head(out.last_hidden_state)
             else:  # decoding
                 out = self.language_model(
                     input_ids=torch.as_tensor(
@@ -79,7 +73,7 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
                     use_cache=True,
                     past_key_values=past_key_values,
                 )
-                logits = self.lm_head(out['last_hidden_state'])
+                logits = self.lm_head(out.last_hidden_state)
                 past_key_values = out.past_key_values
 
             last_token_logits = logits[0, -1, :]
@@ -108,15 +102,16 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
         return output
 
 
-def load_model(model_path='lmms-lab/LongVA-7B',
-               n_init=None, n_local=8000, topk=32, chunk_size=1):
-    n_frame_tokens = 144
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+def load_model(model_path='llava-hf/llava-onevision-qwen2-7b-ov-hf',
+               n_init=None, n_local=None, topk=64, chunk_size=1):
+    device = 'cuda'
+    n_frame_tokens = 196
+    processor = LlavaOnevisionProcessor.from_pretrained(model_path)
     
-    init_prompt = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
-    init_prompt_ids = tokenizer(init_prompt).input_ids
+    init_prompt = '<|im_start|>system \nYou are a helpful assistant.<|im_end|><|im_start|>user '
+    init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids.to(device)
     inf_llm_config = {
-        'n_init': len(init_prompt_ids) if n_init is None else n_init,
+        'n_init': init_prompt_ids.shape[1] if n_init is None else n_init,
         'n_local': n_local,
         'fattn': True,
         'block_size': n_frame_tokens,
@@ -126,26 +121,19 @@ def load_model(model_path='lmms-lab/LongVA-7B',
         'exc_block_size': n_frame_tokens,
         'pin_memory': True,
     }
-    model = LongVA_ReKV.from_pretrained(
+    model = LlavaOneVision_ReKV.from_pretrained(
         model_path, 
         device_map="auto",
         low_cpu_mem_usage=True, 
         dtype=torch.float16,
+        processor=processor,
         n_frame_tokens=n_frame_tokens,
         init_prompt_ids=init_prompt_ids,
         n_local=n_local,
         topk=topk,
         chunk_size=chunk_size,
     )
-    vision_tower = model.get_vision_tower()
-    if not vision_tower.is_loaded:
-        vision_tower.load_model(device_map="auto")
-    processor = vision_tower.image_processor
-    processor.tokenizer = tokenizer
-    model.processor = processor
-
-    model = patch_hf(model, **inf_llm_config)
-    model.language_model = model.model
+    patch_hf(model.language_model, **inf_llm_config)
     
     for k, v in inf_llm_config.items():
         logger.info(f'{k}: {v}')

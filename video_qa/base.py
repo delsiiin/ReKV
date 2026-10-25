@@ -16,7 +16,7 @@ from transformers import (
 import logzero
 from logzero import logger
 
-from model import llava_onevision_rekv, video_llava_rekv, longva_rekv
+from model.rekv import llava_onevision_rekv, video_llava_rekv, longva_rekv
 from video_qa.sampling import load_samples, nonnegative_int, sampled_frames, split_samples
 from video_qa.model_paths import MODEL_PATHS
 

@@ -4,8 +4,8 @@ from logzero import logger
 from transformers import AutoTokenizer
 from flash_vstream import VStreamLlamaForCausalLM
 
-from model.patch import patch_hf
-from model.abstract_rekv import Abstract_ReKV
+from model.rekv.patch import patch_hf
+from model.rekv.abstract_rekv import Abstract_ReKV
 
 
 class FlashVStream_ReKV(VStreamLlamaForCausalLM, Abstract_ReKV):

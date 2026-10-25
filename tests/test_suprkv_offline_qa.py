@@ -7,8 +7,8 @@ from unittest.mock import Mock, patch
 import torch
 from transformers import Qwen2Config, Qwen2Model
 
-from model.llava_onevision_rekv import LlavaOneVision_ReKV
-from model.patch import patch_hf
+from model.rekv.llava_onevision_rekv import LlavaOneVision_ReKV
+from model.rekv.patch import patch_hf
 from model.suprkv.attention import streaming_attention_forward
 from model.suprkv.cache import StreamingKVCache
 from model.suprkv.onevision import OneVisionEngine

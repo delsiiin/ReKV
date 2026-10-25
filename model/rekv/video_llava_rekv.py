@@ -2,8 +2,8 @@ import torch
 from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from logzero import logger
 
-from model.patch import patch_hf
-from model.abstract_rekv import Abstract_ReKV
+from model.rekv.patch import patch_hf
+from model.rekv.abstract_rekv import Abstract_ReKV
 
 
 class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):

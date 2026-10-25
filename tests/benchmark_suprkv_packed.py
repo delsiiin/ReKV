@@ -12,8 +12,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
-from model.attention.rope import RotaryEmbeddingESM
-from model.attention.dot_production_attention import get_multi_stage_dot_production_attention
+from model.rekv.attention.rope import RotaryEmbeddingESM
+from model.rekv.attention.dot_production_attention import get_multi_stage_dot_production_attention
 from model.suprkv.packed_attention import AttentionChunk, PackedRotaryCache, coalesce
 from model.suprkv.quantization import PackedKV
 from model.suprkv.rotary import rotate_at

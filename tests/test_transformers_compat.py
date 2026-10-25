@@ -18,11 +18,11 @@ from transformers import (
     LlavaOnevisionVideoProcessor, VideoLlavaVideoProcessor,
 )
 
-from model.patch import patch_hf
-from model.attention.kv_cache_manager import ContextManager
-from model.llava_onevision_rekv import LlavaOneVision_ReKV
-from model.video_llava_rekv import VideoLlava_ReKV
-from model.longva_rekv import LongVA_ReKV
+from model.rekv.patch import patch_hf
+from model.rekv.attention.kv_cache_manager import ContextManager
+from model.rekv.llava_onevision_rekv import LlavaOneVision_ReKV
+from model.rekv.video_llava_rekv import VideoLlava_ReKV
+from model.rekv.longva_rekv import LongVA_ReKV
 from longva.model import (
     LlavaConfig, LlavaLlamaForCausalLM, LlavaMistralConfig,
     LlavaMistralForCausalLM, LlavaQwenConfig, LlavaQwenForCausalLM,

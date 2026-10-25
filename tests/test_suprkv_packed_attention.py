@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from model.attention.rope import RotaryEmbeddingESM
+from model.rekv.attention.rope import RotaryEmbeddingESM
 from model.suprkv.attention import RetrieveLayer, RotaryCache, streaming_attention_forward
 from model.suprkv.cache import CacheSnapshot, Frame, LayerFrame
 from model.suprkv.packed_attention import PackedRotaryCache
@@ -132,7 +132,7 @@ class PackedAttentionTests(unittest.TestCase):
     @torch.inference_mode()
     def test_qwen_model_bridge_retains_packed_cache(self):
         from transformers import Qwen2Config, Qwen2Model
-        from model.patch import patch_hf
+        from model.rekv.patch import patch_hf
         model = Qwen2Model(Qwen2Config(vocab_size=32, hidden_size=64, intermediate_size=96,
             num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2)).half().cuda().eval()
         snapshot = self.snapshot(torch.float16, 4)

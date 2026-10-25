@@ -2,7 +2,7 @@ import torch
 from transformers import LlamaModel, MistralModel, Qwen2Model
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from model.attention import RotaryEmbeddingESM, rekv_attention_forward
+from model.rekv.attention import RotaryEmbeddingESM, rekv_attention_forward
 
 
 def huggingface_forward(forward):

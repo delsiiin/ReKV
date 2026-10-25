@@ -19,11 +19,19 @@ Through comprehensive experimentation, we validate the efficacy and practicality
 ```
 .
 ├── data        processed benchmarks
-├── model       code for integrating ReKV with various Video-LLMs
+├── model
+│   ├── rekv    ReKV model adapters, attention, and retrieval cache
+│   ├── suprkv  SuPr-KV runtime, compression, and retrieval
+│   └── longva  vendored LongVA model dependency (installed separately)
 ├── model_zoo   optional local Video-LLM checkpoints
 ├── results     evaluation results
 └── video_qa    code for StreamingVQA & OfflineVQA
 ```
+
+ReKV modules are imported from `model.rekv` (for example,
+`model.rekv.llava_onevision_rekv` and `model.rekv.patch`); SuPr-KV modules
+are imported from `model.suprkv`. SuPr-KV reuses the decoder patch,
+attention primitives, and QA adapter from `model.rekv`.
 
 ## Preparation
 

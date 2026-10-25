@@ -116,7 +116,7 @@ class ModelBridgeTests(unittest.TestCase):
     @torch.inference_mode()
     def test_qwen_ragged_layers_native_summary_and_encoding(self):
         from transformers import Qwen2Config, Qwen2Model
-        from model.patch import patch_hf
+        from model.rekv.patch import patch_hf
         from model.suprkv.attention import streaming_attention_forward, EncodeLayer, RetrieveLayer
         from model.suprkv.onevision import native_decoder
         model = Qwen2Model(Qwen2Config(vocab_size=32, hidden_size=32, intermediate_size=48,
@@ -156,7 +156,7 @@ class SequentialModelTests(unittest.TestCase):
     def test_encoding_and_native_summary_between_questions_preserve_model_behavior(self):
         from types import SimpleNamespace
         from transformers import Qwen2Config, Qwen2Model
-        from model.patch import patch_hf
+        from model.rekv.patch import patch_hf
         from model.suprkv.onevision import OneVisionEngine, native_decoder
         from model.suprkv.attention import streaming_attention_forward
         torch.manual_seed(19)
