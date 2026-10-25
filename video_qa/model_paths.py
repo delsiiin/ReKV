@@ -1,4 +1,4 @@
-"""Model names shared by the ReKV and SuPr-KV command-line entry points."""
+"""Model presets shared by all video QA inference methods."""
 
 MODEL_PATHS = {
     'llava_ov_0.5b': 'llava-hf/llava-onevision-qwen2-0.5b-ov-hf',

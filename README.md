@@ -149,6 +149,66 @@ Our code is based on [InfLLM](https://github.com/thunlp/InfLLM), [StreamingLLM](
 
 The optional suprKV OneVision backend uses one GPU-resident model for sequential encoding and QA, with no KV offload. It supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/suprkv/README.md). Dataset evaluation uses `python -m video_qa.run_eval --method suprkv`; run `python -m video_qa.run_eval --help` for available options.
 
-Run `bash run_suprkv.sh` with its configured sample limit, or evaluate all annotated RVS-Ego videos with `python -m video_qa.run_eval --method suprkv --model llava_ov_7b --dataset rvs_ego --num_chunks 1 --max_samples 0 --sample_fps 0.5 --retrieve_size 64 --budget_tokens 4096`. SuPr-KV shares ReKV's dataset, sampling, retrieval, sample-limit and worker arguments; `--budget_tokens` is a separate cache budget, not an alias for ReKV's `--n_local`. SuPr-KV supports the streaming `rvs_ego` and `rvs_movie` routes, with one model per GPU worker and the same six CSV columns as ReKV stream output; method configuration and cache statistics are saved separately in `.stats.jsonl`. `SuPrKVStreamVQA` reuses ReKV's `BaseVQA` data loading and CSV output. `eval_rvs_ego` and `eval_rvs_movie` in `run_eval` each implement worker launch, result merging and scoring, selecting ReKV or SuPr-KV via `--method`; use `--only_eval` to score existing results. For predictions only, run `python -m video_qa.suprkv_stream_vqa --anno_path data/rvs/ego/ego4d_oe.json --save_dir results/suprkv_stream`; this worker does not merge or score results.
+Run `bash run_suprkv.sh` with its configured sample limit, or evaluate all annotated RVS-Ego videos with `python -m video_qa.run_eval --method suprkv --model llava_ov_7b --dataset rvs_ego --num_chunks 1 --max_samples 0 --sample_fps 0.5 --retrieve_size 64 --budget_tokens 4096`. SuPr-KV shares ReKV's dataset, sampling, retrieval, sample-limit and worker arguments; `--budget_tokens` is a separate cache budget, not an alias for ReKV's `--n_local`. SuPr-KV supports the streaming `rvs_ego` and `rvs_movie` routes, with one model per GPU worker and the same six CSV columns as ReKV stream output; method configuration and cache statistics are saved separately in `.stats.jsonl`. `SuPrKVStreamVQA` uses the shared `BaseVQA` and streaming traversal. All dataset routes share worker launch, result merging and scoring in `run_eval`, selecting an inference method via `--method`; use `--only_eval` to score existing results. For predictions only, run `python -m video_qa.suprkv_stream_vqa --anno_path data/rvs/ego/ego4d_oe.json --save_dir results/suprkv_stream`; this worker does not merge or score results.
 
-Offline evaluation also supports `mlvu`, `qaego4d`, `egoschema`, `activitynet_qa`, and `cgbench`, for example `python -m video_qa.run_eval --method suprkv --dataset qaego4d --max_samples 5`. `SuPrKVOfflineVQA` encodes every sampled frame and finalizes the last segment before answering all questions for that video. It preserves ReKV's open-ended and multiple-choice CSV fields, including question types, and writes the same separate cache statistics as the stream worker. For offline predictions only, run `python -m video_qa.suprkv_offline_vqa --anno_path data/qaego4d/test_mc.json --save_dir results/suprkv_offline`. Offline QA reuses ReKV's open-question method and multiple-choice prompt construction: retrieval uses only the original question, multiple-choice generation includes the options and `Best option: (` prefix, and generation limits are 1024 tokens for open questions and 16 for choices. These per-question limits override the runtime's `--max_new_tokens` without changing stream defaults or video compression. Both methods use greedy generation and EOS stopping; decoding and nonempty answer parsing follow ReKV. SuPr-KV continues to mark empty multiple-choice answers incorrect.
+Offline evaluation also supports `mlvu`, `qaego4d`, `egoschema`, `activitynet_qa`, and `cgbench`, for example `python -m video_qa.run_eval --method suprkv --dataset qaego4d --max_samples 5`. `SuPrKVOfflineVQA` encodes every sampled frame and finalizes the last segment before answering all questions for that video. It preserves ReKV's open-ended and multiple-choice CSV fields, including question types, and writes the same separate cache statistics as the stream worker. For offline predictions only, run `python -m video_qa.suprkv_offline_vqa --anno_path data/qaego4d/test_mc.json --save_dir results/suprkv_offline`. Offline QA uses the shared open-question method and multiple-choice prompt construction: retrieval uses only the original question, multiple-choice generation includes the options and `Best option: (` prefix, and generation limits are 1024 tokens for open questions and 16 for choices. These per-question limits override the runtime's `--max_new_tokens` without changing stream defaults or video compression. Both methods use greedy generation and EOS stopping; decoding and nonempty answer parsing follow ReKV. SuPr-KV continues to mark empty multiple-choice answers incorrect.
+
+
+## Original language-model inference and method extensions
+
+Use `--method native` for full-context inference with the original language model.
+This is a baseline for the **LLM processing stage**: frame sampling, vision encoder,
+visual token pooling and prompts remain the same as the existing model adapters.
+The decoder is loaded from the original model class with no ReKV/SuPr-KV attention
+patch, retrieval, quantization, token pruning or cache eviction. All model presets
+in `video_qa/model_paths.py` are supported, including OneVision, Video-LLaVA and LongVA.
+
+```bash
+# Offline benchmark, first five videos
+python -m video_qa.run_eval --method native --model llava_ov_7b \
+    --dataset qaego4d --sample_fps 0.5 --max_samples 5
+
+# Streaming benchmark: only frames visible at each question's cutoff
+python -m video_qa.run_eval --method native --model llava_ov_7b \
+    --dataset rvs_ego --sample_fps 0.5 --max_samples 5
+
+# Predictions only, without merging or invoking a scorer
+python -m video_qa.native_offline_vqa --model llava_ov_7b \
+    --anno_path data/qaego4d/test_mc.json --save_dir results/native_test
+```
+
+Visual features are encoded once per sampled frame. Each question prefills the
+complete visible video prefix and its question from scratch, then generates greedily
+with the model's native KV cache and EOS stopping. Question/answer tokens are never
+carried into another question. Streaming uses the same `int(end_time * sample_fps)`
+sampled-array boundary as the other methods, including repeated and zero cutoffs.
+Full context increases memory use with video length; this path does not silently
+truncate frames or switch to a compressed method.
+
+Native results go to `results/native/<model>/<dataset>/fps_<fps>` (with the usual
+`/samples_<N>` suffix). They contain the shared QA fields without retrieval columns.
+`--model_path` can select local weights; `--device cpu` is available for small-model
+checks. Native `--max_new_tokens` overrides all answer limits; otherwise the defaults
+are 1024 for offline open answers, 256 for streaming open answers and 16 for choices.
+Retrieval and compression options such as `--retrieve_size`, `--n_local` and
+`--budget_tokens` are rejected for native inference. Existing ReKV and SuPr-KV
+commands, result directories and CSV metadata remain supported.
+
+The extension points are:
+
+- `video_qa/base.py`: common prompts, answer records, CSV output and worker setup.
+- `video_qa/flows.py`: shared offline/streaming traversal and frame boundaries.
+- `video_qa/methods/`: method-owned CLI options, validation, lazy model loading,
+  resource cleanup, result layout and device assignment. Register a method in
+  `METHODS`; the launcher and base worker need no new method branches.
+- Method entry points combine an offline/streaming flow with lifecycle hooks:
+  `start_video`, `consume_frame`, optional `finish_encoding` and `finish_video`.
+  A runtime supplies `get_prompt` and `question_answering`; methods can override
+  the QA hook when their streaming API has different semantics.
+- `model/video_backbone.py`: shared model-family prompts and visual feature extraction.
+  `model/native/runtime.py` owns full-context LLM prefill and generation.
+
+A new method implements the `Method` interface in `video_qa/methods/common.py`,
+registers its instance, and supplies `<method>_offline_vqa` and `<method>_stream_vqa`
+entry points (or overrides `solver`). Its `analyzer_kwargs` can add method-specific
+record metadata without introducing retrieval assumptions into `BaseVQA`.

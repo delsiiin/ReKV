@@ -2,6 +2,7 @@ import torch
 from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from logzero import logger
 
+from model.video_backbone import INITIAL_PROMPTS, question_prompt, video_features
 from model.rekv.patch import patch_hf
 from model.rekv.abstract_rekv import Abstract_ReKV
 
@@ -12,23 +13,14 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
 
     def get_prompt(self, query, mc=False):
-        prompt =  f"\n{query} ASSISTANT:"
-        if mc:
-            prompt += ' Best option: ('
-        return prompt
+        return question_prompt('video_llava', query, mc)
 
     @property
     def language_model(self):
         return self.model.language_model
 
     def _get_video_features(self, pixel_values_videos):
-        batch_size, frames = pixel_values_videos.shape[:2]
-        features = self.model.get_video_features(
-            pixel_values_videos=pixel_values_videos,
-            vision_feature_layer=self.config.vision_feature_layer,
-            return_dict=True,
-        ).pooler_output
-        return features.reshape(batch_size, frames * features.shape[1], -1)
+        return video_features(self, 'video_llava', pixel_values_videos)
 
     def _encode_video_chunk(self, video_chunk):
         pixel_values_videos = self.processor.video_processor(videos=video_chunk, do_sample_frames=False, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)
@@ -120,7 +112,7 @@ def load_model(model_path='LanguageBind/Video-LLaVA-7B-hf', n_init=None, n_local
     n_frame_tokens = 257
     processor = VideoLlavaProcessor.from_pretrained(model_path)
     
-    init_prompt = 'USER: '
+    init_prompt = INITIAL_PROMPTS['video_llava']
     init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids.to(device)
     inf_llm_config = {
         'n_init': init_prompt_ids.shape[1] if n_init is None else n_init,

@@ -1,74 +1,33 @@
+"""Method-neutral QA prompts, records, dataset partitioning and worker setup."""
 import warnings
 import random
 import os
-import math
 import argparse
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
-from transformers import (
-    logging,
-    LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor,
-    VideoLlavaForConditionalGeneration, VideoLlavaProcessor
-)
+from transformers import logging
 import logzero
 from logzero import logger
 
-from model.rekv import llava_onevision_rekv, video_llava_rekv, longva_rekv
 from video_qa.sampling import load_samples, nonnegative_int, sampled_frames, split_samples
 from video_qa.model_paths import MODEL_PATHS
-
-
-MODELS = {
-    'llava_ov_0.5b': {
-        'load_func': llava_onevision_rekv.load_model,
-        'model_class': LlavaOnevisionForConditionalGeneration,
-        'processor_class': LlavaOnevisionProcessor,
-        'model_path': MODEL_PATHS['llava_ov_0.5b'],
-    },
-    'llava_ov_7b': {
-        'load_func': llava_onevision_rekv.load_model,
-        'model_class': LlavaOnevisionForConditionalGeneration,
-        'processor_class': LlavaOnevisionProcessor,
-        'model_path': MODEL_PATHS['llava_ov_7b'],
-    },
-    'llava_ov_72b': {
-        'load_func': llava_onevision_rekv.load_model,
-        'model_class': LlavaOnevisionForConditionalGeneration,
-        'processor_class': LlavaOnevisionProcessor,
-        'model_path': MODEL_PATHS['llava_ov_72b'],
-    },
-    'video_llava_7b': {
-        'load_func': video_llava_rekv.load_model,
-        'model_class': VideoLlavaForConditionalGeneration,
-        'processor_class': VideoLlavaProcessor,
-        'model_path': MODEL_PATHS['video_llava_7b'],
-    },
-    'longva_7b': {
-        'load_func': longva_rekv.load_model,
-        'model_path': MODEL_PATHS['longva_7b'],
-    },
-}
+from video_qa.methods import get_method, validate_arguments
 
 
 class BaseVQA:
     def __init__(self, anno, save_dir, sample_fps,
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
-                 retrieve_size=64, chunk_size=1) -> None:
+                 record_metadata=None) -> None:
         
         self.sample_fps = sample_fps
 
         self.qa_model = qa_model
         self.qa_processor = qa_processor
 
-        # Retrieval Hyperparams
-        assert chunk_size <= retrieve_size, f'chunk_size: {chunk_size}, retrieve_size: {retrieve_size}'
-        self.retrieve_size = retrieve_size
-        self.chunk_size = chunk_size
-
+        self.record_metadata = dict(record_metadata or {})
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
         if num_chunks is not None:
@@ -78,7 +37,11 @@ class BaseVQA:
 
         self.save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
-        self.record = {(self.retrieve_size, self.chunk_size): []}
+        self.record = {tuple(self.record_metadata.values()): []}
+
+    @property
+    def records(self):
+        return self.record[tuple(self.record_metadata.values())]
 
     def split_list(self, lst, n):
         return split_samples(lst, n)
@@ -95,29 +58,6 @@ class BaseVQA:
         logger.debug(f'video shape: {video.shape}')
         return video
     
-    def calc_recall_precision(self, gt_temporal_windows, retrieved_mask):
-        total_intersection_length = 0.0
-    
-        for (start_sec, end_sec) in gt_temporal_windows:
-            start = math.floor(start_sec)
-            end = math.ceil(end_sec)
-            for i in range(start, end):
-                if i < len(retrieved_mask) and retrieved_mask[i]:
-                    intersection_start = max(start_sec, i)
-                    intersection_end = min(end_sec, i + 1)
-                    total_intersection_length += intersection_end - intersection_start
-
-        gt_len = sum([end_sec - start_sec for start_sec, end_sec in gt_temporal_windows])
-        retrieved_len = sum(retrieved_mask).item()
-
-        recall = total_intersection_length / gt_len if gt_len > 0 else 0
-        precision = total_intersection_length / retrieved_len if retrieved_len > 0 else 0
-        if precision + recall > 0:
-            f1 = 2 * (precision * recall) / (precision + recall)
-        else:
-            f1 = 0
-        return recall, precision, f1
-    
     def format_mcqa_prompt(self, question, candidates):
         assert len(question) > 0, f"Q: {question}"
 
@@ -132,6 +72,8 @@ class BaseVQA:
 
     def extract_characters_regex(self, s):
         s = s.strip()
+        if not s:
+            return ''
         if ")" in s:
             index = s.index(")")
             pred = s[index - 1 : index]
@@ -139,15 +81,40 @@ class BaseVQA:
         else:
             return s[0]
 
-    def video_open_qa(self, question, max_new_tokens=1024):
-        pass
+    def video_open_qa(self, question, max_new_tokens=1024, **generation_options):
+        inputs = {'question': question, 'prompt': self.qa_model.get_prompt(question)}
+        answer = self.qa_model.question_answering(inputs, max_new_tokens=max_new_tokens, **generation_options)
+        return {'pred_answer': answer.replace('\n', '')}
 
-    def video_close_qa(self, question, candidates, correct_choice):
-        pass
+    def video_close_qa(self, question, candidates, correct_choice, **generation_options):
+        inputs = self.format_mcqa_prompt(question, candidates)
+        answer = self.qa_model.question_answering(inputs, max_new_tokens=16, **generation_options)
+        letter = self.extract_characters_regex(answer)
+        return {'pred_answer': answer.replace('\n', ''), 'pred_choice': letter,
+                'acc': float(letter == correct_choice)}
 
-    @torch.inference_mode()
+    def record_answer(self, video_sample, sample, *, max_new_tokens=1024):
+        question, answer = sample['question'], sample['answer']
+        record = dict(video_id=video_sample['video_id'], question=question)
+        if 'choices' in sample:
+            choices = sample['choices']
+            # Existing benchmark convention when the ground truth is private.
+            if answer is None:
+                answer = choices[0]
+            correct = self.choice_letters[choices.index(answer)]
+            result = self.video_close_qa(question, choices, correct)
+            record.update(choices=choices, answer=answer, correct_choice=correct,
+                          pred_answer=result['pred_answer'], pred_choice=result['pred_choice'],
+                          qa_acc=result['acc'] * 100)
+        else:
+            result = self.video_open_qa(question, max_new_tokens=max_new_tokens)
+            record.update(answer=answer, pred_answer=result['pred_answer'])
+        if 'question_type' in sample:
+            record['task'] = sample['question_type']
+        self.records.append(record)
+
     def analyze_a_video(self, video_sample):
-        pass
+        raise NotImplementedError
 
     def analyze(self, debug=False):
         video_annos = self.anno[:1] if debug else self.anno
@@ -155,13 +122,9 @@ class BaseVQA:
             logger.debug(f'video_id: {video_sample["video_id"]}')
             self.analyze_a_video(video_sample)
 
-        dfs = []
-        for (retrieve_size, chunk_size), dict_list in self.record.items():
-            df = pd.DataFrame(dict_list)
-            df['retrieve_size'] = retrieve_size
-            df['chunk_size'] = chunk_size
-            dfs.append(df)
-        final_df = pd.concat(dfs, ignore_index=True)
+        final_df = pd.DataFrame(self.records)
+        for name, value in self.record_metadata.items():
+            final_df[name] = value
         final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
 
 
@@ -184,17 +147,9 @@ def build_parser(method='rekv'):
     parser.add_argument("--chunk_idx", '--chunk-idx', type=int, default=0)
     parser.add_argument("--save_dir", '--save-dir', type=str, required=True)
     parser.add_argument("--anno_path", '--anno-path', type=str, required=True)
-    parser.add_argument("--model", type=str, default="llava_ov_7b")
-    parser.add_argument("--retrieve_size", '--retrieve-size', type=int, default=64)
+    parser.add_argument("--model", choices=MODEL_PATHS, default="llava_ov_7b")
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=False)
-    if method == 'suprkv':
-        from video_qa.suprkv_stream_vqa import add_suprkv_arguments
-        add_suprkv_arguments(parser)
-        parser.add_argument('--device', default='cuda:0')
-        parser.set_defaults(retrieve_chunk_size=1)
-    else:
-        parser.add_argument("--n_local", type=int, default=15000)
-        parser.add_argument("--retrieve_chunk_size", type=int, default=1)
+    get_method(method).add_arguments(parser)
     return parser
 
 
@@ -202,6 +157,11 @@ def work(QA_CLASS, method='rekv', argv=None):
     logging.set_verbosity_error()
     parser = build_parser(method)
     args = parser.parse_args(argv)
+    implementation = get_method(method)
+    try:
+        validate_arguments(args, implementation)
+    except ValueError as error:
+        parser.error(str(error))
 
     if not args.debug:
         logzero.loglevel(logging.INFO)
@@ -220,37 +180,20 @@ def work(QA_CLASS, method='rekv', argv=None):
     if not 0 <= args.chunk_idx < args.num_chunks:
         parser.error("chunk_idx must be between 0 and num_chunks - 1")
 
-    # VideoQA model
-    if method == 'suprkv':
-        from model.suprkv.runtime import StreamingRuntime
-        from video_qa.suprkv_stream_vqa import make_config
-        videoqa_model = StreamingRuntime(make_config(args))
-        videoqa_processor = None
-    else:
-        model_path = MODELS[args.model]['model_path']
-        load_func = MODELS[args.model]['load_func']
-        logger.info(f"Loading VideoQA model: {model_path}")
-        videoqa_model, videoqa_processor = load_func(
-            model_path=model_path,
-            n_local=args.n_local,
-            topk=args.retrieve_size,
-            chunk_size=args.retrieve_chunk_size,
-        )
+    videoqa_model, videoqa_processor = implementation.load(args)
 
     try:
-        retrieve_analyzer = QA_CLASS(
+        analyzer = QA_CLASS(
             anno=anno,
             sample_fps=args.sample_fps,
             qa_model=videoqa_model,
             qa_processor=videoqa_processor,
-            retrieve_size=args.retrieve_size,
-            chunk_size=args.retrieve_chunk_size,
             num_chunks=args.num_chunks,
             chunk_idx=args.chunk_idx,
             save_dir=args.save_dir,
+            **implementation.analyzer_kwargs(args),
         )
 
-        retrieve_analyzer.analyze(debug=args.debug)
+        analyzer.analyze(debug=args.debug)
     finally:
-        if method == 'suprkv':
-            videoqa_model.close()
+        implementation.close(videoqa_model)

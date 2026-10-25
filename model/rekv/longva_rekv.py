@@ -4,6 +4,7 @@ from logzero import logger
 from transformers import AutoTokenizer
 from longva.model import LlavaQwenForCausalLM
 
+from model.video_backbone import INITIAL_PROMPTS, question_prompt, video_features
 from model.rekv.patch import patch_hf
 from model.rekv.abstract_rekv import Abstract_ReKV
 
@@ -15,17 +16,10 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
         Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
 
     def get_prompt(self, query, mc=False):
-        prompt =  f"\n{query}<|im_end|>\n<|im_start|>assistant\n"
-        if mc:
-            prompt += 'Best option: ('
-        return prompt
+        return question_prompt('longva', query, mc)
 
-    def _get_video_features(self, pixel_values_videos):  # (Nv, 3, H, W)
-        video_features = self.get_model().get_vision_tower()(pixel_values_videos)  # (Nv, 576, 1024)
-        video_features = self.get_model().mm_projector(video_features)  # (Nv, 576, 3584)
-        video_features = self.get_2dPool(video_features)  # (Nv, 144, 3584)
-        video_features = video_features.flatten(0, 1).unsqueeze(0)  # (1, Nv*144, 3584)
-        return video_features
+    def _get_video_features(self, pixel_values_videos):
+        return video_features(self, 'longva', pixel_values_videos)
 
     def _encode_video_chunk(self, video_chunk):  # (Nv, H, W, 3)
         pixel_values_videos = self.processor.preprocess(video_chunk, return_tensors="pt").pixel_values.to(self.device, self.dtype)  # (Nv, 3, H, W)
@@ -113,7 +107,7 @@ def load_model(model_path='lmms-lab/LongVA-7B',
     n_frame_tokens = 144
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     
-    init_prompt = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
+    init_prompt = INITIAL_PROMPTS['longva']
     init_prompt_ids = tokenizer(init_prompt).input_ids
     inf_llm_config = {
         'n_init': len(init_prompt_ids) if n_init is None else n_init,

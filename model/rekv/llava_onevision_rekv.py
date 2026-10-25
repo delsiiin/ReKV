@@ -2,6 +2,7 @@ import torch
 from transformers import LlavaOnevisionProcessor, LlavaOnevisionForConditionalGeneration
 from logzero import logger
 
+from model.video_backbone import INITIAL_PROMPTS, question_prompt, video_features
 from model.rekv.patch import patch_hf
 from model.rekv.abstract_rekv import Abstract_ReKV
 
@@ -12,22 +13,14 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
         Abstract_ReKV.__init__(self, processor, n_frame_tokens, init_prompt_ids, n_local, topk, chunk_size)
 
     def get_prompt(self, query, mc=False):
-        prompt =  f"\n{query}<|im_end|><|im_start|>assistant\n"
-        if mc:
-            prompt += 'Best option: ('
-        return prompt
+        return question_prompt('onevision', query, mc)
 
     @property
     def language_model(self):
         return self.model.language_model
 
     def _get_video_features(self, pixel_values_videos):
-        return self.model.get_video_features(
-            pixel_values=pixel_values_videos,
-            vision_feature_layer=self.config.vision_feature_layer,
-            vision_feature_select_strategy=self.config.vision_feature_select_strategy,
-            return_dict=True,
-        ).pooler_output
+        return video_features(self, 'onevision', pixel_values_videos)
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
@@ -108,7 +101,7 @@ def load_model(model_path='llava-hf/llava-onevision-qwen2-7b-ov-hf',
     n_frame_tokens = 196
     processor = LlavaOnevisionProcessor.from_pretrained(model_path)
     
-    init_prompt = '<|im_start|>system \nYou are a helpful assistant.<|im_end|><|im_start|>user '
+    init_prompt = INITIAL_PROMPTS['onevision']
     init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids.to(device)
     inf_llm_config = {
         'n_init': init_prompt_ids.shape[1] if n_init is None else n_init,
