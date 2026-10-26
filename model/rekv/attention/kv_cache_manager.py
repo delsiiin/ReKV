@@ -3,6 +3,7 @@ import torch
 from typing import Optional, Tuple
 
 from .dot_production_attention import get_multi_stage_dot_production_attention
+from .kv_trace import TRACE
 
 
 # Allocate a fixed-size block of GPU memory specifically for storing the KV-Cache of the local_window.
@@ -64,6 +65,9 @@ class MemoryUnit:
         self.gpu_data_id = gpu_data_id
         self.event = event
 
+        if TRACE is not None and kv[0].is_cuda:
+            TRACE.record("offload_d2h", cpu_data)
+
     # Load data from the CPU to the GPU and copy it to 'target' when necessary.
     # target: 2x (n_head, n_token, head_dim), on GPU
     def load(self, target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> bool:
@@ -76,6 +80,8 @@ class MemoryUnit:
             else:
                 target_event = None
 
+            if TRACE is not None:
+                TRACE.record("load_gpu_hit")
             return False, target_event
 
         gpu_data, gpu_data_id = self.cache.alloc()
@@ -98,6 +104,8 @@ class MemoryUnit:
         self.gpu_data = gpu_data
         self.gpu_data_id = gpu_data_id
 
+        if TRACE is not None:
+            TRACE.record("load_h2d", self.cpu_data)
         return True, target_event
 
     # Get the KV-Cache stored on GPU
@@ -113,6 +121,9 @@ class MemoryUnit:
         self.gpu_data = None
         self.cache.delete(self.gpu_data_id)
         self.gpu_data_id = None
+
+        if TRACE is not None:
+            TRACE.record("offload_evict")
 
     def calculate_cpu_memory(self):
         return len(self.cpu_data) * self.cpu_data[0].numel() * self.cpu_data[0].element_size()

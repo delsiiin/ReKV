@@ -132,6 +132,20 @@ class CompressionParameterTests(unittest.TestCase):
                 self.assertNotEqual(key, service.cache_key(dict(params, max_frames=1)))
                 self.assertNotEqual(key, service.cache_key(dict(params, compression_budget_tokens=700)))
                 self.assertNotEqual(key, service.cache_key(dict(params, custom_questions=['another question'])))
+                external = dict(params, summarizer_model_path='llava-hf/llava-onevision-qwen2-0.5b-ov-hf')
+                self.assertNotEqual(key, service.cache_key(external))
+                local = root/'summarizer'
+                local.mkdir()
+                (local/'config.json').write_text('{}')
+                local_params = dict(params, summarizer_model_path=str(local))
+                local_key = service.cache_key(local_params)
+                (local/'config.json').write_text('{"changed": true}')
+                self.assertNotEqual(local_key, service.cache_key(local_params))
+                original_read = Path.read_bytes
+                with patch.object(Path, 'read_bytes', lambda p: original_read(p) + (b'changed' if p.name == 'summarizer.py' else b'')):
+                    self.assertNotEqual(service.cache_key(external), service.cache_key(params))
+                    changed_external = service.cache_key(external)
+                self.assertNotEqual(changed_external, service.cache_key(external))
                 read = Path.read_bytes
                 def changed(path):
                     value = read(path)

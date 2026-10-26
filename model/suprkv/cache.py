@@ -474,6 +474,8 @@ class StreamingKVCache:
                     raise ValueError(error or 'summary_empty')
                 classified = self._classify_segment(pending, queries)
             except (ValueError, RuntimeError) as exc:
+                if isinstance(exc, torch.cuda.OutOfMemoryError):
+                    raise
                 error = (error or str(exc))[:256]
                 classified = {f.frame_id: f.layers for f in pending}
                 self.counts['scoring_failures'] += 1

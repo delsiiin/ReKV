@@ -60,6 +60,10 @@ function clearResults() {
 function updateWindowLabels() {
   const compressionMode = $('mode').value === 'compression';
   $('compressionControls').hidden = !compressionMode;
+  const customSummary = compressionMode && $('compressionSummarizer').value === 'custom';
+  $('compressionSummarizerCustom').hidden = !customSummary;
+  $('compressionSummarizerPath').disabled = !customSummary;
+  $('compressionSummarizerPath').required = customSummary;
   $('question').disabled = compressionMode;
   $('videoWindowSize').disabled = compressionMode;
   $('segmentEnabled').disabled = compressionMode;
@@ -124,6 +128,8 @@ function parameters() {
   return {sample_id: $('sample').value, dtype: $('dtype').value,
     max_frames: $('maxFrames').value === '' ? null : Number($('maxFrames').value),
     ...($('mode').value === 'compression' ? {
+      summarizer_model_path: $('compressionSummarizer').value === 'main' ? null :
+        ($('compressionSummarizer').value === 'custom' ? $('compressionSummarizerPath').value.trim() : $('compressionSummarizer').value),
       question_indices: [...$('compressionQuestions').querySelectorAll('input:checked')].map(input => Number(input.value)),
       custom_questions: $('compressionCustomQuestions').value.split('\n').map(q => q.trim()).filter(Boolean)
     } : {}),
@@ -510,7 +516,7 @@ for (const [id, checked] of [['compressionQuestionsAll', true], ['compressionQue
     invalidate();
   });
 }
-['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment'].forEach(id => $(id).addEventListener('change', invalidate));
+['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));

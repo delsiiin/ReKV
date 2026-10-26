@@ -16,7 +16,9 @@ function renderCompressionResult(result, url, cached) {
   $('compressionStateFollowLabel').hidden = true;
   const e = result.compression_experiment, before = e.runs.before, after = e.runs.after;
   $('results').hidden = true; $('emptyState').hidden = true; $('compressionResults').hidden = false;
-  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · 单模型 / 顺序执行 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
+  const beforeStats = before.model_stats ?? {}, afterStats = after.model_stats ?? {};
+  const summarizer = e.config?.summarizer_model_path ?? null;
+  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 摘要配置：${summarizer ?? '主模型'} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
   $('compressionJson').hidden = false; $('compressionJson').href = url;
   const memory = e.memory, saved = memory.persistent_kv;
   const gpu = e.method.cache_device.startsWith('cuda');
@@ -29,14 +31,25 @@ function renderCompressionResult(result, url, cached) {
     ['编码完成时 CUDA 分配量', memory.cuda_allocated],
     ['整个运行的 CUDA 分配峰值', memory.cuda_peak],
   ].map(([label, item]) => [label, mib(item?.before_bytes), mib(item?.after_bytes), mib(item?.saved_bytes), pct(item?.saved_fraction)]);
+  if (beforeStats.model_parameter_bytes != null && afterStats.model_parameter_bytes != null) {
+    rows.push(['模型参数（含摘要模型）', mib(beforeStats.model_parameter_bytes), mib(afterStats.model_parameter_bytes),
+      mib(beforeStats.model_parameter_bytes - afterStats.model_parameter_bytes), '—']);
+  }
   $('compressionMemoryTable').replaceChildren(compressionTable(['统计口径', '压缩前', '压缩后', '节省量', '节省比例'], rows));
-  $('compressionMemoryNote').textContent = '两侧独立清空缓存后依次运行。持久 KV 不含模型权重；CUDA 分配量和峰值包含权重及工作空间，allocator reserved 不计作节省。';
+  $('compressionMemoryNote').textContent = '两侧独立清空缓存后依次运行。持久 KV 不含模型权重；CUDA 分配量和峰值包含权重及工作空间，包括压缩侧独立摘要模型；allocator reserved 不计作节省。';
   prepareCompressionQuestions(e);
   renderCompressionAnswer();
   renderRetrievalHits();
   $('compressionCostTable').replaceChildren(compressionTable(['阶段', '压缩前', '压缩后', '新增耗时'], e.stages.map(stage => [stage.label, millis(stage.before_seconds), millis(stage.after_seconds), deltaMs(stage.delta_seconds)])));
-  $('compressionTimingNote').textContent = `不含模型加载及视频解码；单次顺序测量，先运行原精度，首次调用的 kernel 初始化可能影响时间。编码总耗时：${fmt(before.encoding_seconds, 3)} → ${fmt(after.encoding_seconds, 3)} 秒。未触发的策略阶段显示 0。`;
-  $('compressionMethod').textContent = JSON.stringify({method: e.method, config: e.config, question_time: e.cutoff_timestamp, commits: after.commits ?? []}, null, 2);
+  $('compressionTimingNote').textContent = `不含模型加载及视频解码；摘要模型加载 ${fmt(after.summarizer_load_seconds ?? 0, 3)} 秒（计入任务总时间）。单次顺序测量，先运行原精度，首次调用的 kernel 初始化可能影响时间。编码总耗时：${fmt(before.encoding_seconds, 3)} → ${fmt(after.encoding_seconds, 3)} 秒。未触发的策略阶段显示 0。`;
+  $('compressionMethod').textContent = JSON.stringify({method: e.method, config: e.config, model_stats: {before: beforeStats, after: afterStats}, question_time: e.cutoff_timestamp, commits: after.commits ?? []}, null, 2);
+  const summaries = (after.commits ?? []).filter(commit => 'summary' in commit);
+  $('compressionSummariesPanel').hidden = !summaries.length;
+  $('compressionSummariesTable').replaceChildren(compressionTable(
+    ['Segment', '实际摘要模型', '摘要', '小模型错误', '主模型重试', '最终错误'],
+    summaries.map(commit => [commit.segment_id, commit.summary_source ?? '主模型', commit.summary || '（空摘要）',
+      commit.summarizer_error || '—', commit.summary_retried ? (commit.summary_retry_succeeded ? '成功' : '失败') : '未重试',
+      commit.summary_error || commit.score_error || '—'])));
   $('compressionFrames').replaceChildren();
   result.frames.forEach(frame => {
     const figure = node('figure', 'compression-frame'), img = node('img'); img.src = frame.image_url; img.alt = `采样帧 ${frame.index+1}`; img.loading = 'lazy';

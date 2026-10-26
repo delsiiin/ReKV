@@ -24,8 +24,14 @@ class StreamingConfig:
     max_segment_frames: int = 32
     summary_max_new_tokens: int = 256
     max_new_tokens: int = 256
+    summarizer_model_path: str | None = None
 
     def __post_init__(self):
+        value = self.summarizer_model_path
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError('summarizer_model_path must be a nonempty string or null')
+        if value is not None:
+            object.__setattr__(self, 'summarizer_model_path', value.strip())
         aliases = [v for v in (self.encode_device, self.qa_device) if v is not None]
         def canonical(value):
             d = torch.device(value)
@@ -48,7 +54,7 @@ class StreamingConfig:
 
 
 class StreamingRuntime:
-    """One model in the calling process. Every operation finishes before returning.
+    """Main model and optional summarizer in the calling process, executing sequentially.
 
     Submit frames/questions in chronological order. ask() blocks until generation
     completes; subsequent frames cannot affect that question's cache view.
@@ -62,7 +68,7 @@ class StreamingRuntime:
         self.question_id = 0
         self.closed = False
         self.last_timestamp = float('-inf')
-        self.startup = dict(inference_pid=os.getpid(), model_instances=1,
+        self.startup = dict(inference_pid=os.getpid(), model_instances=1 + bool(self.config.summarizer_model_path),
                             execution_mode='sequential', device=self.config.device)
 
     def _ensure_open(self):

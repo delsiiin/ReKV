@@ -30,7 +30,7 @@ def validate_params(raw, dataset, default_dtype='float16'):
                'max_new_tokens', 'video_window_size', 'segment_enabled', 'segment_ema_alpha',
                'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
                'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
-               'question_indices', 'custom_questions'}
+               'question_indices', 'custom_questions', 'summarizer_model_path'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -84,6 +84,10 @@ def validate_params(raw, dataset, default_dtype='float16'):
     if mode != 'compression' and ('question_indices' in raw or 'custom_questions' in raw):
         raise ValueError('Multiple questions are supported in compression mode')
     if mode == 'compression':
+        path = raw.get('summarizer_model_path')
+        if path is not None and (not isinstance(path, str) or not path.strip()):
+            raise ValueError('summarizer_model_path must be a nonempty string or null')
+        compression['summarizer_model_path'] = path.strip() if path is not None else None
         indices = raw.get('question_indices', [question])
         custom = raw.get('custom_questions', [])
         if not isinstance(indices, list) or any(type(i) is not int or not 0 <= i < len(record['conversations']) for i in indices):
@@ -134,13 +138,22 @@ class ObservationService:
                 raise ValueError(f'Local model config not found: {model_path}')
             model_source = str(model_path)
             paths += sorted(p for p in model_path.iterdir() if p.is_file())
+        summarizer_source = params.get('summarizer_model_path')
+        if summarizer_source is not None:
+            summary_path = Path(summarizer_source)
+            if summary_path.is_dir():
+                summary_path = summary_path.resolve()
+                if not (summary_path / 'config.json').is_file():
+                    raise ValueError(f'Local summarizer config not found: {summary_path}')
+                summarizer_source = str(summary_path)
+                paths += sorted(p for p in summary_path.iterdir() if p.is_file())
         signature = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
         code = hashlib.sha256()
         for p in sorted(list(Path(__file__).parent.glob('*.py')) + list((ROOT/'model/suprkv').glob('*.py')) + [ROOT/'model/rekv/patch.py']):
             code.update(p.read_bytes())
         versions = {name: importlib.metadata.version(name) for name in ['torch', 'transformers', 'numpy']}
         value = dict(params=params, files=signature, code=code.hexdigest(), versions=versions,
-                     device=self.args.device, model_source=model_source)
+                     device=self.args.device, model_source=model_source, summarizer_source=summarizer_source)
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:24]
 
     def submit(self, raw):
@@ -227,7 +240,7 @@ class ObservationService:
             if 'segment_experiment' in result:
                 result['segment_experiment']['token_similarity']['url'] = f'/api/token-similarity/{job_id}'
                 result['segment_experiment']['segment_attention']['url'] = f'/api/segment-attention/{job_id}'
-            result.update(schema_version=26, job_id=job_id, sample=record, parameters=params,
+            result.update(schema_version=27, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'

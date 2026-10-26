@@ -1,4 +1,4 @@
-"""Paired, single-model streaming-cache comparison for Observation."""
+"""Paired streaming-cache comparison for Observation."""
 from contextlib import contextmanager
 from dataclasses import asdict
 import gc
@@ -9,6 +9,7 @@ import torch
 from model.suprkv.onevision import OneVisionEngine
 from model.suprkv.profiling import StageProfiler
 from model.suprkv.runtime import StreamingConfig
+from model.suprkv.summarizer import OneVisionSummarizer, SummarizerLoadError
 
 
 STAGES = [
@@ -16,6 +17,7 @@ STAGES = [
     ('vision_encoding', '视觉特征提取', False),
     ('video_encoding', '视频编码与入库', False),
     ('segmentation', '在线分段', True),
+    ('summarizer_vision_encoding', '摘要模型视觉编码', True),
     ('summary_generation', '生成 segment summary', True),
     ('summary_query', '提取 summary Query', True),
     ('token_scoring', 'Token 评分与分类', True),
@@ -30,7 +32,7 @@ STAGES = [
 
 
 @contextmanager
-def borrowed_engine(model, processor, config, profiler, check_cancel):
+def borrowed_engine(model, processor, config, profiler, check_cancel, summarizer=None):
     """Restore native forwards and all patch attributes, including on cancellation."""
     decoder = model.model.language_model
     saved = []
@@ -42,12 +44,14 @@ def borrowed_engine(model, processor, config, profiler, check_cancel):
     engine = None
     try:
         engine = OneVisionEngine(config, model=model, processor=processor,
-                                 profiler=profiler, check_cancel=check_cancel)
+                                 profiler=profiler, check_cancel=check_cancel, summarizer=summarizer)
         yield engine
     finally:
         if engine is not None:
             engine.cache = None
-            engine.features, engine.frame_info = [], []
+            engine.clear_segment()
+            engine.summarizer = None
+            engine.main_summarizer = None
             engine.segmenter.previous = None
         for module, name, owned, value in reversed(saved):
             if owned:
@@ -68,6 +72,29 @@ def cuda_memory(device):
 
 def run_pass(model, processor, images, frames, questions, config, compressed, progress, check_cancel,
              on_snapshot=None, question_progress=None):
+    summarizer = None
+    load_seconds = 0.
+    try:
+        if compressed and config.get('summarizer_model_path'):
+            check_cancel()
+            began = time.perf_counter()
+            device = model.model.language_model.get_input_embeddings().weight.device
+            summarizer = OneVisionSummarizer.load(config['summarizer_model_path'], device, model.dtype)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            load_seconds = time.perf_counter()-began
+            check_cancel()
+        result = _run_pass(model, processor, images, frames, questions, config, compressed,
+                           progress, check_cancel, on_snapshot, question_progress, summarizer)
+        result['summarizer_load_seconds'] = load_seconds
+        return result
+    finally:
+        summarizer = None
+        gc.collect()
+
+
+def _run_pass(model, processor, images, frames, questions, config, compressed, progress, check_cancel,
+              on_snapshot, question_progress, summarizer):
     device = model.model.language_model.get_input_embeddings().weight.device
     gc.collect()
     if device.type == 'cuda':
@@ -77,7 +104,7 @@ def run_pass(model, processor, images, frames, questions, config, compressed, pr
     initial_memory = cuda_memory(device)
     profiler = StageProfiler(device)
     began = time.perf_counter()
-    with borrowed_engine(model, processor, dict(config, compression_enabled=compressed), profiler, check_cancel) as engine:
+    with borrowed_engine(model, processor, dict(config, compression_enabled=compressed), profiler, check_cancel, summarizer) as engine:
         timeline, commits = [], []
         last_commit = None
         reporting_seconds = 0.
@@ -136,7 +163,7 @@ def run_pass(model, processor, images, frames, questions, config, compressed, pr
         profiler.synchronize()
         end_memory = cuda_memory(device)
         return dict(status='complete', answer=answers[0], answers=answers, timeline=timeline, commits=commits,
-                    cache=cache_stats, timings=profiler.result(), encoding_seconds=encoding_seconds,
+                    cache=cache_stats, model_stats=engine.stats(), timings=profiler.result(), encoding_seconds=encoding_seconds,
                     total_seconds=time.perf_counter()-began-reporting_seconds, reporting_seconds=reporting_seconds,
                     initial_cuda=initial_memory,
                     cuda_after_encoding=memory_before_answer, cuda_after_answer=end_memory)
@@ -172,6 +199,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
     if not frames or len(images) != len(frames):
         raise ValueError('Compression comparison requires matching nonempty frames/images')
     config = asdict(StreamingConfig(model_path=observation.model_path, device=observation.device,
+        summarizer_model_path=params.get('summarizer_model_path'),
         budget_tokens=params['compression_budget_tokens'], topk=params['compression_topk'],
         recent_frames=params['compression_recent_frames'], max_segment_frames=params['compression_max_segment_frames'],
         min_segment_frames=params['segment_min_frames'], ema_alpha=params['segment_ema_alpha'],
@@ -189,12 +217,17 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         def report_question(number, total):
             progress('compression_'+name, f'{label}：回答问题 {number}/{total}', .45+.4*index+.1*(number-1)/total)
         try:
+            if compressed and config['summarizer_model_path']:
+                progress('loading_summarizer', '加载独立摘要模型', .55)
             runs[name] = run_pass(observation.model, observation.processor, images, frames, questions,
                                  config, compressed, report, check_cancel,
                                  (lambda point: on_snapshot(name, point)) if on_snapshot is not None else None,
                                  report_question)
+        except (torch.cuda.OutOfMemoryError, SummarizerLoadError):
+            raise
         except (RuntimeError, ValueError) as error:
-            runs[name] = dict(status='failed', error=f'{type(error).__name__}: {error}')
+            runs[name] = dict(status='failed', error=f'{type(error).__name__}: {error}',
+                             model_stats=dict(model_instances=1 + bool(compressed and config['summarizer_model_path'])))
         check_cancel()
     before, after = runs['before'], runs['after']
     # Share the compressed run's semantic segments; the baseline does not segment.
@@ -225,7 +258,9 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         question=questions[0]['question'], question_index=questions[0]['question_index'], questions=questions,
         frame_count=len(frames),
         cutoff_timestamp=frames[-1]['timestamp'], config=config, runs=runs, memory=memory, stages=stages,
-        method=dict(model_instances=1, execution='sequential', cache_device=observation.device, dtype=dtype,
+        method=dict(model_instances=after.get('model_stats', {}).get('model_instances', 1),
+            summarizer_model_path=config['summarizer_model_path'],
+            execution='sequential', cache_device=observation.device, dtype=dtype,
             offload=False, baseline=f'same streaming encoding and top-k retrieval; all {dtype}; no compression or summaries',
             timing='exclusive wall time, CUDA synchronized at stage boundaries; excludes model loading and video decoding',
             memory='unique persistent tensor storage; CUDA allocated/peak include weights and workspaces; reserved allocator memory is not savings',

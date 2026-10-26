@@ -2,7 +2,28 @@
 
 Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --method suprkv`。`video_qa.suprkv_stream_vqa` 中的 `SuPrKVStreamVQA` 与原 `ReKVStreamVQA` 一样继承 `BaseVQA`，复用 `work()` 加载数据和模型、`analyze()` 遍历视频和保存 CSV。`video_qa.run_eval` 中的 `eval_rvs_ego` 和 `eval_rvs_movie` 分别实现各自的启动、合并和评分流程，并按 `--method` 选择 ReKV 或 SuPr-KV；测试与性能基准文件统一使用 `suprkv` 命名。
 
-采用 ReKV 单进程顺序执行方式的单模型、GPU 常驻压缩后端，支持 LLaVA-OneVision Qwen2 checkpoint。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
+采用 ReKV 单进程顺序执行方式的 GPU 常驻压缩后端（默认单模型，可选独立摘要模型），支持 LLaVA-OneVision Qwen2 checkpoint。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
+
+## 独立摘要模型
+
+默认由主模型生成 segment summary。通过参数启用独立 OneVision：
+
+```bash
+bash run_suprkv.sh \
+  --summarizer-model-path llava-hf/llava-onevision-qwen2-0.5b-ov-hf
+```
+
+Python 使用 `StreamingConfig(summarizer_model_path="llava-hf/llava-onevision-qwen2-0.5b-ov-hf")`。
+参数接受 Hugging Face ID 或本地 OneVision 目录；`None` 使用主模型。两模型同进程、同设备、同浮点精度，
+各自使用视觉编码器、projector 和 tokenizer，不共享投影特征。小模型仅生成文本，主模型重新分词并提取
+各层 RoPE 前 Query；摘要提示词、生成上限及 KV 评分策略沿用原实现。
+
+两个模型的上下文上限都参与闭段判断。开放段保留两套视觉特征，供小模型失败时主模型重试一次。
+空摘要或可恢复的视觉/生成错误触发重试；重试失败时全段按高分处理并执行原有预算策略。
+加载失败、CUDA OOM 和取消直接传播。未启用压缩时不加载独立模型。
+
+默认结果目录不变；独立模型追加 `summarizer_<模型名>-<完整路径字符串 SHA-256 前8位>` 子目录。
+启用小模型会增加常驻权重和段特征占用；显存、速度和问答质量需分别测量。
 
 ## 运行
 
@@ -32,7 +53,7 @@ SuPr-KV 支持 `rvs_ego`、`rvs_movie` 两个流式开放问答数据集，使�
 
 离线数据集支持 `mlvu`、`qaego4d`、`egoschema`、`activitynet_qa` 和 `cgbench`，例如 `python -m video_qa.run_eval --method suprkv --dataset qaego4d --max_samples 5`。`SuPrKVOfflineVQA` 逐帧编码完整视频并结束最后一个片段，再复用该视频缓存回答全部问题，无需 `end_time`。开放题沿用 ReKV 的输出字段；选择题另存 `choices`、`correct_choice`、`pred_choice`、`qa_acc`（百分数），`question_type` 映射为 `task`。无公开答案时沿用 ReKV 取首个选项的约定，此时 `qa_acc` 不能视为真实准确率。离线开放题直接复用 `ReKVOfflineVQA.video_open_qa`，选择题复用 `BaseVQA.format_mcqa_prompt` 和 ReKV 的 OneVision 对话模板：检索仅输入原始问题；选择题生成 prompt 包含选项，并以 `Best option: (` 开始回答。开放题默认生成 1024 个新 token、选择题生成 16 个，覆盖 runtime 的 `--max_new_tokens`。两者均使用贪心生成和 EOS 停止，解码清理及非空答案的选项解析与 ReKV 一致；SuPr-KV 保留空选择题答案记错的处理。只生成离线预测可运行 `python -m video_qa.suprkv_offline_vqa --anno_path data/qaego4d/test_mc.json --save_dir results/suprkv_offline`。
 
-每个 worker 仅加载一次模型，在视频之间调用 `reset()`。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，沿用原 ReKV 的编号方式，由 worker 索引分配 GPU（第 0 个 worker 使用 GPU 0，以此类推）。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的 checkpoint；仅支持 OneVision Qwen2 系列。
+每个 worker 的主模型及可选摘要模型均只加载一次，在视频之间调用 `reset()` 复用权重。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，沿用原 ReKV 的编号方式，由 worker 索引分配 GPU（第 0 个 worker 使用 GPU 0，以此类推）。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的 checkpoint；仅支持 OneVision Qwen2 系列。
 
 `--n_local` 是 ReKV 的局部注意力窗口，不能作为 SuPr-KV 预算使用；SuPr-KV 模式会明确拒绝该参数。使用 `--budget_tokens` 设置压缩缓存预算、`--recent_frames` 设置保护的最近帧数。SuPr-KV 扩展参数同时接受下划线和连字符写法。
 
@@ -162,10 +183,14 @@ python tests/benchmark_suprkv_accounting.py \
 | `commits[].before_bytes/after_bytes` | 段提交时压缩前后的持久缓存字节 |
 | `memory.persistent_bytes` | 当前持久缓存占用 |
 | `memory.cache_device / offload_enabled` | 缓存设备 / 固定为 false |
-| `runtime.inference_pid / model_instances / execution_mode` | 当前调用方 PID / 单模型实例 / sequential |
-| `memory.model_parameter_bytes` | 当前模型参数的字节数 |
+| `runtime.inference_pid / model_instances / execution_mode` | 当前调用方 PID / 模型实例数（默认 1，独立摘要模式 2）/ sequential |
+| `memory.model_parameter_bytes` | 主模型及独立摘要模型参数的总字节数 |
+| `memory.summarizer_parameter_bytes / summarizer_model_path` | 独立摘要模型权重字节 / 模型路径；默认 0 / null |
+| `memory.summarizer_failures / summary_retries / summary_failures` | 本视频小模型失败段数 / 主模型重试次数 / 最终摘要或 Query 失败次数 |
+| `memory.last_summary` | 最近提交的摘要、实际来源、原始错误及重试结果 |
+| `memory.summarizer_vision_seconds` | 小模型视觉编码累计耗时，包含在 encode_seconds 中 |
 | `memory.cache_working_bytes` | 开放段、旧快照等额外缓存占用（当前值） |
-| `memory.feature_working_bytes` | 待总结段的视觉语言特征占用 |
+| `memory.feature_working_bytes` | 待总结段的两套视觉语言特征总占用（默认只有主模型） |
 | `gpu_peak_bytes` | 对应进程 PyTorch 分配显存峰值，包含模型权重 |
 | `process_peak_rss_bytes` | 对应进程 RSS 高水位，包含模型加载 |
 | `memory.bits` | 高分区各位宽的“层×帧”记录数；兼容键 `0` 保留且为 0，低分区删除见 `memory.counts` |
@@ -173,7 +198,7 @@ python tests/benchmark_suprkv_accounting.py \
 | `summary_seconds/score_compress_seconds/encode_seconds` | 当前进程中编码相关累计耗时；编码时间不含闭段 summary |
 | `answers[].qa_seconds` | 同步问题检索与完整答案生成耗时 |
 
-分段/summary 的存在会增加编码延迟。此实现验证功能和预算约束，不预设答案质量提升或实时吞吐达标。OneVision 当前要求每帧 196 个语言模型 token；模型配置不匹配时明确报错。PM-KVQ 仅作为算法参考，不需要安装其旧版 Transformers Cache 类。
+分段/summary 的存在会增加编码延迟。此实现验证功能和预算约束，不预设答案质量提升或实时吞吐达标。主模型 OneVision 当前要求每帧 196 个语言模型 token；模型配置不匹配时明确报错。PM-KVQ 仅作为算法参考，不需要安装其旧版 Transformers Cache 类。
 
 ## 验证
 

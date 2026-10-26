@@ -309,19 +309,36 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 结果包含：
 
 - **显存**：持久 KV 张量字节、编码结束时 `torch.cuda.memory_allocated`、全程 `max_memory_allocated` 分别比较；显示节省量、比例及可拖动的逐帧曲线。负的节省量表示增加。KV 载荷包括 scale/offset、索引及检索代表向量，不包括 Python 元数据；预算仍按管理器总字节检查。CUDA 总量包含模型权重与临时张量，allocator reserved 不作为节省量。
-- **开销**：初始化、视觉编码、视频入库、分段、summary 生成、summary Query 提取、token 评分、量化、低分 token 删除、整帧淘汰、段提交、问题检索、KV 读取/反量化/拼接和答案生成，共 14 个互斥阶段。CUDA 在边界同步，父阶段扣除子阶段。表格给出压缩前、压缩后及差值，支持 CSV 下载；未触发阶段为 0，失败侧为缺失值。
+- **开销**：初始化、视觉编码、视频入库、分段、summary 生成、summary Query 提取、token 评分、量化、低分 token 删除、整帧淘汰、段提交、问题检索、KV 读取/反量化/拼接和答案生成，增加可选摘要模型的视觉编码后共 15 个互斥阶段。CUDA 在边界同步，父阶段扣除子阶段。表格给出压缩前、压缩后及差值，支持 CSV 下载；未触发阶段为 0，失败侧为缺失值。
 - **回答**：支持勾选多个标注问题，或输入自定义问题（每行一个），合计 1–32 题。每侧只编码一次视频，在最后一帧后按列表顺序独立回答，共用视频缓存，不带入上一题的回答。通过问题下拉框切换压缩前后回答、命中帧及生成终止原因；参考答案只用于展示，不作为输入。
 - **命中折线图**：横轴分别为帧 ID 和 Segment ID，纵轴为问题检索命中次数。灰色虚线表示原精度，青色实线表示压缩缓存。可查看全部问题累计值或单题的 0/1 命中，悬停或键盘聚焦数据点查看数值，并导出当前统计范围的 CSV。跨层检索同一帧每题只计一次，包含 recent 帧；某段任意成员帧命中则该段本题计一次，不将段内帧次数相加。两侧都使用压缩侧实际观察到的分段进行聚合；基线本身仍不执行分段。压缩侧失败时 Segment 统计缺失，已淘汰帧仍保留在帧曲线中。
 
 对照使用**同一份按网页所选 dtype 加载的模型**，先完整运行原精度 缓存基线，再清理缓存并运行压缩路径。两边使用相同帧、初始化提示词、recent 编码窗口、top-k 检索和贪心生成参数。基线不做 summary、评分、量化或淘汰；它不是原注意力观察的完整上下文 prefill。实验在最后一张选中帧处提问，输入范围由采样参数决定，不自动以标注问题结束时间截断。
 
-该模式调用实际 `model/suprkv` 压缩算法：RoPE 后 K 按 channel 量化、V 按 token 量化，首次原精度→INT16→INT8，再按预算降位/删除；不 offload。结束或取消时恢复 observation 原生前向，原注意力及 segment 观察保持可用。相同 dtype 的任务复用模型，切换 dtype 时先释放旧模型再加载；每次对照的两侧共用同一模型。计算任务仍由原服务的单工作线程串行执行。
+该模式调用实际 `model/suprkv` 压缩算法：RoPE 后 K 按 channel 量化、V 按 token 量化，首次原精度→INT16→INT8，再按预算降位/删除；不 offload。结束或取消时恢复 observation 原生前向，原注意力及 segment 观察保持可用。相同 dtype 的任务复用模型，切换 dtype 时先释放旧模型再加载；每次对照的两侧共用同一问答模型。计算任务仍由原服务的单工作线程串行执行。
 
 首次 INT8 压缩在 CUDA kernel 内完成 INT16 code 计算与整数降位，不再分配中间 INT16 缓存；后续降位同时更新 code 与 scale。量化/降位/反量化的变长 token 数与步长使用运行时参数，避免各帧、各层保留长度不同而反复编译。完整压缩 attention 在本模式中仍默认关闭。本次已复现并修复量化和 KV 读取的变长形状编译回归；固定形状预热基准不能反映这项成本，复现方法见 `model/suprkv/README.md` 的变长回放说明。
 
-计时不含模型加载和视频解码，属于单次、基线先执行的配对测量；首次 kernel 初始化会影响耗时。两侧测量前各自清理 allocator 缓存并重置峰值，避免把第一侧的显存峰值带到第二侧。单侧 OOM 或预算过小会单独显示错误，不伪造节省值。取消任务不发布完整结果。
+计时不含模型加载和视频解码，属于单次、基线先执行的配对测量；首次 kernel 初始化会影响耗时。两侧测量前各自清理 allocator 缓存并重置峰值，避免把第一侧的显存峰值带到第二侧。预算过小会在对应侧显示错误；CUDA OOM 直接终止任务，不触发摘要重试，也不伪造节省值。取消任务不发布完整结果。
 
 API 沿用 `POST /api/jobs`，设置 `mode="compression"` 及 `compression_budget_tokens`、`compression_recent_frames`、`compression_topk`、`compression_max_segment_frames`。结果 `compression_experiment` 包含 `runs.before/after`、`memory`、`stages`、逐帧 `timeline` 和提交记录。JSON 导出包含全部口径和配置。缓存指纹包含压缩算法源码及参数，修改量化或策略代码后自动重新计算。
+
+压缩参数区的「摘要模型」提供主模型（默认）、LLaVA-OneVision 0.5B、自定义 OneVision 三种选择。
+自定义路径支持 Hugging Face ID 或本地目录；API 使用 `summarizer_model_path`，默认 `null`。
+普通视频/问题观察不使用该参数，其分段与摘要流程保持原行为。
+
+小模型仅在压缩侧加载，跟随主模型设备和网页所选 dtype，任务结束、失败或取消后释放。
+每个任务先执行不含小模型的 baseline，再加载小模型并重置压缩侧 CUDA 峰值。
+`runs.after.summarizer_load_seconds` 单列加载耗时，不计入编码/阶段计时，计入任务总时间。
+CUDA 分配量及峰值包含压缩侧新增权重；持久 KV 预算不包含模型权重。
+小模型空摘要或可恢复错误由主模型重试一次，失败后按原策略全段高分保留；OOM、取消和加载失败不重试。
+
+`schema_version=27` 新增每侧 `model_stats`（实际实例数、总权重、独立模型权重及重试/失败计数）。
+`commits[]` 记录自动闭段和末段提交的 `summary`、`summary_source`、`summarizer_error`、
+`summary_retried`、`summary_retry_succeeded`、`summary_error`；重试成功也保留首次错误。
+`summary_retry_succeeded` 表示重试是否生成非空文本，后续 Query 失败单独体现在 `summary_error`。
+页面的「Segment 摘要与实际来源」表显示逐段文本、实际生成模型及重试结果；JSON 导出保存全部字段，页面支持读取缺少这些字段的旧结果。模型配置、摘要后端源码和本地模型文件签名
+纳入缓存指纹，切换摘要模型不会复用另一配置的结果。
 
 多问题参数为 `question_indices`（标注问题的零基索引列表，保留提交顺序）和 `custom_questions`（随后回答的自定义问题字符串列表，每题最多 2000 字符）。可传空的 `question_indices` 仅问自定义问题；省略时沿用单个 `question_index`。`schema_version=25` 新增 `compression_experiment.questions`、每侧 `answers` 和 `retrieval_stats`，其中 `frame_hits` 保存每帧累计次数、时间戳和分段，`segment_hits` 保存每段累计次数及成员帧。每题答案带 `question_id`、`question_index`、`hit_frames` 和 `hit_segments`；自定义题的 `question_index=null`。原 `question`、`question_index`、`answer` 字段保留第一题，兼容单题结果读取。所有问题均在编码结束后提出，因此本批命中统计不会追溯影响已经完成的淘汰。
 

@@ -1,5 +1,6 @@
 """Single-process OneVision model. Native isolated summaries, ReKV streaming attention."""
 from contextlib import contextmanager
+from functools import partial
 import time
 import resource
 import os
@@ -9,11 +10,12 @@ from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionP
 
 from model.rekv.patch import patch_hf
 from observation.engine import INIT_PROMPT, question_inputs, greedy_token_ids
-from observation.segments import SUMMARY_SYSTEM, summary_prompt, selected_vision_features, capture_queries
+from observation.segments import selected_vision_features, capture_queries
 from .attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
 from .cache import StreamingKVCache
 from .segments import OnlineSegmenter
 from .profiling import stage, measure
+from .summarizer import OneVisionSummarizer, Summarizer, validate_summarizer_path
 
 
 @contextmanager
@@ -30,7 +32,8 @@ def native_decoder(decoder):
 
 
 class OneVisionEngine:
-    def __init__(self, config, *, model=None, processor=None, profiler=None, check_cancel=lambda: None):
+    def __init__(self, config, *, model=None, processor=None, profiler=None,
+                 check_cancel=lambda: None, summarizer: Summarizer | None = None):
         self.config = config
         self.profiler = profiler
         self.check_cancel = check_cancel
@@ -62,13 +65,22 @@ class OneVisionEngine:
                  n_local=local, n_init=self.sink_tokens,
                  packed_attention=config.get('packed_attention', False),
                  fattn=str(device).startswith('cuda') and self.dtype != torch.float32)
+        self.main_summarizer = OneVisionSummarizer(self.model, self.processor,
+            config.get('model_path', 'main'), partial(native_decoder, self.decoder))
+        path = validate_summarizer_path(config.get('summarizer_model_path'))
+        self.summarizer = None
+        if self.compression_enabled:
+            self.check_cancel()
+            self.summarizer = summarizer if summarizer is not None else (
+                OneVisionSummarizer.load(path, self.device, self.dtype) if path else None)
+            self.check_cancel()
         self.features, self.frame_info = [], []
         self.cache = None
         self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.)
         self.reset()
 
     def _set_window(self, mode, max_new_tokens=None):
-        limit = self.config['max_new_tokens'] if max_new_tokens is None else max_new_tokens
+        limit = self.config.get('max_new_tokens', 256) if max_new_tokens is None else max_new_tokens
         window = (self.config['recent_frames']*self.frame_tokens if mode == 'encode' else
                   self.config['topk']*self.frame_tokens+limit+1024)
         for layer in self.decoder.layers:
@@ -86,24 +98,35 @@ class OneVisionEngine:
                                       dtype=self.dtype)
         self.segmenter = OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
                                          self.config['max_segment_frames'])
-        self.features, self.frame_info = [], []
-        self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.)
+        self.clear_segment()
+        self.summary_counts = dict(summarizer_failures=0, summary_retries=0, summary_failures=0)
+        self.last_summary = None
+        self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.,
+                            summarizer_vision_seconds=0.)
 
-    def _summary_ids(self, frames):
-        system = f'<|im_start|>system\n{SUMMARY_SYSTEM}<|im_end|><|im_start|>user\n'
-        system_ids = self.tokenizer(system, return_tensors='pt').input_ids.to(self.device)
-        suffix = question_inputs(self.tokenizer, summary_prompt(frames)).to(self.device)
-        return system_ids, suffix
+    def clear_segment(self):
+        self.features, self.frame_info, self.summarizer_features = [], [], []
+        self.summarizer_error = ''
 
     def _summary_length(self, features, frames):
-        system_ids, suffix = self._summary_ids(frames)
-        return system_ids.shape[1] + suffix.shape[1] + sum(f.shape[1] for f in features)
+        return self.main_summarizer.context_length(features, frames)
 
-    def _summary_inputs(self, features, frames):
-        system_ids, suffix = self._summary_ids(frames)
-        embedding = self.decoder.get_input_embeddings()
-        visual = torch.cat([f.to(self.device) for f in features], 1)
-        return torch.cat([embedding(system_ids), visual, embedding(suffix)], 1)
+    @staticmethod
+    def _recoverable_error(exc):
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            raise exc
+        return f'{type(exc).__name__}: {exc}'[:256]
+
+    def _external_feature(self, image):
+        began = time.monotonic()
+        try:
+            self.check_cancel()
+            with measure(self.profiler, 'summarizer_vision_encoding'):
+                return self.summarizer.encode_frame(image), ''
+        except (ValueError, RuntimeError) as exc:
+            return None, self._recoverable_error(exc)
+        finally:
+            self.timings['summarizer_vision_seconds'] += time.monotonic()-began
 
     @torch.inference_mode()
     @stage('video_encoding')
@@ -122,21 +145,41 @@ class OneVisionEngine:
             if feature.shape[1] != self.frame_tokens:
                 raise ValueError(f'Expected {self.frame_tokens} frame tokens; got {feature.shape[1]}')
         info = dict(index=self.cache.next_id, timestamp=float(timestamp))
+        summary_feature = None
         if self.compression_enabled:
+            reserve = self.config['summary_max_new_tokens']
             with measure(self.profiler, 'segmentation'):
                 raw = selected_vision_features(output, self.model.config.vision_feature_layer,
                                               self.model.config.vision_feature_select_strategy)
                 boundary = self.segmenter.push(raw[0])
-                info = dict(index=self.cache.next_id, timestamp=float(timestamp))
-                # Check the exact summary prompt size, including timestamps and generation reserve.
-                context_full = self._summary_length(self.features+[feature], self.frame_info+[info]) + self.config['summary_max_new_tokens'] > self.decoder.config.max_position_embeddings
-                if self.features and (boundary or context_full):
+                context_full = self._summary_length(self.features+[feature], self.frame_info+[info]) + reserve > self.main_summarizer.context_limit
+            if self.features and (boundary or context_full):
+                close_started = time.monotonic()
+                self.close_segment(reset_segmenter=False)
+                closed_seconds += time.monotonic()-close_started
+                self.segmenter.count = 1
+            if self._summary_length([feature], [info]) + reserve > self.main_summarizer.context_limit:
+                raise ValueError('Even one frame plus summary prompt exceeds the model context')
+            if self.summarizer is not None and not self.summarizer_error:
+                summary_feature, failure = self._external_feature(image)
+                external_full = False
+                if not failure:
+                    try:
+                        length = self.summarizer.context_length(self.summarizer_features+[summary_feature], self.frame_info+[info])
+                        external_full = length + reserve > self.summarizer.context_limit
+                        if self.summarizer.context_length([summary_feature], [info]) + reserve > self.summarizer.context_limit:
+                            raise ValueError('One frame exceeds summarizer context capacity')
+                    except (ValueError, RuntimeError) as exc:
+                        failure = self._recoverable_error(exc)
+                if self.features and external_full:
                     close_started = time.monotonic()
                     self.close_segment(reset_segmenter=False)
                     closed_seconds += time.monotonic()-close_started
                     self.segmenter.count = 1
-                if self._summary_length([feature], [info]) + self.config['summary_max_new_tokens'] > self.decoder.config.max_position_embeddings:
-                    raise ValueError('Even one frame plus summary prompt exceeds the model context')
+                if failure:
+                    self.summarizer_error = failure
+                    self.summarizer_features = []
+                    summary_feature = None
         contexts = []
         recent = [self.cache.frames[i] for i in self.cache.recent_ids]
         for layer, (sink_k, sink_v) in enumerate(self.cache.sink):
@@ -158,6 +201,8 @@ class OneVisionEngine:
             self.timings['encode_seconds'] += time.monotonic()-began
             return
         self.features.append(feature.detach().clone())
+        if summary_feature is not None:
+            self.summarizer_features.append(summary_feature)
         self.frame_info.append(info)
         self.timings['encode_seconds'] += time.monotonic()-began-closed_seconds
         if self.segmenter.count >= self.segmenter.max_frames:
@@ -173,42 +218,65 @@ class OneVisionEngine:
             return self.stats()
         began = time.monotonic()
         queries, error, text = None, '', ''
+        first_error = self.summarizer_error
+        retried = False
+        source = self.summarizer.model_path if self.summarizer is not None else self.main_summarizer.model_path
         try:
-            with native_decoder(self.decoder):
-                with measure(self.profiler, 'summary_generation'):
-                    inputs = self._summary_inputs(self.features, self.frame_info)
-                    output = self.decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
-                    ids, _ = greedy_token_ids(self.decoder, self.model.lm_head, output,
-                        self.config['summary_max_new_tokens'], {self.tokenizer.eos_token_id}, self.check_cancel)
-                    text = self.tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
-                    del output, inputs
-                if text:
-                    with measure(self.profiler, 'summary_query'):
-                        content = self.tokenizer(text, add_special_tokens=False, return_tensors='pt').input_ids.to(self.device)
-                        combined = torch.cat([self.prefix, content], 1)
-                        queries = [None]*len(self.decoder.layers)
-                        def capture(layer, states):
-                            attention = self.decoder.layers[layer].self_attn
-                            queries[layer] = states[0, self.prefix.shape[1]:].reshape(-1,
-                                attention.config.num_attention_heads, attention.head_dim).detach().clone()
-                        with capture_queries(self.decoder, capture):
-                            self.decoder(input_ids=combined, use_cache=False, return_dict=True)
-                else:
+            with measure(self.profiler, 'summary_generation'):
+                if self.summarizer is not None:
+                    if not first_error:
+                        try:
+                            text = self.summarizer.generate(self.summarizer_features, self.frame_info,
+                                self.config['summary_max_new_tokens'], self.check_cancel).strip()
+                            if not text:
+                                first_error = 'summary_empty'
+                        except (ValueError, RuntimeError) as exc:
+                            first_error = self._recoverable_error(exc)
+                    if first_error:
+                        self.summary_counts['summarizer_failures'] += 1
+                        self.summary_counts['summary_retries'] += 1
+                        retried = True
+                if self.summarizer is None or retried:
+                    source = self.main_summarizer.model_path
+                    text = self.main_summarizer.generate(self.features, self.frame_info,
+                        self.config['summary_max_new_tokens'], self.check_cancel).strip()
+                if not text:
                     error = 'summary_empty'
+            if text:
+                with native_decoder(self.decoder), measure(self.profiler, 'summary_query'):
+                    content = self.tokenizer(text, add_special_tokens=False, return_tensors='pt').input_ids.to(self.device)
+                    combined = torch.cat([self.prefix, content], 1)
+                    queries = [None]*len(self.decoder.layers)
+                    def capture(layer, states):
+                        attention = self.decoder.layers[layer].self_attn
+                        queries[layer] = states[0, self.prefix.shape[1]:].reshape(-1,
+                            attention.config.num_attention_heads, attention.head_dim).detach().clone()
+                    with capture_queries(self.decoder, capture):
+                        self.decoder(input_ids=combined, use_cache=False, return_dict=True)
         except (ValueError, RuntimeError) as exc:
-            if isinstance(exc, torch.cuda.OutOfMemoryError):
-                raise
-            error = f'{type(exc).__name__}: {exc}'[:256]
+            error = self._recoverable_error(exc)
+            queries = None
         self.timings['summary_seconds'] += time.monotonic()-began
+        if error:
+            self.summary_counts['summary_failures'] += 1
+        record = dict(segment_id=self.cache.segment_id, summary=text, summary_source=source,
+                      summarizer_error=first_error, summary_retried=retried,
+                      summary_retry_succeeded=bool(text) if retried else None, summary_error=error)
         began = time.monotonic()
-        cache_stats = self.cache.close_segment(queries, error)
+        try:
+            cache_stats = self.cache.close_segment(queries, error)
+        finally:
+            self.clear_segment()
         self.timings['score_compress_seconds'] += time.monotonic()-began
-        self.features, self.frame_info = [], []
+        # Store only the latest record; observation copies each commit into its artifact.
+        self.last_summary = record
+        if self.cache.last_event is not None:
+            self.cache.last_event.update(record)
+            cache_stats['last_event'] = dict(self.cache.last_event)
         if reset_segmenter:
             self.segmenter.close()
         stats = self.stats(cache_stats)
-        stats['summary'] = text
-        stats['summary_error'] = error
+        stats.update(record)
         return stats
 
     @torch.inference_mode()
@@ -250,9 +318,15 @@ class OneVisionEngine:
         result = self.cache.memory_stats() if cache_stats is None else dict(cache_stats)
         result.update(self.timings)
         result['inference_pid'] = os.getpid()
-        result['model_instances'] = 1
-        result['model_parameter_bytes'] = self._model_parameter_bytes
-        result['feature_working_bytes'] = sum(x.untyped_storage().nbytes() for x in self.features)
+        result['model_instances'] = 1 + (self.summarizer is not None)
+        extra_bytes = self.summarizer.parameter_bytes if self.summarizer is not None else 0
+        result['model_parameter_bytes'] = self._model_parameter_bytes + extra_bytes
+        result['summarizer_parameter_bytes'] = extra_bytes
+        result['summarizer_model_path'] = self.summarizer.model_path if self.summarizer is not None else None
+        result.update(self.summary_counts)
+        result['last_summary'] = self.last_summary
+        result['feature_working_bytes'] = sum(x.untyped_storage().nbytes()
+                                            for x in self.features + self.summarizer_features)
         result['process_peak_rss_bytes'] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024
         result['gpu_peak_bytes'] = torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else 0
         return result

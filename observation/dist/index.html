@@ -34,6 +34,10 @@
     <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。阈值倍数固定为 1；第一对帧初始化 EMA，后续距离超过历史 EMA 则切分。每段单独生成总结。</p>
     <div id="compressionControls" hidden>
       <div class="section-label">04 / KV 压缩对照</div>
+      <label for="compressionSummarizer">摘要模型</label>
+      <select id="compressionSummarizer"><option value="main">主模型（默认）</option><option value="llava-hf/llava-onevision-qwen2-0.5b-ov-hf">LLaVA-OneVision 0.5B</option><option value="custom">自定义 OneVision</option></select>
+      <div id="compressionSummarizerCustom" hidden><label for="compressionSummarizerPath">模型 ID 或本地目录</label><input id="compressionSummarizerPath" type="text" disabled placeholder="组织/模型名 或 /path/to/model"></div>
+      <p class="field-note">独立摘要模型与主模型同卡运行，仅压缩侧加载。摘要失败时由主模型重试。</p>
       <label>本次一起提问的标注问题</label>
       <div class="question-list-actions"><button id="compressionQuestionsAll" type="button" class="text-button">全选</button><button id="compressionQuestionsNone" type="button" class="text-button">清空</button></div>
       <div id="compressionQuestions" class="compression-question-list" role="group" aria-label="本次提问的标注问题"></div>
@@ -42,7 +46,7 @@
       <label for="compressionBudget">Memory budget / FP16 token 数</label><input id="compressionBudget" type="number" value="1024" min="1" max="10000000" required>
       <div class="field-pair"><div><label for="compressionRecent">Recent 保护帧数</label><input id="compressionRecent" type="number" value="2" min="1" max="128" required></div><div><label for="compressionTopk">检索帧数上限</label><input id="compressionTopk" type="number" value="64" min="1" max="512" required></div></div>
       <label for="compressionMaxSegment">每段最多帧数</label><input id="compressionMaxSegment" type="number" value="32" min="1" max="128" required>
-      <p class="field-note">同一模型顺序运行原精度与压缩缓存；使用上方的 EMA 和 summary 参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
+      <p class="field-note">同一问答模型顺序运行原精度与压缩缓存；使用上方的 EMA 和 summary 参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
     </div>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
@@ -72,6 +76,10 @@
       <div id="compressionFrameStates" class="compression-scroll"></div>
     </section>
     <section class="panel"><div class="panel-heading"><div><h2>各阶段耗时与新增开销</h2><p class="muted">互斥阶段计时：子阶段从父阶段扣除，避免重复累计。CUDA 在计时边界同步。</p></div><button id="compressionCsv" type="button" class="text-button">↓ 开销 CSV</button></div><div id="compressionCostChart"></div><div id="compressionCostTable" class="compression-scroll"></div><p id="compressionTimingNote" class="tiny"></p></section>
+    <section id="compressionSummariesPanel" class="panel" hidden>
+      <div class="panel-heading"><h2>Segment 摘要与实际来源</h2></div>
+      <div id="compressionSummariesTable" class="compression-scroll"></div>
+    </section>
     <section id="compressionHitsPanel" class="panel">
       <div class="panel-heading"><h2>Retrieve 命中分布</h2><button id="compressionHitsCsv" type="button" class="text-button">↓ 命中 CSV</button></div>
       <label for="compressionHitQuestion">统计范围</label><select id="compressionHitQuestion"></select>

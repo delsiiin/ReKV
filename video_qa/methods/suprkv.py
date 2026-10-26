@@ -1,3 +1,6 @@
+import hashlib
+import re
+
 from video_qa.model_paths import MODEL_PATHS, SUPRKV_MODELS
 from .common import Method, add_option, add_retrieval_arguments, retrieval_size
 
@@ -6,6 +9,8 @@ def add_suprkv_arguments(parser):
     # None preserves StreamingConfig defaults; forward only explicitly specified arguments.
     add_option(parser, '--model_path', '--model-path', type=str, default=None,
                         help='Model path or Hugging Face ID, overriding the preset path for --model.')
+    parser.add_argument('--summarizer_model_path', '--summarizer-model-path', default=None,
+                        help='Independent OneVision summary model ID or directory; default: use the main model.')
     parser.add_argument('--budget_tokens', '--budget-tokens', type=int, default=None,
                         help='Persistent KV cache budget in FP16-equivalent tokens (default: 8192).')
     parser.add_argument('--recent_frames', '--recent-frames', type=int, default=None,
@@ -19,7 +24,7 @@ def add_suprkv_arguments(parser):
     parser.add_argument('--max_segment_frames', '--max-segment-frames', type=int, default=None,
                         help='Maximum sampled frames per segment before summarization and compression (default: 32).')
     parser.add_argument('--summary_max_new_tokens', '--summary-max-new-tokens', type=int, default=None,
-                        help='Maximum tokens generated for segment summaries used to score KV importance (default: 128).')
+                        help='Maximum tokens generated for segment summaries used to score KV importance (default: 256).')
     add_option(parser, '--max_new_tokens', '--max-new-tokens', type=int, default=None,
                         help='Answer token limit; SuPr-KV streaming defaults to 256, native uses per-task defaults.')
     parser.add_argument('--packed_attention', '--packed-attention', action='store_true',
@@ -28,6 +33,7 @@ def add_suprkv_arguments(parser):
 
 def config_overrides(args):
     values = dict(model_path=args.model_path, budget_tokens=args.budget_tokens,
+                  summarizer_model_path=getattr(args, 'summarizer_model_path', None),
                   recent_frames=args.recent_frames, group_size=args.group_size,
                   ema_alpha=args.ema_alpha, min_segment_frames=args.min_segment_frames,
                   max_segment_frames=args.max_segment_frames,
@@ -50,7 +56,7 @@ def make_config(args):
 class SuPrKVMethod(Method):
     name = 'suprkv'
     defaults = dict(retrieve_size=64)
-    options = ('retrieve_size', 'model_path', 'device', 'budget_tokens', 'recent_frames',
+    options = ('retrieve_size', 'model_path', 'summarizer_model_path', 'device', 'budget_tokens', 'recent_frames',
                'group_size', 'ema_alpha', 'min_segment_frames', 'max_segment_frames',
                'summary_max_new_tokens', 'max_new_tokens', 'packed_attention')
 
@@ -68,8 +74,15 @@ class SuPrKVMethod(Method):
     def result_dir(self, args, dataset):
         budget = getattr(args, 'budget_tokens', None)
         budget = 8192 if budget is None else budget
-        return (f'results/suprkv/{args.model}/{dataset}/'
-                f'{retrieval_size(args)}-{args.sample_fps}/budget_{budget}')
+        directory = (f'results/suprkv/{args.model}/{dataset}/'
+                     f'{retrieval_size(args)}-{args.sample_fps}/budget_{budget}')
+        path = getattr(args, 'summarizer_model_path', None)
+        if path is not None:
+            path = path.strip()
+            name = re.sub(r'[^A-Za-z0-9_.-]', '_', path.rstrip('/').split('/')[-1])[:80]
+            digest = hashlib.sha256(path.encode()).hexdigest()[:8]
+            directory += f'/summarizer_{name}-{digest}'
+        return directory
 
     def devices(self, args, index):
         return str(index)
