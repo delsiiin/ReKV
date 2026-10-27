@@ -16,10 +16,12 @@ class Abstract_ReKV:
         self.topk = topk
         self.chunk_size = chunk_size
 
-    def clear_cache(self):
+    def clear_cache(self, *, release_allocator=False):
+        """Release video state; optionally return unused allocator memory too."""
         self.kv_cache = None
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        if release_allocator:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     @torch.inference_mode()
     def encode_init_prompt(self):
@@ -30,6 +32,38 @@ class Abstract_ReKV:
 
     def _get_video_features(self, pixel_values_videos):
         pass
+
+    @torch.inference_mode()
+    def create_kv_snapshot(self, position_bias):
+        from model.rekv.attention.snapshot import KVSnapshot, LayerSnapshot
+        layers = tuple(LayerSnapshot.capture(layer) for layer in self.kv_cache)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        return KVSnapshot(layers, ready, position_bias)
+
+    def _retrieve_question(self, input_ids, retrieved_indices=None, kv_snapshot=None):
+        if kv_snapshot is not None:
+            kv_snapshot.wait()
+            if retrieved_indices is not None and any(
+                    layer.block_size != self.n_frame_tokens for layer in kv_snapshot.layers):
+                raise ValueError('External retrieval requires one block per frame')
+            options = dict(rekv_position_bias=kv_snapshot.position_bias)
+            output = self.language_model(input_ids=input_ids, use_cache=True,
+                                         past_key_values=kv_snapshot.retrieval_contexts(retrieved_indices),
+                                         **options)
+            return output.past_key_values, options
+
+        try:
+            for layer in self.kv_cache:
+                layer.set_retrieval()
+                if retrieved_indices is not None:
+                    assert layer.block_size == self.n_frame_tokens
+                    layer.set_retrieved_block_indices(retrieved_indices)
+            output = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+            return output.past_key_values, {}
+        finally:
+            for layer in self.kv_cache:
+                layer.reset_retrieval()
 
     def _encode_video_chunk(self, video_chunk):
         pixel_values_videos = self.processor.video_processor(videos=video_chunk, do_sample_frames=False, return_tensors="pt").pixel_values_videos.to(self.device, self.dtype)  # (1, Nv, 3, H, W)

@@ -219,3 +219,122 @@ A new method implements the `Method` interface in `video_qa/methods/common.py`,
 registers its instance, and supplies `<method>_offline_vqa` and `<method>_stream_vqa`
 entry points (or overrides `solver`). Its `analyzer_kwargs` can add method-specific
 record metadata without introducing retrieval assumptions into `BaseVQA`.
+
+### Asynchronous ReKV streaming
+
+Add `--rekv_async` to overlap video encoding with question retrieval and generation
+on one GPU, using one model and a background answer thread:
+
+```bash
+python -m video_qa.run_eval --method rekv --model llava_ov_7b \
+    --dataset rvs_ego --num_chunks 1 --sample_fps 0.5 --rekv_async
+```
+
+The option defaults to off. `run_rekv.sh` enables it for its configured RVS-Ego
+run. It supports `rvs_ego`, `rvs_movie`, and the direct
+`python -m video_qa.rekv_stream_vqa` entry point. Async results go into an `async/`
+subdirectory of the usual result directory (including when using `--max_samples`
+or `--only_eval`). The direct worker similarly appends `async/` to `--save_dir`
+unless that path already ends in `async`. CSV columns and answer ordering are unchanged.
+Remove the flag to use the synchronous baseline.
+
+Each question receives a frozen video prefix using the existing
+`int(end_time * sample_fps)` sampled-array boundary. Encoding can advance while
+the answer runs, but retrieval cannot see later frames. Repeated end times use
+the same published view; an empty prefix answers using only the initialization prompt.
+Questions with the same end time form one group and are answered sequentially
+from that view. At most two groups may retain published views, including the
+active group; the number of queued questions is no longer limited to two.
+The encoder can write the next interval while both older views are in use. It
+waits for a slot only before publishing a third view. Questions are never dropped.
+All answers finish before the next video begins, and worker errors stop evaluation.
+
+To remove the encoder's wait for QA queue capacity, add
+`--rekv_async_max_pending_groups 0` (also spelled
+`--rekv-async-max-pending-groups 0`). Positive values set a group limit; the
+default is still 2. This option requires `--rekv_async`. For example:
+
+```bash
+python -m video_qa.run_eval --method rekv --model llava_ov_7b \
+    --dataset rvs_ego --sample_fps 0.5 --rekv_async \
+    --rekv_async_max_pending_groups 0
+```
+
+With limit 0, the encoder can submit every annotated prefix without waiting for
+answers, collecting already-completed results without blocking. Questions still
+wait for their prefix's CUDA ready event, and the video call waits for all
+answers before clearing its cache or starting another video. Both threads still
+share GPU compute and bandwidth. Thus this removes consumer backpressure, not
+data dependencies or all hardware synchronization. A slower QA consumer can
+accumulate arbitrarily many pending views, retaining old GPU allocations and CPU
+payloads until consumed; memory and response latency can grow. There is no
+automatic dropping or disk spill. If the two-group queue rarely fills, removing
+the limit may give little benefit. `run_rekv.sh` exposes the setting as
+`async_max_pending_groups`, defaulting to 2.
+
+Results for limit 0 use `async_unbounded/`; other nondefault positive limits use
+`async_groups_N/`. The default limit keeps `async/`. The launcher, direct worker,
+and `--only_eval` use the same suffix so different policies do not overwrite
+one another's results.
+
+This mode supports the single-GPU OneVision, Video-LLaVA, and LongVA paths. It
+rejects offline evaluation, the 72B model, sharded weights, and CPU/disk weight
+offload. Encoding and QA share weights but have separate CUDA streams, RoPE
+state, and retrieval/generation buffers. Publication copies metadata only: CPU
+history blocks and GPU representative-key prefixes are shared read-only, with
+fixed visible lengths. Init/remainder tensors are retained by reference; the
+encoder replaces them when appending instead of overwriting published storage.
+A CUDA event makes all prefix writes/offloads visible before QA reads them.
+Each view registers this dependency and its tensor lifetimes once per consuming
+CUDA stream, including when used outside the streaming scheduler. Encoding only
+allocates an init-prefix buffer; the live cache's larger retrieval buffer and
+GPU history pool are allocated on demand by synchronous retrieval. Snapshot QA
+does not allocate those synchronous buffers.
+Readers keep old storage alive across vector growth and cache replacement.
+Historical entries must never be overwritten or removed while readers hold a
+view. Retrieval still assembles private GPU KV from the selected CPU blocks;
+zero-copy publication does not eliminate this transfer. Retained old storage
+and generation buffers can increase GPU memory use. Speedup depends on GPU load
+and transfer costs; enabling concurrency does not guarantee higher throughput.
+
+Run the scheduling, snapshot, and model compatibility checks in the `rekv`
+environment:
+
+```bash
+python -m unittest discover -s tests -p 'test_rekv_async*.py' -v
+```
+
+CUDA tests are skipped when no working GPU is available. They compare live and
+snapshot retrieval, hidden states, logits, and greedy generation across local
+cache/offload boundaries and representative-vector growth, including concurrent
+forwards and both attention implementations. A real-model benchmark needs local
+weights and videos, and does not call the external scoring service:
+
+```bash
+python -m tests.benchmark_rekv_async --model llava_ov_7b \
+    --anno_path data/rvs/ego/ego4d_oe.json --max_samples 1 \
+    --sample_fps 0.5 --repeat 3 --output /tmp/rekv-async-benchmark.json
+```
+
+The JSON contains wall time, per-question execution time, snapshot/queue wait,
+response time from prefix capture to GPU completion, peak allocated/reserved GPU
+memory, and exact output comparisons. For proof of
+GPU execution overlap, run the same benchmark under
+`nsys profile --trace=cuda,nvtx,osrt -o /tmp/rekv-async-trace` and inspect the
+`rekv.encode_frame` / `rekv.answer` ranges and CUDA kernels on their respective
+streams. Thread overlap alone is not evidence of simultaneous GPU computation.
+
+Both modes include video initialization and video-state cleanup in total wall
+time. ReKV's `clear_cache()` releases video references without flushing PyTorch's
+allocator; `clear_cache(release_allocator=True)` also returns unused allocator
+memory. The benchmark performs this allocator cleanup before each trial, outside
+the timer, and once on exit. Historical timings used different cleanup boundaries
+and should not be treated as directly comparable measurements.
+
+The benchmark also accepts `--rekv_async_max_pending_groups 0`; it applies that
+policy to the async leg and retains the synchronous reference. Its
+`async_video_stats` records submitted/peak pending groups, time blocked by queue
+backpressure, host time to finish all frame/group submissions (`producer_seconds`),
+and final answer-drain time. Producer time is not a GPU-completion measurement.
+Use these counters to check whether backpressure actually limits the workload
+before attributing wall-time changes to the queue policy.

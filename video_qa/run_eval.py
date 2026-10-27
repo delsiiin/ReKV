@@ -8,6 +8,7 @@ import shlex
 from video_qa.sampling import load_samples, nonnegative_int
 from video_qa.model_paths import MODEL_PATHS
 from video_qa.methods import METHODS, get_method, validate_arguments
+from video_qa.methods.rekv import async_result_subdir
 
 
 def exec(cmd, sub=False, device=None):
@@ -26,6 +27,8 @@ def get_eval_settings(args, dataset, anno_path):
     save_dir = get_method(getattr(args, 'method', 'rekv')).result_dir(args, dataset)
     if args.max_samples:
         save_dir += f"/samples_{args.max_samples}"
+    if getattr(args, 'rekv_async', False):
+        save_dir += '/' + async_result_subdir(args)
     # Scoring existing results must not require the source annotations.
     if args.only_eval:
         return args.num_chunks, save_dir

@@ -14,6 +14,7 @@ from logzero import logger
 from video_qa.sampling import load_samples, nonnegative_int, sampled_frames, split_samples
 from video_qa.model_paths import MODEL_PATHS
 from video_qa.methods import get_method, validate_arguments
+from video_qa.methods.rekv import async_result_subdir
 
 
 class BaseVQA:
@@ -33,7 +34,8 @@ class BaseVQA:
         if num_chunks is not None:
             anno = self.get_chunk(anno, num_chunks, chunk_idx)
         self.anno = anno
-        self.eval_grounding = 'temporal_windows' in anno[0]['conversations'][0]
+        first_question = next((q for video in anno for q in video['conversations']), {})
+        self.eval_grounding = 'temporal_windows' in first_question
 
         self.save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
@@ -94,6 +96,10 @@ class BaseVQA:
                 'acc': float(letter == correct_choice)}
 
     def record_answer(self, video_sample, sample, *, max_new_tokens=1024):
+        self.records.append(self.answer_record(video_sample, sample, max_new_tokens=max_new_tokens))
+
+    def answer_record(self, video_sample, sample, *, max_new_tokens=1024, **generation_options):
+        """Return a record without publishing it (also used by background QA)."""
         question, answer = sample['question'], sample['answer']
         record = dict(video_id=video_sample['video_id'], question=question)
         if 'choices' in sample:
@@ -102,16 +108,16 @@ class BaseVQA:
             if answer is None:
                 answer = choices[0]
             correct = self.choice_letters[choices.index(answer)]
-            result = self.video_close_qa(question, choices, correct)
+            result = self.video_close_qa(question, choices, correct, **generation_options)
             record.update(choices=choices, answer=answer, correct_choice=correct,
                           pred_answer=result['pred_answer'], pred_choice=result['pred_choice'],
                           qa_acc=result['acc'] * 100)
         else:
-            result = self.video_open_qa(question, max_new_tokens=max_new_tokens)
+            result = self.video_open_qa(question, max_new_tokens=max_new_tokens, **generation_options)
             record.update(answer=answer, pred_answer=result['pred_answer'])
         if 'question_type' in sample:
             record['task'] = sample['question_type']
-        self.records.append(record)
+        return record
 
     def analyze_a_video(self, video_sample):
         raise NotImplementedError
@@ -160,8 +166,15 @@ def work(QA_CLASS, method='rekv', argv=None):
     implementation = get_method(method)
     try:
         validate_arguments(args, implementation)
+        if getattr(args, 'rekv_async', False) and not getattr(QA_CLASS, 'supports_rekv_async', False):
+            raise ValueError('--rekv_async is only supported by the ReKV streaming entry point')
     except ValueError as error:
         parser.error(str(error))
+
+    if getattr(args, 'rekv_async', False):
+        subdir = async_result_subdir(args)
+        if os.path.basename(os.path.normpath(args.save_dir)) != subdir:
+            args.save_dir = os.path.join(args.save_dir, subdir)
 
     if not args.debug:
         logzero.loglevel(logging.INFO)

@@ -30,7 +30,7 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
         self.kv_cache = output.past_key_values
 
     @torch.inference_mode()
-    def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
+    def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None, *, kv_snapshot=None):
         device = self.device
         stop_token_ids = [self.processor.tokenizer.eos_token_id]
 
@@ -40,28 +40,15 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
         # NOTE: Only input the question to perform retrieval.
         input_ids = self.processor.tokenizer(input_text['question']).input_ids
         input_ids = torch.as_tensor([input_ids], device=device)
-        for layer_kv in self.kv_cache:  # activate retrieval mode
-            layer_kv.set_retrieval()
-
-        if retrieved_indices is None:  # Internal retrieval
-            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
-            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
-        else:  # External retrieval
-            for layer_kv in self.kv_cache:
-                assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
-                layer_kv.set_retrieved_block_indices(retrieved_indices)
-            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
-            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
-
-        for layer_kv in self.kv_cache:  # reset to default
-            layer_kv.reset_retrieval()
+        past_key_values, forward_options = self._retrieve_question(
+            input_ids, retrieved_indices, kv_snapshot)
 
         for i in range(max_new_tokens):
             if i == 0:  # prefill
                 input_ids = self.processor.tokenizer(input_text['prompt']).input_ids
                 input_ids = torch.as_tensor([input_ids], device=device)
                 inputs_embeds = self.get_input_embeddings()(input_ids)
-                out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
+                out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values, **forward_options)
                 past_key_values = out.past_key_values
                 logits = self.lm_head(out['last_hidden_state'])
             else:  # decoding
@@ -72,6 +59,7 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
                     ),
                     use_cache=True,
                     past_key_values=past_key_values,
+                    **forward_options,
                 )
                 logits = self.lm_head(out['last_hidden_state'])
                 past_key_values = out.past_key_values
