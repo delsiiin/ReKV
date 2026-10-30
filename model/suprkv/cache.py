@@ -230,6 +230,7 @@ class StreamingKVCache:
         self._frames = TrackedDict(changed=self._frame_changed)
         # Pre-RoPE scoring keys are transient work memory, never snapshot KV.
         self._score_keys = TrackedDict(changed=self._diagnostics_changed)
+        self._score_queries = TrackedDict(changed=self._diagnostics_changed)
         self.next_id = self.segment_id = self.version = 0
         self.last_timestamp = float('-inf')
         self.last_activation_id = -1
@@ -263,6 +264,9 @@ class StreamingKVCache:
         for frame_id in tuple(self._score_keys):
             if frame_id not in self._frames or self._frames[frame_id].closed:
                 self._score_keys.pop(frame_id)
+        for frame_id in tuple(self._score_queries):
+            if frame_id not in self._frames or self._frames[frame_id].closed:
+                self._score_queries.pop(frame_id)
         # Bulk replacement is a cold compatibility/debug path. Normal updates
         # use the tracked table and never rebuild the object graph.
         self._reset_accounting()
@@ -313,13 +317,14 @@ class StreamingKVCache:
         self._persistent_ledger, self._working_ledger = MemoryLedger(), MemoryLedger()
         self._persistent_root = self._persistent_value()
         self._working_root = (self._persistent_root, self.frames, self.snapshots, self.counts, self.last_event,
-                              self._score_keys)
+                              self._score_keys, self._score_queries)
         self._persistent_ledger.add(self._persistent_root)
         self._working_ledger.add(self._working_root)
 
     def _frame_changed(self, mapping, key, previous, value):
         if value is None or value.closed:
             self._score_keys.pop(key, None)
+            self._score_queries.pop(key, None)
         # Appends and eviction of non-recent frames only need the previous top-k
         # IDs. Avoid sorting every retained ID on every insertion/deletion.
         if (self._recent_key is not None and self._recent_key[0] == id(mapping)
@@ -390,7 +395,7 @@ class StreamingKVCache:
         else:
             self._persistent_ledger.add(persistent)
             self._persistent_ledger.remove(id(self._persistent_root))
-        working = (persistent, self.frames, self.snapshots, self.counts, self.last_event, self._score_keys)
+        working = (persistent, self.frames, self.snapshots, self.counts, self.last_event, self._score_keys, self._score_queries)
         if all(a is b for a, b in zip(working, self._working_root)):
             working = self._working_root
         else:
@@ -408,7 +413,7 @@ class StreamingKVCache:
             self._recent_ids = tuple(sorted(self.frames)[-self.recent_frames:])
         return self._recent_ids
 
-    def append_frame(self, timestamp, layers, *, score_keys=None, rope_start=0):
+    def append_frame(self, timestamp, layers, *, score_keys=None, frame_queries=None, rope_start=0):
         """Append post-RoPE KV; supply pre-RoPE keys only when partitioning is needed."""
         if not math.isfinite(timestamp) or timestamp < self.last_timestamp:
             raise ValueError('Frame timestamps must be finite and nondecreasing')
@@ -428,11 +433,20 @@ class StreamingKVCache:
                     for key, record in zip(score_keys, records)):
                 raise ValueError('Pre-RoPE scoring keys must match frame KV shapes and device')
             score_keys = tuple(resident_copy(key, self.dtype) for key in score_keys)
+        if frame_queries is not None:
+            if len(frame_queries) != len(records) or any(
+                    q is None or q.ndim != 2 or q.device != self.device or q.shape[0] < 1
+                    or q.shape[0] % record.high_k.shape[0] or q.shape[-1] != record.high_k.shape[-1]
+                    for q, record in zip(frame_queries, records)):
+                raise ValueError('Frame Query means must match layer heads, dimensions and device')
+            frame_queries = tuple(q.detach().float().clone() for q in frame_queries)
         frame = Frame(self.next_id, float(timestamp), self.segment_id, records,
                       rope_start=rope_start, token_count=self.frame_tokens)
         self.frames[frame.frame_id] = frame
         if score_keys is not None:
             self._score_keys[frame.frame_id] = score_keys
+        if frame_queries is not None:
+            self._score_queries[frame.frame_id] = frame_queries
         self.last_timestamp = timestamp
         self.next_id += 1
         self.version += 1
@@ -446,12 +460,17 @@ class StreamingKVCache:
         self._refresh_accounting()
         return self._persistent_ledger.total
 
-    def _classify_segment(self, pending, queries):
+    def _classify_segment(self, pending, queries, scoring_strategy='summary'):
         # Keep temporary scoring tensors scoped here so they are released before
         # budget enforcement, including when a later layer fails validation.
         frame_keys = [self._score_keys.get(frame.frame_id) for frame in pending]
         if any(keys is None for keys in frame_keys):
             raise ValueError('Missing pre-RoPE scoring keys')
+        if scoring_strategy == 'frame_mean_query':
+            frame_queries = [self._score_queries.get(frame.frame_id) for frame in pending]
+            if any(row is None for row in frame_queries):
+                raise ValueError('Missing frame Query means')
+            queries = (torch.stack([row[layer] for row in frame_queries]) for layer in range(len(self.sink)))
         classified = [[] for _ in pending]
         for layer, query in enumerate(queries):
             keys = [row[layer] for row in frame_keys]
@@ -462,7 +481,13 @@ class StreamingKVCache:
                 row.append(frame.layers[layer].classify_scores(frame_scores))
         return {frame.frame_id: tuple(row) for frame, row in zip(pending, classified)}
 
-    def close_segment(self, queries, error=''):
+    def clear_frame_queries(self):
+        """Release temporary frame means, including an interrupted segment."""
+        self._score_queries.clear()
+
+    def close_segment(self, queries, error='', *, scoring_strategy='summary'):
+        if scoring_strategy not in ('summary', 'frame_mean_query'):
+            raise ValueError('Invalid scoring_strategy')
         began = time.monotonic()
         pending = [self.frames[i] for i in self._open_ids]
         if not pending:
@@ -470,9 +495,9 @@ class StreamingKVCache:
         with measure(self.profiler, 'token_scoring'):
             classified = {}
             try:
-                if queries is None or len(queries) != len(self.sink):
+                if scoring_strategy == 'summary' and (queries is None or len(queries) != len(self.sink)):
                     raise ValueError(error or 'summary_empty')
-                classified = self._classify_segment(pending, queries)
+                classified = self._classify_segment(pending, queries, scoring_strategy)
             except (ValueError, RuntimeError) as exc:
                 if isinstance(exc, torch.cuda.OutOfMemoryError):
                     raise

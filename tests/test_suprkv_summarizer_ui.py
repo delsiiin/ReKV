@@ -37,6 +37,12 @@ $('compressionSummarizer').value = 'custom'; $('compressionSummarizerPath').valu
 update();
 assert(parameters().summarizer_model_path === '/models/custom', 'trim custom path');
 assert($('compressionSummarizerPath').required && !$('compressionSummarizerPath').disabled, 'custom path required');
+$('compressionScoring').value = 'frame_mean_query'; update();
+assert(parameters().scoring_strategy === 'frame_mean_query', 'strategy in payload');
+assert(parameters().summarizer_model_path === null, 'unused summarizer excluded');
+assert($('compressionSummarizer').disabled && !$('compressionSummarizerPath').required, 'skip summary controls');
+$('compressionScoring').value = 'summary'; update();
+assert(!$('compressionSummarizer').disabled && $('compressionSummarizerPath').required, 'restore summary controls');
 $('mode').value = 'video'; update();
 assert(!('summarizer_model_path' in parameters()), 'ordinary observation excludes summarizer');
 assert($('compressionSummarizerPath').disabled && !$('compressionSummarizerPath').required, 'hidden field must not block submit');
@@ -67,6 +73,11 @@ render(result, '/result.json', false);
 assert(!$('compressionSummariesPanel').hidden, 'show segment summaries');
 assert($('compressionSummariesTable').children[0].rows[0][1] === 'main-checkpoint', 'show actual fallback source');
 assert($('compressionSummariesTable').children[0].rows[0][4] === '成功', 'show retry outcome');
+e.config.scoring_strategy = 'frame_mean_query';
+e.stages = [{label: '生成 summary', before_seconds: 0, after_seconds: 0, delta_seconds: 0, enabled: false}];
+render(result, '/result.json', false);
+assert($('compressionLabel').textContent.includes('摘要配置：未启用'), 'summary disabled label');
+assert($('compressionCostTable').children[0].rows[0][2] === '未启用', 'summary stage disabled');
 print('UI behavior OK');
 '''
         result = subprocess.run(['gjs', '-c', script], cwd=Path(__file__).resolve().parents[1],

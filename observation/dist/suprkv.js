@@ -18,7 +18,8 @@ function renderCompressionResult(result, url, cached) {
   $('results').hidden = true; $('emptyState').hidden = true; $('compressionResults').hidden = false;
   const beforeStats = before.model_stats ?? {}, afterStats = after.model_stats ?? {};
   const summarizer = e.config?.summarizer_model_path ?? null;
-  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 摘要配置：${summarizer ?? '主模型'} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
+  const frameQuery = e.config?.scoring_strategy === 'frame_mean_query';
+  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 评分：${frameQuery ? '帧均值 Query' : 'Summary Query'} · 摘要配置：${frameQuery ? '未启用' : (summarizer ?? '主模型')} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
   $('compressionJson').hidden = false; $('compressionJson').href = url;
   const memory = e.memory, saved = memory.persistent_kv;
   const gpu = e.method.cache_device.startsWith('cuda');
@@ -40,7 +41,7 @@ function renderCompressionResult(result, url, cached) {
   prepareCompressionQuestions(e);
   renderCompressionAnswer();
   renderRetrievalHits();
-  $('compressionCostTable').replaceChildren(compressionTable(['阶段', '压缩前', '压缩后', '新增耗时'], e.stages.map(stage => [stage.label, millis(stage.before_seconds), millis(stage.after_seconds), deltaMs(stage.delta_seconds)])));
+  $('compressionCostTable').replaceChildren(compressionTable(['阶段', '压缩前', '压缩后', '新增耗时'], e.stages.map(stage => [stage.label, millis(stage.before_seconds), stage.enabled === false ? '未启用' : millis(stage.after_seconds), stage.enabled === false ? '—' : deltaMs(stage.delta_seconds)])));
   $('compressionTimingNote').textContent = `不含模型加载及视频解码；摘要模型加载 ${fmt(after.summarizer_load_seconds ?? 0, 3)} 秒（计入任务总时间）。单次顺序测量，先运行原精度，首次调用的 kernel 初始化可能影响时间。编码总耗时：${fmt(before.encoding_seconds, 3)} → ${fmt(after.encoding_seconds, 3)} 秒。未触发的策略阶段显示 0。`;
   $('compressionMethod').textContent = JSON.stringify({method: e.method, config: e.config, model_stats: {before: beforeStats, after: afterStats}, question_time: e.cutoff_timestamp, commits: after.commits ?? []}, null, 2);
   const summaries = (after.commits ?? []).filter(commit => 'summary' in commit);
@@ -205,13 +206,13 @@ function renderCompressionCostChart(stages) {
   selected.forEach(stage=>{
     const row=node('div','compression-cost-row'), track=node('div','compression-cost-track'), bar=node('div','compression-cost-bar');
     bar.style.width=`${Math.max(0,stage.after_seconds??0)/max*100}%`; track.append(bar);
-    row.append(node('span','',stage.label),track,node('span','',millis(stage.after_seconds))); target.append(row);
+    row.append(node('span','',stage.label),track,node('span','',stage.enabled === false ? '未启用' : millis(stage.after_seconds))); target.append(row);
   });
 }
 $('compressionFrame').addEventListener('input', () => { stopCachePlayback(); pauseLiveFollowing(); updateCompressionReadout(); });
 $('compressionCsv').addEventListener('click', () => {
   const stages=state.compression?.compression_experiment.stages; if (!stages) return;
-  const csv=['stage,before_seconds,after_seconds,delta_seconds', ...stages.map(s=>[s.label,s.before_seconds??'',s.after_seconds??'',s.delta_seconds??''].join(','))].join('\n');
+  const csv=['stage,before_seconds,after_seconds,delta_seconds,enabled', ...stages.map(s=>[s.label,s.before_seconds??'',s.after_seconds??'',s.delta_seconds??'',s.enabled !== false].join(','))].join('\n');
   const url=URL.createObjectURL(new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}));
   const link=node('a');link.href=url;link.download='kv-compression-costs.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 });

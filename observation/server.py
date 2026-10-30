@@ -30,7 +30,7 @@ def validate_params(raw, dataset, default_dtype='float16'):
                'max_new_tokens', 'video_window_size', 'segment_enabled', 'segment_ema_alpha',
                'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
                'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
-               'question_indices', 'custom_questions', 'summarizer_model_path'}
+               'question_indices', 'custom_questions', 'summarizer_model_path', 'scoring_strategy'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -84,7 +84,11 @@ def validate_params(raw, dataset, default_dtype='float16'):
     if mode != 'compression' and ('question_indices' in raw or 'custom_questions' in raw):
         raise ValueError('Multiple questions are supported in compression mode')
     if mode == 'compression':
-        path = raw.get('summarizer_model_path')
+        strategy = raw.get('scoring_strategy', 'summary')
+        if strategy not in ('summary', 'frame_mean_query'):
+            raise ValueError('Invalid scoring_strategy')
+        compression['scoring_strategy'] = strategy
+        path = raw.get('summarizer_model_path') if strategy == 'summary' else None
         if path is not None and (not isinstance(path, str) or not path.strip()):
             raise ValueError('summarizer_model_path must be a nonempty string or null')
         compression['summarizer_model_path'] = path.strip() if path is not None else None
@@ -240,7 +244,8 @@ class ObservationService:
             if 'segment_experiment' in result:
                 result['segment_experiment']['token_similarity']['url'] = f'/api/token-similarity/{job_id}'
                 result['segment_experiment']['segment_attention']['url'] = f'/api/segment-attention/{job_id}'
-            result.update(schema_version=27, job_id=job_id, sample=record, parameters=params,
+                result['segment_experiment']['frame_query_attention']['url'] = f'/api/frame-query-attention/{job_id}'
+            result.update(schema_version=28, job_id=job_id, sample=record, parameters=params,
                           sampling=sampling, total_elapsed_seconds=time.monotonic() - started)
             check_cancel()
             temporary = directory / 'result.tmp'
@@ -300,6 +305,15 @@ class ObservationService:
             result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
             return segment_attention(directory, result, summary, segment, frame, layer, rope)
 
+    def frame_query_attention(self, job_id, segment, frame, layer):
+        from observation.segments import frame_query_attention
+        if not re.fullmatch(r'[a-f0-9]{24}', job_id):
+            raise ValueError('Invalid job id')
+        with self.similarity_lock:
+            directory = self.cache / job_id
+            result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
+            return frame_query_attention(directory, result, segment, frame, layer)
+
 
 def handler_for(service):
     class Handler(BaseHTTPRequestHandler):
@@ -341,6 +355,13 @@ def handler_for(service):
                     return self.send_json(service.dataset.get(path.removeprefix('/api/samples/')))
                 if path.startswith('/api/jobs/'):
                     return self.send_json(service.get_job(path.removeprefix('/api/jobs/')))
+                match = re.fullmatch(r'/api/frame-query-attention/([a-f0-9]{24})', path)
+                if match:
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    if set(query) != {'segment', 'frame', 'layer'} or any(len(v) != 1 for v in query.values()):
+                        raise ValueError('Expected segment, frame and layer exactly once')
+                    return self.send_json(service.frame_query_attention(match[1], int(query['segment'][0]),
+                        int(query['frame'][0]), query['layer'][0]))
                 match = re.fullmatch(r'/api/segment-attention/([a-f0-9]{24})', path)
                 if match:
                     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -366,6 +387,7 @@ def handler_for(service):
                 static = {'/': ('index.html', 'text/html; charset=utf-8'),
                           '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
                           '/attention.js': ('attention.js', 'application/javascript; charset=utf-8'),
+                          '/frame-query.js': ('frame-query.js', 'application/javascript; charset=utf-8'),
                           '/suprkv.js': ('suprkv.js', 'application/javascript; charset=utf-8'),
                           '/style.css': ('style.css', 'text/css; charset=utf-8')}
                 if path in static:

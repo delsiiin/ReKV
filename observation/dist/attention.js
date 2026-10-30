@@ -83,7 +83,10 @@ async function renderSegmentAttention() {
     $('segmentAttentionReadout').textContent = '可重新选择帧或层重试。';
   }
 }
-function renderAttentionMap(data, measure, variant) {
+function renderAttentionMap(data, measure, variant, options = {}) {
+  const viewState = options.state ?? segmentAttentionState;
+  const readToken = options.readToken ?? readAttentionToken;
+  const target = options.target ?? 'segmentAttentionMaps';
   const frame = state.result.frames[data.frame_index], values = variant[measure.key];
   const label = `${ropeLabel(variant.rope)} · ${measure.label}`;
   const range = similarityColorRange(values), pruning = frameMeanPruning(values);
@@ -110,17 +113,17 @@ function renderAttentionMap(data, measure, variant) {
         'data-token-index':index,stroke:masked?'none':'#ffffff55','stroke-width':1});
       rect.append(svgNode('title',{},`图片 token #${index} · ${label}: ${fmt(values[index],8)}`));
       if (!masked) {
-        rect.addEventListener('mouseenter',()=>readAttentionToken(index));
-        rect.addEventListener('click',()=>{segmentAttentionState.selected=index;readAttentionToken(index);});
+        rect.addEventListener('mouseenter',()=>readToken(index));
+        rect.addEventListener('click',()=>{viewState.selected=index;readToken(index);});
       }
       svg.append(rect);
     });
     if (!masked) {
-      svg.addEventListener('mouseleave',()=>readAttentionToken(segmentAttentionState.selected));
+      svg.addEventListener('mouseleave',()=>readToken(viewState.selected));
       svg.addEventListener('keydown',event=>{
         const cols=state.result.spatial.cols, moves={ArrowLeft:-1,ArrowRight:1,ArrowUp:-cols,ArrowDown:cols};
         if (!(event.key in moves)) return;
-        event.preventDefault();segmentAttentionState.selected=Math.max(0,Math.min(data.image_tokens-1,segmentAttentionState.selected+moves[event.key]));readAttentionToken(segmentAttentionState.selected);
+        event.preventDefault();viewState.selected=Math.max(0,Math.min(data.image_tokens-1,viewState.selected+moves[event.key]));readToken(viewState.selected);
       });
     }
     stage.append(img,svg);figure.append(stage);
@@ -128,13 +131,13 @@ function renderAttentionMap(data, measure, variant) {
     pair.append(figure);
   }
   section.append(pair,node('p','muted',pruning.threshold==null?'无有效 Query，无法计算分数或剪枝阈值。':`帧内均值 ${fmt(pruning.threshold,8)} · 剪去 ${pruning.pruned.filter(Boolean).length}/${data.image_tokens} 个 token；等于均值保留。`));
-  $('segmentAttentionMaps').append(section);
+  $(target).append(section);
 }
 function readAttentionToken(index) {
   const data=segmentAttentionState.data;if(!data)return;
   const cell=state.result.spatial.cells[index];
   $('segmentAttentionReadout').textContent=`Summary ${data.summary_index+1} → Segment ${data.segment_index+1} · 帧 ${data.frame_index+1} · 图片 token #${index} · 全局 token #${data.frame_token_start+index}${cell?` · 空间行 ${cell.row+1} / 列 ${cell.col+1}`:''}\n` + data.variants.map(v => `${ropeLabel(v.rope)}：Softmax 前 ${fmt(v.pre_softmax[index],8)} · Softmax 后 ${fmt(v.post_softmax[index],8)}`).join('\n');
-  document.querySelectorAll('.attention-overlay rect').forEach(rect=>{
+  $('segmentAttentionMaps').querySelectorAll('.attention-overlay rect').forEach(rect=>{
     const selected=Number(rect.dataset.tokenIndex)===index;rect.setAttribute('stroke',selected?'#ff8a24':'#ffffff55');rect.setAttribute('stroke-width',selected?5:1);
   });
 }

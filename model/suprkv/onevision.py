@@ -38,6 +38,9 @@ class OneVisionEngine:
         self.profiler = profiler
         self.check_cancel = check_cancel
         self.compression_enabled = config.get('compression_enabled', True)
+        self.scoring_strategy = config.get('scoring_strategy', 'summary')
+        if self.scoring_strategy not in ('summary', 'frame_mean_query'):
+            raise ValueError('Invalid scoring_strategy')
         device = config['device']
         if str(device).startswith('cuda'):
             torch.cuda.set_device(device)
@@ -67,9 +70,9 @@ class OneVisionEngine:
                  fattn=str(device).startswith('cuda') and self.dtype != torch.float32)
         self.main_summarizer = OneVisionSummarizer(self.model, self.processor,
             config.get('model_path', 'main'), partial(native_decoder, self.decoder))
-        path = validate_summarizer_path(config.get('summarizer_model_path'))
+        path = validate_summarizer_path(config.get('summarizer_model_path')) if self.scoring_strategy == 'summary' else None
         self.summarizer = None
-        if self.compression_enabled:
+        if self.compression_enabled and self.scoring_strategy == 'summary':
             self.check_cancel()
             self.summarizer = summarizer if summarizer is not None else (
                 OneVisionSummarizer.load(path, self.device, self.dtype) if path else None)
@@ -107,6 +110,8 @@ class OneVisionEngine:
     def clear_segment(self):
         self.features, self.frame_info, self.summarizer_features = [], [], []
         self.summarizer_error = ''
+        if self.cache is not None:
+            self.cache.clear_frame_queries()
 
     def _summary_length(self, features, frames):
         return self.main_summarizer.context_length(features, frames)
@@ -152,13 +157,15 @@ class OneVisionEngine:
                 raw = selected_vision_features(output, self.model.config.vision_feature_layer,
                                               self.model.config.vision_feature_select_strategy)
                 boundary = self.segmenter.push(raw[0])
-                context_full = self._summary_length(self.features+[feature], self.frame_info+[info]) + reserve > self.main_summarizer.context_limit
-            if self.features and (boundary or context_full):
+                context_full = (self.scoring_strategy == 'summary' and
+                    self._summary_length(self.features+[feature], self.frame_info+[info]) + reserve > self.main_summarizer.context_limit)
+            if self.frame_info and (boundary or context_full):
                 close_started = time.monotonic()
                 self.close_segment(reset_segmenter=False)
                 closed_seconds += time.monotonic()-close_started
                 self.segmenter.count = 1
-            if self._summary_length([feature], [info]) + reserve > self.main_summarizer.context_limit:
+            if (self.scoring_strategy == 'summary' and
+                    self._summary_length([feature], [info]) + reserve > self.main_summarizer.context_limit):
                 raise ValueError('Even one frame plus summary prompt exceeds the model context')
             if self.summarizer is not None and not self.summarizer_error:
                 summary_feature, failure = self._external_feature(image)
@@ -189,18 +196,22 @@ class OneVisionEngine:
             positions = torch.cat([torch.arange(sink_k.shape[1], device=self.device)] +
                                   [part[2].long()+frame.rope_start for frame, part in zip(recent, parts)])
             contexts.append(EncodeLayer(RotaryCache(key, value, positions),
-                                        capture_scores=self.compression_enabled))
+                                        capture_scores=self.compression_enabled,
+                                        capture_frame_query=self.compression_enabled and self.scoring_strategy == 'frame_mean_query'))
         self._set_window('encode')
         self.decoder(inputs_embeds=feature, past_key_values=contexts, use_cache=True, return_dict=True)
         self.cache.append_frame(timestamp, [context.captured for context in contexts],
                                 score_keys=[context.score_key for context in contexts] if self.compression_enabled else None,
+                                frame_queries=[context.frame_query for context in contexts]
+                                    if self.compression_enabled and self.scoring_strategy == 'frame_mean_query' else None,
                                 rope_start=contexts[0].position_start)
         del contexts
         if not self.compression_enabled:
             self.cache.close_uncompressed_segment(return_stats=False)
             self.timings['encode_seconds'] += time.monotonic()-began
             return
-        self.features.append(feature.detach().clone())
+        if self.scoring_strategy == 'summary':
+            self.features.append(feature.detach().clone())
         if summary_feature is not None:
             self.summarizer_features.append(summary_feature)
         self.frame_info.append(info)
@@ -214,8 +225,24 @@ class OneVisionEngine:
         self.check_cancel()
         if not self.compression_enabled:
             return self.stats(self.cache.close_uncompressed_segment())
-        if not self.features:
+        if not self.frame_info:
             return self.stats()
+        if self.scoring_strategy == 'frame_mean_query':
+            began = time.monotonic()
+            record = dict(segment_id=self.cache.segment_id, scoring_strategy=self.scoring_strategy,
+                          summary_enabled=False)
+            try:
+                cache_stats = self.cache.close_segment(None, scoring_strategy=self.scoring_strategy)
+            finally:
+                self.clear_segment()
+            self.timings['score_compress_seconds'] += time.monotonic()-began
+            self.last_summary = record
+            if self.cache.last_event is not None:
+                self.cache.last_event.update(record)
+                cache_stats['last_event'] = dict(self.cache.last_event)
+            if reset_segmenter:
+                self.segmenter.close()
+            return self.stats(cache_stats)
         began = time.monotonic()
         queries, error, text = None, '', ''
         first_error = self.summarizer_error
@@ -259,7 +286,8 @@ class OneVisionEngine:
         self.timings['summary_seconds'] += time.monotonic()-began
         if error:
             self.summary_counts['summary_failures'] += 1
-        record = dict(segment_id=self.cache.segment_id, summary=text, summary_source=source,
+        record = dict(segment_id=self.cache.segment_id, scoring_strategy=self.scoring_strategy,
+                      summary_enabled=True, summary=text, summary_source=source,
                       summarizer_error=first_error, summary_retried=retried,
                       summary_retry_succeeded=bool(text) if retried else None, summary_error=error)
         began = time.monotonic()
@@ -317,6 +345,7 @@ class OneVisionEngine:
     def stats(self, cache_stats=None):
         result = self.cache.memory_stats() if cache_stats is None else dict(cache_stats)
         result.update(self.timings)
+        result['scoring_strategy'] = self.scoring_strategy
         result['inference_pid'] = os.getpid()
         result['model_instances'] = 1 + (self.summarizer is not None)
         extra_bytes = self.summarizer.parameter_bytes if self.summarizer is not None else 0

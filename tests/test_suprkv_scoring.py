@@ -8,6 +8,48 @@ from model.suprkv.segments import segment_summary_scores, summary_scores
 
 
 class SegmentScoringTests(unittest.TestCase):
+    def test_frame_queries_match_dense_logits_and_working_memory_lifecycle(self):
+        torch.manual_seed(77)
+        sink = torch.zeros(2, 2, 4)
+        cache = StreamingKVCache([(sink, sink)]*2, 100000, 3, dtype=torch.float32)
+        queries = torch.randn(2, 3, 4, 4)  # layer, frame, head, dim
+        keys = torch.randn(2, 3, 2, 3, 4)
+        for frame in range(3):
+            cache.append_frame(frame, [(k, k) for k in keys[:, frame]],
+                               score_keys=list(keys[:, frame]), frame_queries=list(queries[:, frame]))
+        before = cache.memory_stats()
+        cache.audit_accounting()
+        qrefs = list(cache._score_queries.values())
+        cache.clear_frame_queries()
+        without = cache.memory_stats()
+        self.assertEqual(before['persistent_tensor_bytes'], without['persistent_tensor_bytes'])
+        self.assertGreater(before['cache_working_bytes'], without['cache_working_bytes'])
+        for frame, row in enumerate(qrefs):
+            cache._score_queries[frame] = row
+        cache.close_segment(None, scoring_strategy='frame_mean_query')
+        for layer in range(2):
+            q = queries[layer].double().permute(1, 0, 2)
+            k = keys[layer].double().permute(1, 0, 2, 3).reshape(2, 9, 4).repeat_interleave(2, 0)
+            scores = (q @ k.transpose(-1, -2) / 2).mean((0, 1)).reshape(3, 3)
+            for frame in range(3):
+                expected = torch.where(scores[frame] >= scores[frame].mean())[0].tolist()
+                self.assertEqual(cache.frames[frame].layers[layer].high_indices.tolist(), expected)
+        self.assertFalse(cache._score_queries)
+        self.assertFalse(cache._score_keys)
+        cache.audit_accounting()
+
+    def test_frame_query_missing_or_nonfinite_preserves_entire_segment(self):
+        key = torch.ones(2, 3, 4)
+        for invalid in ('missing', 'nonfinite'):
+            cache = StreamingKVCache([(key, key)], 100000, 3)
+            q = torch.full((4, 4), float('nan')) if invalid == 'nonfinite' else None
+            cache.append_frame(0, [(key, key)], score_keys=[key], frame_queries=[q] if q is not None else None)
+            cache.close_segment(None, scoring_strategy='frame_mean_query')
+            self.assertEqual(cache.counts['scoring_failures'], 1)
+            self.assertEqual(cache.frames[0].layers[0].high_indices.tolist(), [0, 1, 2])
+            self.assertFalse(cache._score_queries)
+            cache.audit_accounting()
+
     def devices(self):
         return ['cpu'] + (['cuda:0'] if torch.cuda.is_available() else [])
 

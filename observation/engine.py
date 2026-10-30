@@ -187,10 +187,13 @@ class ObservationEngine:
         if segment_enabled and artifact_dir is None:
             raise ValueError('Segment token observations require an artifact directory')
         token_stores = {kind: TokenStateStore(artifact_dir, kind)
-                        for kind in ('key', 'hidden', 'query', 'key_rope', 'query_rope')} if segment_enabled else {}
+                        for kind in ('key', 'hidden', 'query', 'key_rope', 'query_rope', 'frame_query')} if segment_enabled else {}
 
         def capture_video_states(kind, layer, states):
-            token_stores[kind].video(layer, states, frames)
+            if kind == 'query':
+                token_stores['frame_query'].frame_queries(layer, states, frames)
+            else:
+                token_stores[kind].video(layer, states, frames)
 
         def capture_video_rotary(layer, query, key):
             states = key.transpose(1, 2).reshape(key.shape[0], key.shape[2], -1)
@@ -205,7 +208,7 @@ class ObservationEngine:
         cleanup = install_observer(decoder, capture, window=window, check_cancel=check_cancel,
                                    rotary_callback=capture_video_rotary if segment_enabled else None)
         try:
-            with capture_token_states(decoder, capture_video_states, check_cancel) if segment_enabled else nullcontext():
+            with capture_token_states(decoder, capture_video_states, check_cancel, include_queries=True) if segment_enabled else nullcontext():
                 prefill = decoder(inputs_embeds=inputs, use_cache=True, return_dict=True)
         finally:
             cleanup()
@@ -262,6 +265,11 @@ class ObservationEngine:
                                       definitions=dict(key='pre-RoPE k_proj output; concatenate native KV heads',
                                                        hidden='decoder block output after attention and MLP residuals, before final model norm'),
                                       rows='summary content tokens', columns='selected frame spatial tokens in row-major order'),
+                frame_query_attention=dict(query='FP32 token mean of pre-RoPE video Q per frame, in frame order',
+                    key='all pre-RoPE image Keys in the same segment', rope_modes=['pre'],
+                    aggregation='separate mean of logits and probabilities over frame queries, heads and selected layers',
+                    normalization='softmax over the entire segment per frame query and head; no causal mask',
+                    compression_score='pre_softmax; threshold each frame at its mean'),
                 segment_attention=dict(query='independent summary native pre/post-RoPE Queries',
                                        key='native pre/post-RoPE Keys of original video and independent summary',
                                        rope_modes=['pre', 'post'],

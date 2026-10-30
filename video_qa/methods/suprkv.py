@@ -6,6 +6,8 @@ from .common import Method, add_option, add_retrieval_arguments, retrieval_size
 
 
 def add_suprkv_arguments(parser):
+    parser.add_argument('--scoring_strategy', '--scoring-strategy', choices=('summary', 'frame_mean_query'),
+                        default=None, help='KV token scoring Query source (default: summary).')
     # None preserves StreamingConfig defaults; forward only explicitly specified arguments.
     add_option(parser, '--model_path', '--model-path', type=str, default=None,
                         help='Model path or Hugging Face ID, overriding the preset path for --model.')
@@ -33,6 +35,7 @@ def add_suprkv_arguments(parser):
 
 def config_overrides(args):
     values = dict(model_path=args.model_path, budget_tokens=args.budget_tokens,
+                  scoring_strategy=getattr(args, 'scoring_strategy', None),
                   summarizer_model_path=getattr(args, 'summarizer_model_path', None),
                   recent_frames=args.recent_frames, group_size=args.group_size,
                   ema_alpha=args.ema_alpha, min_segment_frames=args.min_segment_frames,
@@ -56,7 +59,7 @@ def make_config(args):
 class SuPrKVMethod(Method):
     name = 'suprkv'
     defaults = dict(retrieve_size=64)
-    options = ('retrieve_size', 'model_path', 'summarizer_model_path', 'device', 'budget_tokens', 'recent_frames',
+    options = ('retrieve_size', 'model_path', 'summarizer_model_path', 'scoring_strategy', 'device', 'budget_tokens', 'recent_frames',
                'group_size', 'ema_alpha', 'min_segment_frames', 'max_segment_frames',
                'summary_max_new_tokens', 'max_new_tokens', 'packed_attention')
 
@@ -76,6 +79,8 @@ class SuPrKVMethod(Method):
         budget = 8192 if budget is None else budget
         directory = (f'results/suprkv/{args.model}/{dataset}/'
                      f'{retrieval_size(args)}-{args.sample_fps}/budget_{budget}')
+        if getattr(args, 'scoring_strategy', None) == 'frame_mean_query':
+            return directory + '/scoring_frame_mean_query'
         path = getattr(args, 'summarizer_model_path', None)
         if path is not None:
             path = path.strip()

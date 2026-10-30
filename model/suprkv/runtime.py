@@ -25,8 +25,13 @@ class StreamingConfig:
     summary_max_new_tokens: int = 256
     max_new_tokens: int = 256
     summarizer_model_path: str | None = None
+    scoring_strategy: str = 'summary'
 
     def __post_init__(self):
+        if self.scoring_strategy not in ('summary', 'frame_mean_query'):
+            raise ValueError('Invalid scoring_strategy')
+        if self.scoring_strategy == 'frame_mean_query':
+            object.__setattr__(self, 'summarizer_model_path', None)
         value = self.summarizer_model_path
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError('summarizer_model_path must be a nonempty string or null')

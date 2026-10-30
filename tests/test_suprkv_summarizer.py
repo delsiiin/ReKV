@@ -67,6 +67,44 @@ class SummarizerTests(unittest.TestCase):
         return OneVisionEngine(dict(asdict(self.config), **updates), model=self.model,
                                processor=self.processor, summarizer=self.small)
 
+    def test_frame_query_strategy_captures_native_means_and_skips_all_summary_work(self):
+        with patch.object(OneVisionSummarizer, 'load', side_effect=AssertionError('no loading')):
+            engine = self.engine(scoring_strategy='frame_mean_query', summarizer_model_path='/missing/model')
+        self.assertIsNone(engine.summarizer)
+        captured = {}
+        with (patch.object(engine, '_summary_length', side_effect=AssertionError('no summary context')),
+                patch.object(engine.main_summarizer, 'generate', side_effect=AssertionError('no summary'))):
+            with capture_queries(engine.decoder, lambda layer, q: captured.update({layer: q.detach().clone()})):
+                engine.append_frame(self.image, 0.)
+            for layer, q in captured.items():
+                expected = q[0].float().reshape(196, 4, 8).mean(0)
+                torch.testing.assert_close(engine.cache._score_queries[0][layer], expected)
+            for i in range(1, 4):
+                engine.append_frame(self.image, float(i))
+        self.assertEqual(engine.cache.segment_id, 1)  # max-frame cap still closes the segment
+        self.assertEqual(engine.stats()['model_instances'], 1)
+        self.assertFalse(engine.stats()['last_event']['summary_enabled'])
+        self.assertEqual(engine.stats()['last_event']['scoring_strategy'], 'frame_mean_query')
+        self.assertFalse(engine.features or engine.summarizer_features or engine.cache._score_queries)
+        self.assertEqual(engine.summary_counts['summary_failures'], 0)
+        engine.cache.audit_accounting()
+        engine.append_frame(self.image, 4.)
+        self.assertTrue(engine.cache._score_queries)
+        engine.reset()
+        self.assertFalse(engine.cache._score_queries)
+
+    def test_frame_query_fatal_scoring_failure_releases_means(self):
+        engine = self.engine(scoring_strategy='frame_mean_query')
+        for failure in (torch.cuda.OutOfMemoryError('oom'), Cancelled()):
+            engine.reset()
+            engine.append_frame(self.image, 0.)
+            with patch.object(engine.cache, '_classify_segment', side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    engine.close_segment()
+            self.assertFalse(engine.cache._score_queries)
+            self.assertFalse(engine.frame_info)
+            engine.cache.audit_accounting()
+
     def test_different_hidden_sizes_bridge_through_main_text_queries(self):
         engine = self.engine()
         engine.append_frame(self.image, 0.)

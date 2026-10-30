@@ -278,6 +278,7 @@ class SuPrKVEvalTests(unittest.TestCase):
                                   '--model-path', '/custom/model', '--recent-frames', '3',
                                   '--group-size', '64', '--ema-alpha', '0.3',
                                   '--min-segment-frames', '2', '--max-segment-frames', '16',
+                                  '--scoring-strategy', 'frame_mean_query',
                                   '--summary-max-new-tokens', '128', '--max-new-tokens', '64')
         process = Mock(exitcode=0)
         with patch.object(run_eval.multiprocessing, 'Process', return_value=process) as launch, \
@@ -361,6 +362,13 @@ class SuPrKVEvalTests(unittest.TestCase):
         _, directory = run_eval.get_eval_settings(args, 'rvs_ego', self.annotation)
         self.assertTrue(directory.startswith('results/suprkv/'))
         self.assertTrue(directory.endswith('/budget_8192'))
+        args = self.worker_args('--scoring-strategy', 'frame_mean_query', '--summarizer-model-path', '/unused')
+        config = make_config(args)
+        self.assertEqual(config.scoring_strategy, 'frame_mean_query')
+        self.assertIsNone(config.summarizer_model_path)
+        launcher = self.launcher_args('--scoring-strategy', 'frame_mean_query', '--summarizer-model-path', '/unused')
+        _, alternate = run_eval.get_eval_settings(launcher, 'rvs_ego', self.annotation)
+        self.assertEqual(alternate, directory+'/scoring_frame_mean_query')
 
     def test_rekv_specific_parameter_and_unsupported_model_are_rejected(self):
         for extra in (['--n_local', '15000'], ['--model', 'longva_7b']):

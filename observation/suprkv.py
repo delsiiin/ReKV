@@ -75,7 +75,7 @@ def run_pass(model, processor, images, frames, questions, config, compressed, pr
     summarizer = None
     load_seconds = 0.
     try:
-        if compressed and config.get('summarizer_model_path'):
+        if compressed and config.get('scoring_strategy', 'summary') == 'summary' and config.get('summarizer_model_path'):
             check_cancel()
             began = time.perf_counter()
             device = model.model.language_model.get_input_embeddings().weight.device
@@ -199,6 +199,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
     if not frames or len(images) != len(frames):
         raise ValueError('Compression comparison requires matching nonempty frames/images')
     config = asdict(StreamingConfig(model_path=observation.model_path, device=observation.device,
+        scoring_strategy=params.get('scoring_strategy', 'summary'),
         summarizer_model_path=params.get('summarizer_model_path'),
         budget_tokens=params['compression_budget_tokens'], topk=params['compression_topk'],
         recent_frames=params['compression_recent_frames'], max_segment_frames=params['compression_max_segment_frames'],
@@ -252,6 +253,8 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         left = before.get('timings', {}).get(key, {}).get('seconds', 0.) if before['status']=='complete' else None
         right = after.get('timings', {}).get(key, {}).get('seconds', 0.) if after['status']=='complete' else None
         stages.append(dict(id=key, label=label, algorithm=algorithm, before_seconds=left, after_seconds=right,
+                           enabled=config['scoring_strategy'] == 'summary' or key not in
+                               ('summarizer_vision_encoding', 'summary_generation', 'summary_query'),
                            delta_seconds=right-left if left is not None and right is not None else None))
     progress('compression_complete', '压缩对照完成' if complete else '对照部分失败；查看各侧状态', .99)
     return dict(frames=frames, compression_experiment=dict(status='complete' if complete else 'partial',
@@ -259,6 +262,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         frame_count=len(frames),
         cutoff_timestamp=frames[-1]['timestamp'], config=config, runs=runs, memory=memory, stages=stages,
         method=dict(model_instances=after.get('model_stats', {}).get('model_instances', 1),
+            scoring_strategy=config['scoring_strategy'], compression_score='pre_softmax',
             summarizer_model_path=config['summarizer_model_path'],
             execution='sequential', cache_device=observation.device, dtype=dtype,
             offload=False, baseline=f'same streaming encoding and top-k retrieval; all {dtype}; no compression or summaries',

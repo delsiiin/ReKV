@@ -178,7 +178,8 @@ def cosine_matrix(text, visual):
 
 
 STATE_DIRECTORIES = {'key': 'token_keys', 'hidden': 'token_hidden', 'query': 'token_queries',
-                     'key_rope': 'token_keys_rope', 'query_rope': 'token_queries_rope'}
+                     'key_rope': 'token_keys_rope', 'query_rope': 'token_queries_rope',
+                     'frame_query': 'frame_query_means'}
 
 
 class TokenStateStore:
@@ -202,6 +203,12 @@ class TokenStateStore:
 
     def summary(self, layer, index, keys):
         self.write(f'summary-{index}-{layer}.npy', keys)
+
+    def frame_queries(self, layer, queries, frames):
+        count = frames[0]['token_end'] - frames[0]['token_start']
+        selected = queries[0, frames[0]['token_start']:frames[-1]['token_end']]
+        means = selected.reshape(len(frames), count, -1).float().mean(dim=1)
+        self.write(f'video-{layer}.npy', means)
 
 
 def token_similarity(directory, result, summary_index, frame_index, layer, representation='key'):
@@ -277,6 +284,61 @@ def mean_segment_attention(query, key, heads, kv_heads, query_chunk=32, key_mask
             probabilities /= probabilities.sum(axis=-1, keepdims=True)
             after += probabilities.sum(0)
     return before / (heads * len(query)), after / (heads * len(query))
+
+
+def frame_query_attention(directory, result, segment_index, frame_index, layer):
+    """Frame-mean pre-RoPE Q attends to every image key in its own segment."""
+    experiment = result.get('segment_experiment', {})
+    if 'frame_query_attention' not in experiment:
+        raise ValueError('Frame Query means are unavailable; regenerate the observation')
+    segments = experiment['segments']
+    for value, upper, name in [(segment_index, len(segments), 'segment'),
+                                (frame_index, len(result['frames']), 'frame')]:
+        if type(value) is not int or not 0 <= value < upper:
+            raise ValueError(f'Invalid {name} index')
+    segment = segments[segment_index]
+    if frame_index not in segment['frame_indices']:
+        raise ValueError('Selected frame is outside the selected segment')
+    layers = result['model']['layers']
+    if layer == 'all':
+        selected = range(layers)
+    elif isinstance(layer, str) and layer.isascii() and layer.isdigit() and 0 <= int(layer) < layers:
+        selected = [int(layer)]
+    else:
+        raise ValueError('Invalid layer')
+    first, last = segment['start_frame'], segment['end_frame']
+    count = result['sequence']['tokens_per_frame']
+    total = (last - first) * count
+    before, after = np.zeros(total), np.zeros(total)
+    for index in selected:
+        try:
+            q = np.load(Path(directory) / 'frame_query_means' / f'video-{index}.npy', mmap_mode='r', allow_pickle=False)
+            k = np.load(Path(directory) / 'token_keys' / f'video-{index}.npy', mmap_mode='r', allow_pickle=False)
+        except FileNotFoundError as exc:
+            raise ValueError('Frame Q/K states are unavailable; regenerate the observation') from exc
+        if (q.ndim != 2 or q.shape[0] != len(result['frames']) or k.ndim != 3
+                or k.shape[:2] != (len(result['frames']), count)):
+            raise ValueError('Stored frame Q/K dimensions do not match the result')
+        logits, probabilities = mean_segment_attention(q[first:last], k[first:last].reshape(total, -1),
+                                                       result['model']['heads'], result['model']['kv_heads'])
+        before += logits
+        after += probabilities
+    before /= len(selected)
+    after /= len(selected)
+    offset = (frame_index - first) * count
+    pre, post = before[offset:offset + count], after[offset:offset + count]
+    return dict(segment_index=segment_index, frame_index=frame_index, layer=layer, rope='pre',
+                query_count=last-first, image_tokens=count, segment_tokens=total,
+                frame_token_start=result['frames'][frame_index]['token_start'],
+                pre_softmax=pre.tolist(), post_softmax=post.tolist(),
+                pre_frame_mean=float(pre.mean()), post_frame_mean=float(post.mean()),
+                frame_masses=[dict(frame_index=first+i, mass=float(row.sum()))
+                              for i, row in enumerate(after.reshape(-1, count))],
+                segment_mass=float(after.sum()), scoring_strategy='frame_mean_query',
+                normalization='per frame query and head: softmax over all image tokens in the same segment; no causal mask',
+                aggregation='separate mean of logits and probabilities over frame queries, heads and selected layers',
+                compression_score='pre_softmax; each layer and frame thresholded at its own mean',
+                positional_encoding='pre-RoPE Q/K; no rotation applied')
 
 
 def segment_attention(directory, result, summary_index, segment_index, frame_index, layer, rope='pre'):

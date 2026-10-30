@@ -4,6 +4,29 @@ Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --met
 
 采用 ReKV 单进程顺序执行方式的 GPU 常驻压缩后端（默认单模型，可选独立摘要模型），支持 LLaVA-OneVision Qwen2 checkpoint。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
 
+## Token 评分策略
+
+默认 `StreamingConfig(scoring_strategy="summary")` 保留摘要评分流程。通过
+`--scoring-strategy frame_mean_query`（也支持 `--scoring_strategy`）切换到帧均值 Query：
+
+```bash
+python -m video_qa.run_eval --method suprkv --dataset rvs_ego --scoring-strategy frame_mean_query
+```
+
+流式编码时，每层将每帧图片 token 的 RoPE 前 Q 沿 token 维以 FP32 求均值，保留 heads，
+段结束后按帧序组成 Query，与本段全部原始 RoPE 前 K 按原生 GQA 对应计算平均 `QKᵀ / √head_dim`。
+实际分类使用 softmax 前分数，每层每帧独立以帧内均值为阈值，等于均值归为高分。
+量化、预算、recent 保护和问答检索策略保持原有行为。
+
+该策略不加载摘要模型、不生成摘要、不提取文字 Q，忽略 `summarizer_model_path`，
+不检查该路径的 checkpoint。分段保留视觉 EMA 与最少/最大帧数规则，移除摘要上下文容量限制。
+开放段仅保留临时帧 Query 均值和评分 Key，不保留摘要用视觉特征；Query 均值计入工作内存，
+不进入持久 KV 预算或问答 snapshot，段提交、失败或重置后释放。
+评分失败沿用全段高分保留，OOM 和取消传播到调用方。
+
+评测结果在原预算目录下追加 `scoring_frame_mean_query/`，不与默认 summary 策略混用。
+普通观察页提供 softmax 前后热图，但其完整视频 prefill 与流式压缩上下文不同，分数可能不同。
+
 ## 独立摘要模型
 
 默认由主模型生成 segment summary。通过参数启用独立 OneVision：

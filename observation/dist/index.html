@@ -4,7 +4,7 @@
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RVS · Attention Observatory</title>
   <meta name="description" content="本地 RVS 视频注意力观察实验：可配置视频窗口、逐帧 attention mass 与 token 热力图。">
-  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/attention.js" defer></script><script src="/suprkv.js" defer></script>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script><script src="/attention.js" defer></script><script src="/frame-query.js" defer></script><script src="/suprkv.js" defer></script>
 </head>
 <body>
 <aside class="sidebar">
@@ -34,6 +34,8 @@
     <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。阈值倍数固定为 1；第一对帧初始化 EMA，后续距离超过历史 EMA 则切分。每段单独生成总结。</p>
     <div id="compressionControls" hidden>
       <div class="section-label">04 / KV 压缩对照</div>
+      <label for="compressionScoring">Token 评分策略</label>
+      <select id="compressionScoring"><option value="summary">Summary Query（默认）</option><option value="frame_mean_query">帧均值 Query（跳过摘要）</option></select>
       <label for="compressionSummarizer">摘要模型</label>
       <select id="compressionSummarizer"><option value="main">主模型（默认）</option><option value="llava-hf/llava-onevision-qwen2-0.5b-ov-hf">LLaVA-OneVision 0.5B</option><option value="custom">自定义 OneVision</option></select>
       <div id="compressionSummarizerCustom" hidden><label for="compressionSummarizerPath">模型 ID 或本地目录</label><input id="compressionSummarizerPath" type="text" disabled placeholder="组织/模型名 或 /path/to/model"></div>
@@ -46,7 +48,7 @@
       <label for="compressionBudget">Memory budget / FP16 token 数</label><input id="compressionBudget" type="number" value="1024" min="1" max="10000000" required>
       <div class="field-pair"><div><label for="compressionRecent">Recent 保护帧数</label><input id="compressionRecent" type="number" value="2" min="1" max="128" required></div><div><label for="compressionTopk">检索帧数上限</label><input id="compressionTopk" type="number" value="64" min="1" max="512" required></div></div>
       <label for="compressionMaxSegment">每段最多帧数</label><input id="compressionMaxSegment" type="number" value="32" min="1" max="128" required>
-      <p class="field-note">同一问答模型顺序运行原精度与压缩缓存；使用上方的 EMA 和 summary 参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
+      <p class="field-note">同一问答模型顺序运行原精度与压缩缓存；使用上方 EMA 参数，仅 Summary 策略使用摘要参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
     </div>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
@@ -143,6 +145,18 @@
       <p id="segmentAttentionReadout" class="spatial-readout" aria-live="polite">选择 summary、segment、帧和层查看分数。</p>
       <p id="segmentAttentionPositions" class="tiny"></p>
       <p class="tiny">RoPE 前取原生 q_proj / k_proj 输出，RoPE 后取模型实际旋转后的 Q/K，均使用原生 GQA head 对应关系。两组采用相同的 summary-Key mask。summary 仍独立编码，RoPE 使用各自输入的原生位置编号（未将 summary 重定位到视频之后）。遮罩作用于观察分布，不改变原模型 forward；这是跨输入 QK 对照，并非完整上下文中的原生注意力。</p>
+    </section>
+    <section id="frameQueryPanel" class="panel" hidden>
+      <div class="panel-heading"><div><h2>帧均值 Query → 本段 Key 注意力分布</h2><p id="frameQueryMeta" class="muted"></p></div><button id="exportFrameQueryCsv" class="text-button" type="button" disabled>↓ 当前帧 CSV</button></div>
+      <div class="similarity-controls">
+        <label for="frameQueryLayer">注意力层<select id="frameQueryLayer"></select></label>
+        <label for="frameQuerySegment">Segment / Query 与 Key<select id="frameQuerySegment"></select></label>
+        <label for="frameQueryFrame">段内图片帧<select id="frameQueryFrame"></select></label>
+      </div>
+      <p class="muted">每帧图片 token 的 RoPE 前 Q 沿 token 维求均值，保留各 head，再按帧序组成段 Query。检索本段全部图片 Key，无因果遮罩；切帧不改变 softmax 归一化范围。段、帧和层与上方面板联动。</p>
+      <p id="frameQueryMass" class="muted"></p><div id="frameQueryMaps"></div>
+      <p id="frameQueryReadout" class="spatial-readout" aria-live="polite"></p>
+      <p class="tiny">实际压缩使用 Softmax 前分数，逐层按帧内均值分类；全部层剪枝图仅作预览。普通观察来自完整视频 prefill，实际压缩来自流式上下文，Q/K 数值可能不同。</p>
     </section>
     <section id="answerPanel" class="panel" hidden><div class="panel-heading"><h2>模型回答</h2><span id="answerStatus" class="tag"></span></div><p id="answerQuestion" class="answer-question"></p><div class="answer-columns"><div><div class="eyebrow">MODEL RESPONSE</div><p id="modelAnswer" class="answer-text"></p></div><div class="reference-answer"><div class="eyebrow">REFERENCE ANSWER</div><p id="referenceAnswer" class="answer-text"></p></div></div><p id="answerMeta" class="muted"></p></section>
     <details id="inputDetails" class="panel" hidden><summary>本次模型输入与采样信息</summary><pre id="inputMetadata"></pre></details>

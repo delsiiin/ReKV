@@ -245,6 +245,31 @@ CSV 导出所显示的全部模式及其前后分数、阈值、剪枝标记、s
 原有末尾窗口注意力、独立文字余弦相似度和问答计算仍保持各自口径。
 更新后需重启服务并重新生成一次，以采集 RoPE 后状态；之后切换无需重新运行模型。
 
+## 帧均值 Query → 本段 Key
+
+普通视频/问题观察启用分段后，新增独立的帧均值 Query 热图，与 summary–segment 面板双向联动
+segment、帧和层；summary 来源和原面板的 RoPE 模式独立保留。
+
+每层采集视频 `q_proj` 的 RoPE 前输出，仅沿每帧图片 token 维以 FP32 求均值，保留各 Query head，
+按帧顺序组成 `[帧数, query heads, head_dim]` 的观察窗口。Key 是同段全部图片 token 的 RoPE 前 K。
+使用原生 GQA head 对应计算 `QKᵀ / √head_dim`，不包含提示词、summary、其他段或因果遮罩。
+热图分别展示平均 logits 和每个帧 Query/head 在整段 softmax 后的平均概率；全部层视图最后平均各层结果。
+切帧只切展示向量，整段概率和为 1；同时提供帧内均值剪枝预览、token 读数与 CSV。
+全部层剪枝预览不等于实际逐层分类结果。
+
+仅保存 `frame_query_means/video-{layer}.npy`（FP32，形状 `[视频帧数, query heads × head_dim]`），
+复用 `token_keys/video-{layer}.npy`，不保存完整视频 Q。结果元数据位于
+`segment_experiment.frame_query_attention`。接口为：
+
+```text
+GET /api/frame-query-attention/{job_id}?segment=0&frame=0&layer=all
+```
+
+`layer` 支持 `all` 或从 0 开始的层号，frame 必须属于 segment。返回 `pre_softmax`、`post_softmax`、
+`pre_frame_mean`、`post_frame_mean`、`frame_masses`、`segment_mass` 与计算口径。
+旧缓存缺少帧均值 Q 时需重启服务、刷新页面并重新生成观察数据。
+普通观察使用完整视频 prefill，实际压缩使用流式上下文；公式一致，Q/K 数值不保证一致。
+
 ## 原末尾窗口注意力计算口径
 
 这是独立的**完整因果注意力 prefill**观察路径，不调用 ReKV 的 KV 淘汰或检索，
@@ -304,7 +329,14 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 
 ## KV 压缩前后对照
 
-重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；本模式始终进行算法要求的分段和 summary，不受注意力观察的启用复选框影响。
+重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；本模式始终分段，默认 summary 策略生成摘要，不受注意力观察的启用复选框影响。
+
+「Token 评分策略」支持 `summary`（默认）和 `frame_mean_query`。后者使用每帧的 RoPE 前 Q 均值，
+对本段原始 RoPE 前 K 计算 **softmax 前**平均分数，逐层逐帧按帧内均值分类，等于均值归为高分。
+新策略跳过摘要模型加载、摘要生成和文字 Q 提取，忽略摘要模型配置；对应阶段显示“未启用”。
+分段只使用视觉 EMA 与帧数限制，不受摘要上下文容量约束。帧均值 Q 计入临时工作内存，段提交后释放，
+不计入持久 KV 预算。API `POST /api/jobs` 增加 `scoring_strategy`，配置、提交记录和结果 JSON 记录策略。
+评分异常仍按全段高分保留，OOM 和取消继续传播。新策略热图位于普通观察页。
 
 结果包含：
 

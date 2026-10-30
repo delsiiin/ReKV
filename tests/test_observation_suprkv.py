@@ -206,6 +206,30 @@ class CompressionModelTests(unittest.TestCase):
             compression_max_segment_frames=2, segment_min_frames=1, segment_ema_alpha=.2,
             summary_max_new_tokens=2, max_new_tokens=3, question_index=0)
 
+    def test_frame_query_comparison_skips_summary_and_restores_native_forward(self):
+        from model.suprkv.summarizer import OneVisionSummarizer
+        decoder = self.observer.model.model.language_model
+        original = decoder.forward
+        with (patch.object(OneVisionSummarizer, 'load', side_effect=AssertionError('no load')),
+              patch.object(OneVisionSummarizer, 'generate', side_effect=AssertionError('no summary'))):
+            result = compare(self.observer, list(range(4)), self.frames, self.record,
+                dict(self.params, scoring_strategy='frame_mean_query', summarizer_model_path='/missing/model'),
+                lambda *_: None, lambda: None)['compression_experiment']
+        self.assertEqual(result['status'], 'complete', result['runs'])
+        self.assertIsNone(result['config']['summarizer_model_path'])
+        self.assertEqual(result['method']['scoring_strategy'], 'frame_mean_query')
+        self.assertEqual(decoder.forward, original)
+        self.assertFalse(hasattr(decoder, '_old_forward'))
+        after = result['runs']['after']
+        self.assertEqual(after['model_stats']['model_instances'], 1)
+        self.assertTrue(after['answers'])
+        self.assertTrue(all(not c['summary_enabled'] for c in after['commits']))
+        for stage in result['stages']:
+            if stage['id'] in ('summarizer_vision_encoding', 'summary_generation', 'summary_query'):
+                self.assertFalse(stage['enabled'])
+                self.assertEqual(stage['after_seconds'], 0.)
+        json.dumps(result, allow_nan=False)
+
     @torch.inference_mode()
     def test_bfloat16_and_float32_comparison_use_selected_model_dtype(self):
         original_visual = self.observer.model.model.get_video_features

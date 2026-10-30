@@ -13,7 +13,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 from observation.engine import Cancelled, ObservationEngine
 from observation.segments import (EPSILON, capture_keys, capture_hidden_states, capture_token_states, cosine_matrix,
                                   selected_vision_features, vision_frame_distances,
-                                  segment_by_ema, TokenStateStore, token_similarity, segment_attention)
+                                  segment_by_ema, TokenStateStore, token_similarity, segment_attention, frame_query_attention)
 from observation.server import validate_params
 
 
@@ -245,6 +245,12 @@ class SegmentIntegrationTests(unittest.TestCase):
         self.assertEqual(np.load(Path(self.directory.name) / 'token_keys_rope/video-0.npy').shape, (4, 10, 12))
         self.assertEqual(np.load(Path(self.directory.name) / 'token_keys_rope/summary-0-0.npy').shape, (2, 12))
         self.assertFalse((Path(self.directory.name) / 'token_queries/video-0.npy').exists())
+        means = np.load(Path(self.directory.name) / 'frame_query_means/video-0.npy')
+        self.assertEqual(means.shape, (4, 24))
+        self.assertEqual(means.dtype, np.float32)
+        frame_attention = frame_query_attention(self.directory.name, result, 0, 0, 'all')
+        self.assertEqual(frame_attention['query_count'], 2)
+        self.assertAlmostEqual(frame_attention['segment_mass'], 1.)
         matrix = token_similarity(self.directory.name, result, 0, 3, 'all')
         self.assertEqual(np.asarray(matrix['cosine']).shape, (2, 10))
         self.assertEqual(matrix['text_tokens'][1]['token_id'], 5)

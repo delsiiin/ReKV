@@ -28,6 +28,8 @@ class EncodeLayer:
     score_key: object = None
     position_start: int = 0
     capture_scores: bool = True
+    capture_frame_query: bool = False
+    frame_query: object = None
 
 
 @dataclass
@@ -89,6 +91,8 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
             positions = past_key_value.past.positions
             if past_key_value.capture_scores:
                 past_key_value.score_key = k[0].detach().clone()
+            if past_key_value.capture_frame_query:
+                past_key_value.frame_query = q[0].float().mean(dim=1).detach()
         elif past_key_value is None:
             pk, pv = k[:, :, :0], v[:, :, :0]
             positions = torch.empty(0, dtype=torch.long, device=q.device)
