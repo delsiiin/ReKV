@@ -3,7 +3,6 @@ import torch
 from typing import Optional
 
 from .kv_cache_manager import ContextManager
-from .snapshot import SnapshotRetrieval
 from .dot_production_attention import get_multi_stage_dot_production_attention
 
 
@@ -64,10 +63,7 @@ def rekv_attention_forward(
 
         # NOTE: Question-answering, fall back to sliding-window attention (infinite_lm)
         if type(past_key_value) is not ContextManager or past_key_value.to_retrieve:
-            if isinstance(past_key_value, SnapshotRetrieval):
-                past_k, past_v = past_key_value.get_retrieved_kv(global_q)
-                updata_kv_cache = False
-            elif type(past_key_value) is ContextManager:  # retrieval
+            if type(past_key_value) is ContextManager:  # retrieval
                 if past_key_value.retrieved_block_indices is None:  # retrieve based on global_q (question's query)
                     past_k, past_v = past_key_value.get_retrieved_kv(global_q)
                 else:  # retrieve based on pre-computed retrieved_block_indices

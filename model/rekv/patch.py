@@ -49,7 +49,6 @@ def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, attention_
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        rekv_position_bias=None,
         **kwargs,
     ):
         use_cache = self.config.use_cache if use_cache is None else use_cache
@@ -80,7 +79,7 @@ def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, attention_
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=self.position_bias if rekv_position_bias is None else rekv_position_bias,
+                position_ids=self.position_bias,
                 past_key_values=caches,
                 use_cache=True,
             )
