@@ -332,7 +332,8 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；本模式始终分段，默认 summary 策略生成摘要，不受注意力观察的启用复选框影响。
 
 「Token 评分策略」支持 `summary`（默认）和 `frame_mean_query`。后者使用每帧的 RoPE 前 Q 均值，
-对本段原始 RoPE 前 K 计算 **softmax 前**平均分数，逐层逐帧按帧内均值分类，等于均值归为高分。
+对本段原始 RoPE 前 K 计算缩放点积，保留各帧 Query 和 head，计算后再沿 Query 帧维和 head 维平均。
+使用 **softmax 前**分数逐层逐帧按帧内均值分类，等于均值归为高分。
 新策略跳过摘要模型加载、摘要生成和文字 Q 提取，忽略摘要模型配置；对应阶段显示“未启用”。
 分段只使用视觉 EMA 与帧数限制，不受摘要上下文容量约束。帧均值 Q 计入临时工作内存，段提交后释放，
 不计入持久 KV 预算。API `POST /api/jobs` 增加 `scoring_strategy`，配置、提交记录和结果 JSON 记录策略。

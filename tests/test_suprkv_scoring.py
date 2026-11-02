@@ -4,7 +4,7 @@ import unittest
 import torch
 
 from model.suprkv.cache import LayerFrame, StreamingKVCache
-from model.suprkv.segments import segment_summary_scores, summary_scores
+from model.suprkv.segments import segment_summary_scores, summary_scores, segment_frame_query_scores
 
 
 class SegmentScoringTests(unittest.TestCase):
@@ -52,6 +52,59 @@ class SegmentScoringTests(unittest.TestCase):
 
     def devices(self):
         return ['cpu'] + (['cuda:0'] if torch.cuda.is_available() else [])
+
+    def test_frame_attention_matches_fp64_gqa_reference(self):
+        torch.manual_seed(123)
+        for device in self.devices():
+            for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                for frames in (1, 2, 8, 32):
+                    with self.subTest(device=device, dtype=dtype, frames=frames):
+                        query = torch.randn(frames, 6, 8, device=device, dtype=dtype)
+                        keys = list(torch.randn(frames, 2, 7, 8, device=device, dtype=dtype))
+                        q = query.double().permute(1, 0, 2)
+                        k = torch.cat(keys, dim=1).double().repeat_interleave(3, dim=0)
+                        reference = (q @ k.transpose(-1, -2) / 8**.5).mean((0, 1))
+                        with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16):
+                            actual = segment_frame_query_scores(query, keys)
+                        self.assertEqual(actual.dtype, torch.float32)
+                        torch.testing.assert_close(actual.double().flatten(), reference, rtol=1e-5, atol=1e-6)
+                        torch.testing.assert_close(actual, segment_summary_scores(query, keys), rtol=1e-5, atol=1e-6)
+
+    def test_frame_scores_use_logits_instead_of_probabilities(self):
+        key = torch.tensor([-1., 0., 1.]).reshape(1, 3, 1)
+        # Averaged logits keep the zero and positive endpoints, whereas
+        # averaged softmax probabilities would keep both nonzero endpoints.
+        for query in (torch.tensor([2., -1.]).reshape(2, 1, 1),
+                      torch.tensor([2., -1.]).reshape(1, 2, 1)):
+            keys = [key] * len(query)
+            scores = segment_frame_query_scores(query, keys)
+            for row in scores:
+                torch.testing.assert_close(row, torch.tensor([-.5, 0., .5]))
+                self.assertEqual(torch.where(row >= row.mean())[0].tolist(), [1, 2])
+
+    def test_frame_scores_are_unnormalized_and_handle_ties(self):
+        query = torch.ones(2, 1, 1)
+        keys = [torch.zeros(1, 3, 1), torch.ones(1, 3, 1)]
+        scores = segment_frame_query_scores(query, keys)
+        torch.testing.assert_close(scores, torch.tensor([[0., 0., 0.], [1., 1., 1.]]))
+        uniform = segment_frame_query_scores(torch.zeros_like(query), keys)
+        torch.testing.assert_close(uniform, torch.zeros(2, 3))
+        self.assertTrue((uniform >= uniform.mean(-1, keepdim=True)).all())
+
+    def test_frame_attention_rejects_invalid_inputs(self):
+        query = torch.ones(2, 4, 8)
+        key = torch.ones(2, 3, 8)
+        for invalid in (float('nan'), float('inf')):
+            bad_key, bad_query = key.clone(), query.clone()
+            bad_key[0, 0, 0] = invalid
+            bad_query[0, 0, 0] = invalid
+            for q, keys in ((query, [key, bad_key]), (bad_query, [key, key])):
+                with self.assertRaisesRegex(ValueError, 'Nonfinite'):
+                    segment_frame_query_scores(q, keys)
+        for q, keys in ((query[:0], []), (query[:1], [key, key]),
+                        (query[:, :3], [key, key]), (query, [key, key[:, :2]])):
+            with self.assertRaises(ValueError):
+                segment_frame_query_scores(q, keys)
 
     def test_batched_scores_and_masks_match_individual_frames(self):
         torch.manual_seed(72)

@@ -14,7 +14,9 @@ python -m video_qa.run_eval --method suprkv --dataset rvs_ego --scoring-strategy
 ```
 
 流式编码时，每层将每帧图片 token 的 RoPE 前 Q 沿 token 维以 FP32 求均值，保留 heads，
-段结束后按帧序组成 Query，与本段全部原始 RoPE 前 K 按原生 GQA 对应计算平均 `QKᵀ / √head_dim`。
+段结束后按帧序组成 `[F, Hq, D]` Query，与本段全部原始 RoPE 前 K 按原生 GQA 对应计算 `QKᵀ / √head_dim`。
+每个帧 Query、每个 head 独立计算与整段全部 Key token 的缩放点积，不做 softmax、不施加因果 mask；
+随后沿 Query 帧维 F 和 head 维求均值，得到各 Key token 的分数。点积前不合并帧或 head。
 实际分类使用 softmax 前分数，每层每帧独立以帧内均值为阈值，等于均值归为高分。
 量化、预算、recent 保护和问答检索策略保持原有行为。
 

@@ -7,7 +7,7 @@ import time
 import torch
 
 from .quantization import PackedKV
-from .segments import summary_scores, segment_summary_scores
+from .segments import summary_scores, segment_summary_scores, segment_frame_query_scores
 from .profiling import measure
 from .accounting import MemoryLedger, TrackedDict
 from .rotary import rotate_at
@@ -476,7 +476,8 @@ class StreamingKVCache:
             keys = [row[layer] for row in frame_keys]
             if any(key.shape != frame.layers[layer].high_k.shape for frame, key in zip(pending, keys)):
                 raise ValueError('Scoring key must match the unpartitioned frame')
-            scores = segment_summary_scores(query, keys)
+            scorer = segment_frame_query_scores if scoring_strategy == 'frame_mean_query' else segment_summary_scores
+            scores = scorer(query, keys)
             for frame, row, frame_scores in zip(pending, classified, scores):
                 row.append(frame.layers[layer].classify_scores(frame_scores))
         return {frame.frame_id: tuple(row) for frame, row in zip(pending, classified)}

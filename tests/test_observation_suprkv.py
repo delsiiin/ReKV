@@ -218,6 +218,7 @@ class CompressionModelTests(unittest.TestCase):
         self.assertEqual(result['status'], 'complete', result['runs'])
         self.assertIsNone(result['config']['summarizer_model_path'])
         self.assertEqual(result['method']['scoring_strategy'], 'frame_mean_query')
+        self.assertEqual(result['method']['compression_score'], 'pre_softmax')
         self.assertEqual(decoder.forward, original)
         self.assertFalse(hasattr(decoder, '_old_forward'))
         after = result['runs']['after']

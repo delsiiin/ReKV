@@ -75,3 +75,34 @@ def segment_summary_scores(query, keys):
     with torch.autocast(device_type=key.device.type, enabled=False):
         q = query.mean(0).reshape(kv_heads, heads // kv_heads, dim).mean(1)
         return torch.einsum('hd,fhnd->fn', q, batch) / (kv_heads * math.sqrt(dim))
+
+
+def segment_frame_query_scores(query, keys):
+    """Mean pre-softmax logits over frame queries and query heads.
+
+    Q=[frames, query heads, d], keys=list of [kv heads, tokens, d].
+    Each query/head scores every token in the segment, without softmax or a
+    causal mask. Return FP32 [frames, tokens] for per-frame thresholding.
+    """
+    if not keys or query.ndim != 3 or len(query) != len(keys):
+        raise ValueError('Expected one Query mean per segment frame')
+    key = keys[0]
+    if key.ndim != 3 or any(k.shape != key.shape or k.device != key.device for k in keys):
+        raise ValueError('Scoring keys must have matching frame shapes and devices')
+    kv_heads, tokens, dim = key.shape
+    heads = query.shape[1]
+    if min(kv_heads, tokens, dim, heads) < 1 or heads % kv_heads or query.shape[-1] != dim:
+        raise ValueError('Invalid GQA head mapping')
+    with torch.autocast(device_type=key.device.type, enabled=False):
+        query = query.to(device=key.device, dtype=torch.float32)
+        key = torch.cat(keys, dim=1).float()
+        if not (torch.isfinite(query).all() & torch.isfinite(key).all()):
+            raise ValueError('Nonfinite frame Q/K')
+        # Keep frame queries and GQA heads separate until after the dot product.
+        # Grouped contraction avoids repeating the entire Key tensor per Q head.
+        q = query.reshape(len(keys), kv_heads, heads // kv_heads, dim)
+        logits = torch.einsum('fhgd,hnd->hgfn', q, key) / math.sqrt(dim)
+        scores = logits.mean(dim=2).mean(dim=(0, 1))
+        if not torch.isfinite(scores).all():
+            raise ValueError('Nonfinite frame attention scores')
+        return scores.reshape(len(keys), tokens)
