@@ -44,7 +44,7 @@ class Element {
   }
 }
 const elements = {};
-globalThis.$ = id => elements[id] ??= new Element(/(Segment|Frame|Layer|Summary|Rope)$/.test(id) ? 'select' : 'div');
+globalThis.$ = id => elements[id] ??= new Element(/(Segment|Frame|Layer|Head|Summary|Rope)$/.test(id) ? 'select' : 'div');
 globalThis.node = (tag, cls = '', text = '') => { const el = new Element(tag, text); if (cls) el.classes.add(cls); return el; };
 globalThis.svgNode = (tag, attrs = {}, text = '') => { const el = node(tag, '', text); for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v); return el; };
 globalThis.fmt = value => String(value);
@@ -56,7 +56,7 @@ globalThis.segmentAttentionState = {controller: null, request: 0, selected: 0, d
 globalThis.attentionMeasures = [{key: 'pre_softmax', label: 'Softmax 前'}, {key: 'post_softmax', label: 'Softmax 后'}];
 globalThis.ropeLabel = () => 'RoPE 前';
 globalThis.state = {result: {
-  model: {layers: 2}, frames: [0,1,2].map(index => ({index, timestamp: index, width: 10, height: 10, image_url: '/frame.jpg'})),
+  model: {layers: 2, heads: 4, kv_heads: 2}, frames: [0,1,2].map(index => ({index, timestamp: index, width: 10, height: 10, image_url: '/frame.jpg'})),
   spatial: {cols: 2, cells: [{row:0, col:0, box:[0,0,.5,1]}, {row:0, col:1, box:[.5,0,1,1]}]},
   segment_experiment: {frame_query_attention: {url:'/api/frame-query-attention/abc'}, segment_attention: {url:'/summary'},
     segments: [{id:0, frame_indices:[0,1]}, {id:1, frame_indices:[2]}]}
@@ -71,6 +71,8 @@ globalThis.renderSegmentAttention = () => summaryRenders++;
 globalThis.renderFrameQuery = () => frameRenders++;
 initFrameQuery();
 assert(!$('frameQueryPanel').hidden && $('frameQueryLayer').value === 'all', 'initialize default layer');
+assert($('frameQueryHead').value === 'all' && $('frameQueryHead').options.length === 5, 'default mean and all Query head choices');
+$('frameQueryHead').value = '3';
 $('segmentAttentionSegment').value = '0'; $('segmentAttentionFrame').value = '0'; $('segmentAttentionLayer').value = 'all';
 $('segmentAttentionSummary').value = '1'; $('segmentAttentionRope').value = 'post';
 $('frameQuerySegment').value = '1'; $('frameQuerySegment').emit('change');
@@ -79,20 +81,29 @@ assert($('segmentAttentionSummary').value === '1' && $('segmentAttentionRope').v
 $('segmentAttentionSegment').value = '0'; attentionFrames(); $('segmentAttentionFrame').value = '1'; $('segmentAttentionLayer').value = '1';
 $('segmentAttentionLayer').emit('change');
 assert($('frameQuerySegment').value === '0' && $('frameQueryFrame').value === '1' && $('frameQueryLayer').value === '1', 'summary to frame controls');
+assert($('frameQueryHead').value === '3', 'preserve head through linked frame/layer selection');
 assert(summaryRenders === 1 && frameRenders === 3, 'no event recursion');
 globalThis.renderFrameQuery = render;
 const data = {segment_index:0, frame_index:1, layer:'1', rope:'pre', query_count:2, image_tokens:2, segment_tokens:4,
+  head:'3', query_heads:4, kv_heads:2, kv_head:1,
   frame_token_start:4, pre_softmax:[-2,2], post_softmax:[.1,.3], frame_masses:[{frame_index:1,mass:.4}], segment_mass:1};
 const pending = [];
 globalThis.fetch = (url, options) => new Promise(resolve => pending.push({url, options, resolve}));
 const response = value => ({ok:true, json:async () => value});
 async function main() {
-  const first = render(); const second = render();
+  const first = render(); $('frameQueryHead').value = 'all'; const second = render();
   assert(pending[0].options.signal.aborted, 'cancel prior request');
   assert(pending[1].url.includes('segment=0&frame=1&layer=1'), 'API selection');
-  pending[1].resolve(response(data)); await second;
+  assert(pending[0].url.includes('head=3') && pending[1].url.includes('head=all'), 'head sent in API request');
+  pending[1].resolve(response({...data, head:'all', kv_head:null})); await second;
   pending[0].resolve(response({...data, query_count:99})); await first;
   assert(frameQueryState.data.query_count === 2, 'ignore late older response');
+  assert(frameQueryState.data.head === 'all' && $('frameQueryMeta').textContent.includes('全部 Heads 平均'), 'ignore stale head response');
+  $('frameQueryHead').value = '3'; $('frameQueryHead').emit('change');
+  assert(pending[2].url.includes('head=3'), 'head control triggers request');
+  pending[2].resolve(response(data));
+  await Promise.resolve(); await Promise.resolve();
+  assert($('frameQueryMeta').textContent.includes('Query Head 4 → KV Head 2'), 'show native GQA head mapping');
   assert(!$('exportFrameQueryCsv').disabled && $('frameQueryMaps').children.length === 2, 'both measures render');
   const rects = $('frameQueryMaps').querySelectorAll('.attention-overlay rect');
   assert(rects.length === 4, 'two frame grids');
@@ -102,10 +113,11 @@ async function main() {
   const csv = frameQueryCsv(data).split('\n').map(row => row.split(','));
   assert(csv.length === 3 && csv[1][9] === '-2' && csv[1][11] === '0' && csv[1][13] === '1', 'CSV logits threshold/pruning');
   assert(csv[2][10] === '0.3' && csv[2][13] === '0', 'CSV probability and retained token');
-  const third = render(); clearFrameQuery(); pending[2].resolve(response(data)); await third;
+  assert(csv[0][15] === 'query_head' && csv[1][15] === '3' && csv[1][16] === '1', 'CSV zero-based Query and KV heads');
+  const third = render(); clearFrameQuery(); pending[3].resolve(response(data)); await third;
   assert(frameQueryState.data === null && $('frameQueryPanel').hidden, 'clear prevents late response from repopulating panel');
   delete state.result.segment_experiment.frame_query_attention;
-  initFrameQuery(); assert($('frameQueryMeta').textContent.includes('重新生成') && $('frameQueryFrame').disabled, 'legacy cache message');
+  initFrameQuery(); assert($('frameQueryMeta').textContent.includes('重新生成') && $('frameQueryFrame').disabled && $('frameQueryHead').disabled, 'legacy cache message');
   state.result = {}; initFrameQuery(); assert($('frameQueryPanel').hidden, 'no segment mode hides panel');
   print('frame-query UI OK');
 }

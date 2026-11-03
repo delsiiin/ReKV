@@ -266,6 +266,7 @@ class ObservationEngine:
                                                        hidden='decoder block output after attention and MLP residuals, before final model norm'),
                                       rows='summary content tokens', columns='selected frame spatial tokens in row-major order'),
                 frame_query_attention=dict(query='FP32 token mean of pre-RoPE video Q per frame, in frame order',
+                    head_selection='all (default) or zero-based Query head index; native GQA mapping',
                     key='all pre-RoPE image Keys in the same segment', rope_modes=['pre'],
                     aggregation='separate mean of logits and probabilities over frame queries, heads and selected layers',
                     normalization='softmax over the entire segment per frame query and head; no causal mask',

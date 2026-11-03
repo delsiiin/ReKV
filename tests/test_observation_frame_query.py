@@ -36,11 +36,43 @@ class FrameQueryTests(unittest.TestCase):
             self.queries.append(q[:, 2:11].float().reshape(3, 3, 4, 4).mean(1))
             self.keys.append(k[:, 2:11].reshape(3, 3, 2, 4))
 
-    def reference(self, layer, start=0, end=2):
+    def reference(self, layer, start=0, end=2, head=None):
         q = self.queries[layer][start:end].double().permute(1, 0, 2)
         k = self.keys[layer][start:end].double().reshape(-1, 2, 4).permute(1, 0, 2).repeat_interleave(2, 0)
         logits = q @ k.transpose(-1, -2) / 2
+        if head is not None:
+            logits = logits[head:head+1]
         return logits.mean((0, 1)).numpy(), logits.softmax(-1).mean((0, 1)).numpy()
+
+    def test_each_head_matches_dense_gqa_and_recovers_head_average(self):
+        for layer in ('0', '1', 'all'):
+            pieces_by_head = []
+            for head in range(4):
+                expected = np.mean([self.reference(i, head=head)
+                    for i in (range(2) if layer == 'all' else [int(layer)])], axis=0)
+                pieces = [frame_query_attention(self.root, self.result, 0, f, layer, str(head))
+                          for f in range(2)]
+                for measure, row in zip(('pre_softmax', 'post_softmax'), expected):
+                    np.testing.assert_allclose(np.concatenate([p[measure] for p in pieces]), row, atol=1e-12)
+                self.assertEqual(pieces[0]['head'], str(head))
+                self.assertEqual(pieces[0]['kv_head'], head // 2)
+                self.assertEqual(pieces[0]['query_heads'], 4)
+                self.assertEqual(pieces[0]['kv_heads'], 2)
+                self.assertEqual(pieces[0]['frame_masses'], pieces[1]['frame_masses'])
+                self.assertAlmostEqual(pieces[0]['segment_mass'], 1.)
+                self.assertAlmostEqual(pieces[0]['post_frame_mean'], np.mean(pieces[0]['post_softmax']))
+                json.dumps(pieces, allow_nan=False)
+                pieces_by_head.append(pieces[0])
+            averaged = frame_query_attention(self.root, self.result, 0, 0, layer)
+            self.assertEqual(averaged['head'], 'all')
+            self.assertIsNone(averaged['kv_head'])
+            for measure in ('pre_softmax', 'post_softmax'):
+                np.testing.assert_allclose(np.mean([p[measure] for p in pieces_by_head], axis=0),
+                                           averaged[measure], atol=1e-12)
+            self.assertFalse(np.allclose(pieces_by_head[0]['post_softmax'], pieces_by_head[1]['post_softmax']))
+        for head in ('-1', '4', '', 'ALL', '../0', '1.5', '０', None, True, 0):
+            with self.assertRaisesRegex(ValueError, 'head'):
+                frame_query_attention(self.root, self.result, 0, 0, '0', head)
 
     def test_fp32_frame_pooling_and_dense_gqa_layer_aggregation(self):
         for layer in range(2):
@@ -97,8 +129,17 @@ class FrameQueryTests(unittest.TestCase):
         handler.path = f'/api/frame-query-attention/{job}?segment=0&frame=0&layer=all'
         handler.do_GET()
         self.assertEqual(handler.send_json.call_args.args[0]['query_count'], 2)
+        self.assertEqual(handler.send_json.call_args.args[0]['head'], 'all')
+        handler.path = f'/api/frame-query-attention/{job}?segment=0&frame=0&layer=1&head=3'
+        handler.do_GET()
+        actual = handler.send_json.call_args.args[0]
+        self.assertEqual(actual['head'], '3')
+        self.assertEqual(actual['kv_head'], 1)
+        np.testing.assert_allclose(actual['post_softmax'], self.reference(1, head=3)[1][:3], atol=1e-12)
         for query in ('segment=0&frame=2&layer=all', 'segment=0&frame=0&layer=all&frame=1',
-                      'segment=0&frame=0&layer=all&rope=pre', 'segment=0&layer=all'):
+                      'segment=0&frame=0&layer=all&rope=pre', 'segment=0&layer=all',
+                      'segment=0&frame=0&layer=0&head=4', 'segment=0&frame=0&layer=0&head=',
+                      'segment=0&frame=0&layer=0&head=1&head=2'):
             handler.path = f'/api/frame-query-attention/{job}?{query}'
             handler.do_GET()
             self.assertEqual(handler.send_json.call_args.args[1], 404)

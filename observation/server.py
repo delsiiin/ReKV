@@ -305,14 +305,14 @@ class ObservationService:
             result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
             return segment_attention(directory, result, summary, segment, frame, layer, rope)
 
-    def frame_query_attention(self, job_id, segment, frame, layer):
+    def frame_query_attention(self, job_id, segment, frame, layer, head='all'):
         from observation.segments import frame_query_attention
         if not re.fullmatch(r'[a-f0-9]{24}', job_id):
             raise ValueError('Invalid job id')
         with self.similarity_lock:
             directory = self.cache / job_id
             result = json.loads((directory / 'result.json').read_text(encoding='utf-8'))
-            return frame_query_attention(directory, result, segment, frame, layer)
+            return frame_query_attention(directory, result, segment, frame, layer, head)
 
 
 def handler_for(service):
@@ -358,10 +358,11 @@ def handler_for(service):
                 match = re.fullmatch(r'/api/frame-query-attention/([a-f0-9]{24})', path)
                 if match:
                     query = parse_qs(parsed.query, keep_blank_values=True)
-                    if set(query) != {'segment', 'frame', 'layer'} or any(len(v) != 1 for v in query.values()):
-                        raise ValueError('Expected segment, frame and layer exactly once')
+                    required = {'segment', 'frame', 'layer'}
+                    if not required <= set(query) <= required | {'head'} or any(len(v) != 1 for v in query.values()):
+                        raise ValueError('Expected segment, frame, layer and optional head exactly once')
                     return self.send_json(service.frame_query_attention(match[1], int(query['segment'][0]),
-                        int(query['frame'][0]), query['layer'][0]))
+                        int(query['frame'][0]), query['layer'][0], query.get('head', ['all'])[0]))
                 match = re.fullmatch(r'/api/segment-attention/([a-f0-9]{24})', path)
                 if match:
                     query = parse_qs(parsed.query, keep_blank_values=True)

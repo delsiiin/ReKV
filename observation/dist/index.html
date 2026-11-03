@@ -150,13 +150,14 @@
       <div class="panel-heading"><div><h2>帧均值 Query → 本段 Key 注意力分布</h2><p id="frameQueryMeta" class="muted"></p></div><button id="exportFrameQueryCsv" class="text-button" type="button" disabled>↓ 当前帧 CSV</button></div>
       <div class="similarity-controls">
         <label for="frameQueryLayer">注意力层<select id="frameQueryLayer"></select></label>
+        <label for="frameQueryHead">Query Head<select id="frameQueryHead"></select></label>
         <label for="frameQuerySegment">Segment / Query 与 Key<select id="frameQuerySegment"></select></label>
         <label for="frameQueryFrame">段内图片帧<select id="frameQueryFrame"></select></label>
       </div>
-      <p class="muted">每帧图片 token 的 RoPE 前 Q 沿 token 维求均值，保留各 head，再按帧序组成段 Query。检索本段全部图片 Key，无因果遮罩；切帧不改变 softmax 归一化范围。段、帧和层与上方面板联动。</p>
+      <p class="muted">每帧图片 token 的 RoPE 前 Q 沿 token 维求均值，保留各 head，再按帧序组成段 Query。默认平均全部 heads；选择单个 Query Head 后仅平均本段帧 Query，使用原生 GQA 对应的 KV head。全部层模式再平均各层同编号 head。检索本段全部图片 Key，无因果遮罩；切帧不改变 softmax 归一化范围。段、帧和层与上方面板联动，Head 独立选择。</p>
       <p id="frameQueryMass" class="muted"></p><div id="frameQueryMaps"></div>
       <p id="frameQueryReadout" class="spatial-readout" aria-live="polite"></p>
-      <p class="tiny">实际压缩使用 Softmax 前分数，逐层按帧内均值分类；全部层剪枝图仅作预览。普通观察来自完整视频 prefill，实际压缩来自流式上下文，Q/K 数值可能不同。</p>
+      <p class="tiny">各图独立使用当前帧 min–max 色阶，跨 head 比较请读取原始分数。实际压缩使用全部 heads 平均的 Softmax 前分数，逐层按帧内均值分类；单 head 与全部层剪枝图仅作预览。普通观察来自完整视频 prefill，实际压缩来自流式上下文，Q/K 数值可能不同。</p>
     </section>
     <section id="answerPanel" class="panel" hidden><div class="panel-heading"><h2>模型回答</h2><span id="answerStatus" class="tag"></span></div><p id="answerQuestion" class="answer-question"></p><div class="answer-columns"><div><div class="eyebrow">MODEL RESPONSE</div><p id="modelAnswer" class="answer-text"></p></div><div class="reference-answer"><div class="eyebrow">REFERENCE ANSWER</div><p id="referenceAnswer" class="answer-text"></p></div></div><p id="answerMeta" class="muted"></p></section>
     <details id="inputDetails" class="panel" hidden><summary>本次模型输入与采样信息</summary><pre id="inputMetadata"></pre></details>

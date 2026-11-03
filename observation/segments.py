@@ -252,11 +252,12 @@ def token_similarity(directory, result, summary_index, frame_index, layer, repre
                 frame_token_start=result['frames'][frame_index]['token_start'])
 
 
-def mean_segment_attention(query, key, heads, kv_heads, query_chunk=32, key_mask=None):
+def mean_segment_attention(query, key, heads, kv_heads, query_chunk=32, key_mask=None, head=None):
     """QK diagnostic; apply the explicit key mask before softmax per head/query.
 
     Return separate means of logits and probabilities. Do not softmax mean logits.
     A single head and a bounded query chunk are materialized at a time.
+    With head set, average queries only for that native Query head.
     """
     query, key = np.asarray(query, dtype=np.float64), np.asarray(key, dtype=np.float64)
     if (query.ndim != 2 or key.ndim != 2 or min(query.shape) < 1 or min(key.shape) < 1
@@ -266,6 +267,9 @@ def mean_segment_attention(query, key, heads, kv_heads, query_chunk=32, key_mask
         raise ValueError('Invalid Q/K dimensions or GQA head configuration')
     if not np.isfinite(query).all() or not np.isfinite(key).all():
         raise ValueError('Attention requires finite Q/K states')
+    if head is not None and (type(head) is not int or not 0 <= head < heads):
+        raise ValueError('Invalid Query head')
+    selected_heads = range(heads) if head is None else [head]
     if key_mask is None:
         key_mask = np.ones(len(key), dtype=bool)
     key_mask = np.asarray(key_mask)
@@ -274,7 +278,7 @@ def mean_segment_attention(query, key, heads, kv_heads, query_chunk=32, key_mask
     dim = query.shape[1] // heads
     q, k = query.reshape(-1, heads, dim), key.reshape(-1, kv_heads, dim)
     before, after = np.zeros(len(key)), np.zeros(len(key))
-    for head in range(heads):
+    for head in selected_heads:
         kh = k[:, head // (heads // kv_heads), :]
         for start in range(0, len(query), query_chunk):
             logits = q[start:start + query_chunk, head, :] @ kh.T / np.sqrt(dim)
@@ -283,10 +287,10 @@ def mean_segment_attention(query, key, heads, kv_heads, query_chunk=32, key_mask
             probabilities = np.exp(logits - logits.max(axis=-1, keepdims=True))
             probabilities /= probabilities.sum(axis=-1, keepdims=True)
             after += probabilities.sum(0)
-    return before / (heads * len(query)), after / (heads * len(query))
+    return before / (len(selected_heads) * len(query)), after / (len(selected_heads) * len(query))
 
 
-def frame_query_attention(directory, result, segment_index, frame_index, layer):
+def frame_query_attention(directory, result, segment_index, frame_index, layer, head='all'):
     """Frame-mean pre-RoPE Q attends to every image key in its own segment."""
     experiment = result.get('segment_experiment', {})
     if 'frame_query_attention' not in experiment:
@@ -306,6 +310,14 @@ def frame_query_attention(directory, result, segment_index, frame_index, layer):
         selected = [int(layer)]
     else:
         raise ValueError('Invalid layer')
+    heads, kv_heads = result['model']['heads'], result['model']['kv_heads']
+    if head == 'all':
+        selected_head = None
+    elif isinstance(head, str) and head.isascii() and head.isdigit() and 0 <= int(head) < heads:
+        selected_head = int(head)
+        head = str(selected_head)
+    else:
+        raise ValueError('Invalid Query head')
     first, last = segment['start_frame'], segment['end_frame']
     count = result['sequence']['tokens_per_frame']
     total = (last - first) * count
@@ -320,7 +332,7 @@ def frame_query_attention(directory, result, segment_index, frame_index, layer):
                 or k.shape[:2] != (len(result['frames']), count)):
             raise ValueError('Stored frame Q/K dimensions do not match the result')
         logits, probabilities = mean_segment_attention(q[first:last], k[first:last].reshape(total, -1),
-                                                       result['model']['heads'], result['model']['kv_heads'])
+                                                       heads, kv_heads, head=selected_head)
         before += logits
         after += probabilities
     before /= len(selected)
@@ -328,6 +340,8 @@ def frame_query_attention(directory, result, segment_index, frame_index, layer):
     offset = (frame_index - first) * count
     pre, post = before[offset:offset + count], after[offset:offset + count]
     return dict(segment_index=segment_index, frame_index=frame_index, layer=layer, rope='pre',
+                head=head, query_heads=heads, kv_heads=kv_heads,
+                kv_head=None if selected_head is None else selected_head // (heads // kv_heads),
                 query_count=last-first, image_tokens=count, segment_tokens=total,
                 frame_token_start=result['frames'][frame_index]['token_start'],
                 pre_softmax=pre.tolist(), post_softmax=post.tolist(),
@@ -336,7 +350,9 @@ def frame_query_attention(directory, result, segment_index, frame_index, layer):
                               for i, row in enumerate(after.reshape(-1, count))],
                 segment_mass=float(after.sum()), scoring_strategy='frame_mean_query',
                 normalization='per frame query and head: softmax over all image tokens in the same segment; no causal mask',
-                aggregation='separate mean of logits and probabilities over frame queries, heads and selected layers',
+                aggregation=('separate mean of logits and probabilities over frame queries, '
+                             + ('all heads' if selected_head is None else 'the selected Query head')
+                             + ' and selected layers'),
                 compression_score='pre_softmax; each layer and frame thresholded at its own mean',
                 positional_encoding='pre-RoPE Q/K; no rotation applied')
 

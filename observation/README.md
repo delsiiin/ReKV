@@ -254,19 +254,27 @@ segment、帧和层；summary 来源和原面板的 RoPE 模式独立保留。
 按帧顺序组成 `[帧数, query heads, head_dim]` 的观察窗口。Key 是同段全部图片 token 的 RoPE 前 K。
 使用原生 GQA head 对应计算 `QKᵀ / √head_dim`，不包含提示词、summary、其他段或因果遮罩。
 热图分别展示平均 logits 和每个帧 Query/head 在整段 softmax 后的平均概率；全部层视图最后平均各层结果。
+“Query Head”默认选全部 Heads 平均；选择具体层与 Head 可查看每层每个 Query head 的分布，
+此时仅平均段内帧 Query，不再平均 heads。全部层 + 单 head 会平均各层同编号 head 的结果。
+页面 Head 编号从 1 开始，并显示原生 GQA 对应的 KV Head；切层、切帧或联动 summary 面板时保留 Head 选择。
 切帧只切展示向量，整段概率和为 1；同时提供帧内均值剪枝预览、token 读数与 CSV。
-全部层剪枝预览不等于实际逐层分类结果。
+热力图、剪枝阈值、帧/段权重和与 CSV 均使用所选 head 的结果。各图色阶独立缩放，跨 head 比较需读取原始分数。
+单 head 和全部层剪枝预览不等于实际压缩的逐层、全部 heads 平均分类结果。
 
 仅保存 `frame_query_means/video-{layer}.npy`（FP32，形状 `[视频帧数, query heads × head_dim]`），
 复用 `token_keys/video-{layer}.npy`，不保存完整视频 Q。结果元数据位于
 `segment_experiment.frame_query_attention`。接口为：
 
 ```text
-GET /api/frame-query-attention/{job_id}?segment=0&frame=0&layer=all
+GET /api/frame-query-attention/{job_id}?segment=0&frame=0&layer=0&head=0
 ```
 
-`layer` 支持 `all` 或从 0 开始的层号，frame 必须属于 segment。返回 `pre_softmax`、`post_softmax`、
-`pre_frame_mean`、`post_frame_mean`、`frame_masses`、`segment_mass` 与计算口径。
+`layer` 支持 `all` 或从 0 开始的层号，frame 必须属于 segment。
+可选 `head` 为 `all`（默认，兼容原接口）或从 0 开始的 Query head 编号。
+返回 `pre_softmax`、`post_softmax`、`pre_frame_mean`、`post_frame_mean`、`frame_masses`、`segment_mass` 与计算口径，
+另含 `head`、`query_heads`、`kv_heads` 和 `kv_head`（全部 heads 模式为 null）。
+CSV 增加 `query_head` 和 `kv_head` 列，编号从 0 开始；文件名包含 head 选择。
+已有帧均值 Q 与 Key 缓存可直接计算单 head 分布，无需额外保存模型状态。
 旧缓存缺少帧均值 Q 时需重启服务、刷新页面并重新生成观察数据。
 普通观察使用完整视频 prefill，实际压缩使用流式上下文；公式一致，Q/K 数值不保证一致。
 
