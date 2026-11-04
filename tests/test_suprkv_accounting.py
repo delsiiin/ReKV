@@ -9,12 +9,12 @@ import torch
 
 from model.suprkv.cache import StreamingKVCache, footprint
 from model.suprkv.accounting import MemoryLedger
-from model.suprkv.quantization import PackedKV
+from model.suprkv.quantization import PackedKV, CompactPackedKV
 
 
 def make_cache(device='cpu', frames=0, layers=2):
     sink = [(torch.zeros(2, 2, 16, device=device), torch.zeros(2, 2, 16, device=device)) for _ in range(layers)]
-    cache = StreamingKVCache(sink, 100000, 8, group_size=8)
+    cache = StreamingKVCache(sink, 100000, 8, group_size=8, compression_granularity="head")
     for i in range(frames):
         append(cache, i)
     return cache
@@ -38,9 +38,11 @@ class AccountingTests(unittest.TestCase):
         for frame in cache.frames.values():
             expected_counts = []
             for layer in frame.layers:
-                bits = layer.high_k.bits if isinstance(layer.high_k, PackedKV) else 16
+                bits = layer.high_k.bits if isinstance(layer.high_k, (PackedKV, CompactPackedKV)) else 16
                 counts = [layer.low_indices.numel(), 0, 0, 0]
                 counts[{16: 0, 8: 1, 4: 2, 2: 3}[bits]] += layer.high_indices.numel()
+                if layer.high_offsets is not None:
+                    counts = [n / layer.heads for n in counts]
                 expected_counts.append(counts)
             self.assertEqual(rows[frame.frame_id]['counts'], expected_counts)
         return stats
@@ -184,7 +186,7 @@ class AccountingTests(unittest.TestCase):
                 return footprint(self._persistent())
 
         fast = make_cache()
-        slow = FullScanCache(fast.sink, 100000, 8, group_size=8)
+        slow = FullScanCache(fast.sink, 100000, 8, group_size=8, compression_granularity="head")
         for i in range(12):
             append(fast, i)
             append(slow, i)

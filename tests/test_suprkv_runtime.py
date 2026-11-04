@@ -124,7 +124,7 @@ class ModelBridgeTests(unittest.TestCase):
         patch_hf(model, attention_factory=streaming_attention_forward, n_local=64, n_init=2, fattn=False)
         initial = model(input_ids=torch.tensor([[1, 2]]), use_cache=True)
         sink = [(k[0], v[0]) for k, v in initial.past_key_values]
-        store = StreamingKVCache(sink, 10000, 4, group_size=8)
+        store = StreamingKVCache(sink, 10000, 4, group_size=8, compression_granularity="head")
         contexts = [EncodeLayer(past) for past in initial.past_key_values]
         model(input_ids=torch.tensor([[3, 4, 5, 6]]), past_key_values=contexts, use_cache=True)
         self.assertTrue(all(x.captured is not None for x in contexts))
@@ -141,7 +141,8 @@ class ModelBridgeTests(unittest.TestCase):
         retrieved = model(input_ids=torch.tensor([[7, 8]]),
             past_key_values=[RetrieveLayer(snapshot, i, 3, hits) for i in range(2)], use_cache=True)
         self.assertEqual(hits, {0, 1, 2})
-        self.assertNotEqual(retrieved.past_key_values[0][0].shape[-2], retrieved.past_key_values[1][0].shape[-2])
+        self.assertNotEqual(retrieved.past_key_values[0].heads[0].key.shape[-2],
+                            retrieved.past_key_values[1].heads[0].key.shape[-2])
         decoded = model(input_ids=torch.tensor([[9]]), past_key_values=retrieved.past_key_values, use_cache=True)
         self.assertTrue(torch.isfinite(decoded.last_hidden_state).all())
         with native_decoder(model):

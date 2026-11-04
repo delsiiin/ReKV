@@ -98,7 +98,7 @@ class OneVisionEngine:
         sink = tuple((k[0], v[0]) for k, v in output.past_key_values)
         self.cache = StreamingKVCache(sink, self.config['budget_tokens'], self.frame_tokens,
                                       self.config['recent_frames'], self.config['group_size'], profiler=self.profiler,
-                                      dtype=self.dtype)
+                                      dtype=self.dtype, compression_granularity=self.config.get('compression_granularity', 'layer'))
         self.segmenter = OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
                                          self.config['max_segment_frames'])
         self.clear_segment()

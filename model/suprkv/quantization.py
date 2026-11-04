@@ -133,6 +133,69 @@ class PackedKV:
         return left @ (dense.transpose(-1, -2) if transpose else dense)
 
 
+@dataclass(frozen=True)
+class CompactPackedKV:
+    """Flat packed payload; every head retains its own quantization boundaries.
+
+    Offsets are immutable host metadata, avoiding device synchronization during
+    reads. Only per-row packing alignment is padded, never to the longest head.
+    Head views share these three storages and are created only when needed.
+    """
+    data: torch.Tensor
+    scale: torch.Tensor
+    offset: torch.Tensor
+    head_offsets: tuple
+    dim: int
+    bits: int
+    group_size: int
+    axis: str
+    data_offsets: tuple
+    parameter_offsets: tuple
+
+    @classmethod
+    def quantize(cls, value, head_offsets, group_size, *, axis, bits=8, backend='auto'):
+        if value.ndim != 2 or head_offsets[0] != 0 or head_offsets[-1] != len(value):
+            raise ValueError('Expected compact [total_head_tokens, dim] payload and offsets')
+        parts, data_offsets, parameter_offsets = [], [0], [0]
+        for start, end in zip(head_offsets, head_offsets[1:]):
+            if end <= start:
+                raise ValueError('Retained high regions must be nonempty in every head')
+            part = PackedKV.quantize(value[start:end][None], group_size, axis=axis, bits=bits, backend=backend)
+            parts.append(part)
+            data_offsets.append(data_offsets[-1] + part.data.numel())
+            parameter_offsets.append(parameter_offsets[-1] + part.scale.numel())
+        return cls(*(torch.cat([getattr(p, name).flatten() for p in parts]) for name in ('data', 'scale', 'offset')),
+                   tuple(head_offsets), value.shape[-1], bits, group_size, axis,
+                   tuple(data_offsets), tuple(parameter_offsets))
+
+    def head(self, index):
+        tokens = self.head_offsets[index+1] - self.head_offsets[index]
+        rows, length = (self.dim, tokens) if self.axis == 'channel' else (tokens, self.dim)
+        words = ((length + 7) // 8 * 8) // (16 // self.bits)
+        groups = (length + self.group_size - 1) // self.group_size
+        begin, end = self.data_offsets[index:index+2]
+        pbegin, pend = self.parameter_offsets[index:index+2]
+        return PackedKV(self.data[begin:end].view(1, rows, words),
+                        self.scale[pbegin:pend].view(1, rows, groups),
+                        self.offset[pbegin:pend].view(1, rows, groups),
+                        (1, tokens, self.dim), self.bits, self.group_size, self.axis)
+
+    def shrink(self, *, backend='auto'):
+        if self.bits == 2:
+            return self
+        # Each packed row is aligned for all supported precisions, so the
+        # existing integer lowering kernel can process the flat storage once.
+        flat = PackedKV(self.data, self.scale, self.offset, (), self.bits, self.group_size, self.axis)
+        lowered = flat.shrink(backend=backend)
+        return CompactPackedKV(lowered.data, lowered.scale, lowered.offset,
+                               self.head_offsets, self.dim, lowered.bits, self.group_size, self.axis,
+                               tuple(x // 2 for x in self.data_offsets), self.parameter_offsets)
+
+    def dequantize(self, device=None, dtype=torch.float16, *, backend='auto'):
+        return torch.cat([self.head(h).dequantize(device, dtype, backend=backend)[0]
+                          for h in range(len(self.head_offsets)-1)])
+
+
 def pack(codes, bits):
     """PM-KVQ int16 containers, first code in the most significant bits."""
     if bits not in (16, 8, 4, 2):

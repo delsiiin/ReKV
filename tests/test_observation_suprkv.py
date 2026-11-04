@@ -17,6 +17,16 @@ from model.suprkv.profiling import StageProfiler
 
 
 class CompressionParameterTests(unittest.TestCase):
+    def test_compression_granularity_validation_and_default(self):
+        dataset = SimpleNamespace(get=lambda _: dict(conversations=[dict(question='q')]))
+        base = dict(sample_id='sample', mode='compression')
+        self.assertEqual(validate_params(base, dataset)['compression_granularity'], 'layer')
+        for mode in ('layer', 'head'):
+            self.assertEqual(validate_params(dict(base, compression_granularity=mode), dataset)['compression_granularity'], mode)
+        for invalid in ('heads', None, True, {}):
+            with self.assertRaisesRegex(ValueError, 'compression_granularity'):
+                validate_params(dict(base, compression_granularity=invalid), dataset)
+
     def test_observation_loads_hub_id_without_resolving_as_local_path(self):
         model_id = 'llava-hf/llava-onevision-qwen2-7b-ov-hf'
         engine = ObservationEngine(model_id, device='cpu', dtype='float32')
@@ -131,6 +141,7 @@ class CompressionParameterTests(unittest.TestCase):
                 self.assertNotEqual(key, service.cache_key(dict(params, dtype='float32')))
                 self.assertNotEqual(key, service.cache_key(dict(params, max_frames=1)))
                 self.assertNotEqual(key, service.cache_key(dict(params, compression_budget_tokens=700)))
+                self.assertNotEqual(key, service.cache_key(dict(params, compression_granularity='head')))
                 self.assertNotEqual(key, service.cache_key(dict(params, custom_questions=['another question'])))
                 external = dict(params, summarizer_model_path='llava-hf/llava-onevision-qwen2-0.5b-ov-hf')
                 self.assertNotEqual(key, service.cache_key(external))
@@ -368,12 +379,75 @@ class CompressionModelTests(unittest.TestCase):
         self.assertFalse(hasattr(self.llm.model, '_old_forward'))
 
     @torch.inference_mode()
-    def test_no_compression_has_equal_payload_and_answers(self):
+    def test_no_pruning_preserves_answers_and_accounts_for_per_head_indices(self):
+        result = compare(self.observer, list(range(4)), self.frames, self.record,
+                         dict(self.params, compression_budget_tokens=10000, compression_granularity="head"), lambda *_: None, lambda: None)['compression_experiment']
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['runs']['after']['cache']['counts']['compressions'], 0)
+        states = result['runs']['after']['timeline'][-1]['frame_states']
+        # Before pruning, KV values are unchanged, but each classified head
+        # needs its own int32 source-token index instead of one shared index.
+        extra_indices = len(states['frames'])*states['tokens_per_frame']*sum(h-1 for h in states['kv_heads'])*4
+        self.assertEqual(result['memory']['persistent_kv']['saved_bytes'], -extra_indices)
+        self.assertEqual(result['runs']['before']['answer']['answer'], result['runs']['after']['answer']['answer'])
+
+    @torch.inference_mode()
+    def test_default_original_flow_keeps_shared_indices_and_equal_payload(self):
         result = compare(self.observer, list(range(4)), self.frames, self.record,
                          dict(self.params, compression_budget_tokens=10000), lambda *_: None, lambda: None)['compression_experiment']
         self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['config']['compression_granularity'], 'layer')
+        self.assertEqual(result['runs']['after']['cache']['compression_granularity'], 'layer')
         self.assertEqual(result['memory']['persistent_kv']['saved_bytes'], 0)
         self.assertEqual(result['runs']['before']['answer']['answer'], result['runs']['after']['answer']['answer'])
+
+    @torch.inference_mode()
+    def test_headwise_paired_run_prunes_with_both_scoring_strategies_and_live_snapshots(self):
+        for strategy in ('summary', 'frame_mean_query'):
+            captured = {'before': [], 'after': []}
+            messages = []
+            def publish(side, point):
+                captured[side].append(json.loads(json.dumps(point)))
+            result = compare(self.observer, list(range(4)), self.frames, self.record,
+                             dict(self.params, compression_granularity='head', scoring_strategy=strategy),
+                             lambda stage, message, fraction: messages.append(message), lambda: None,
+                             on_snapshot=publish)['compression_experiment']
+            self.assertEqual(result['status'], 'complete', result['runs'])
+            self.assertEqual(result['config']['compression_granularity'], 'head')
+            self.assertEqual(result['method']['compression_granularity'], 'head')
+            before, after = result['runs']['before'], result['runs']['after']
+            self.assertFalse(before['compression_enabled'])
+            self.assertTrue(after['compression_enabled'])
+            self.assertEqual(before['compression_granularity'], 'layer')
+            self.assertEqual(before['cache']['compression_granularity'], 'layer')
+            self.assertEqual(before['cache']['counts']['compressions'], 0)
+            self.assertEqual(after['compression_granularity'], 'head')
+            self.assertEqual(after['cache']['compression_granularity'], 'head')
+            self.assertEqual(after['cache']['counts']['scoring_failures'], 0)
+            self.assertGreater(after['cache']['counts']['dropped_low_frames'], 0)
+            self.assertLessEqual(after['cache']['persistent_bytes'], after['cache']['budget_bytes'])
+            self.assertGreater(result['memory']['persistent_kv']['saved_bytes'], 0)
+            self.assertTrue(any('压缩后 · 逐 KV head' in message for message in messages))
+            for side, run in (('before', before), ('after', after)):
+                self.assertEqual(captured[side], run['timeline'])
+                for point in run['timeline']:
+                    self.assertEqual(point['compression_enabled'], side == 'after')
+                    self.assertEqual(point['compression_granularity'], 'head' if side == 'after' else 'layer')
+                    for frame in point['frame_states']['frames']:
+                        if frame['status'] == 'evicted':
+                            continue
+                        for mean, heads in zip(frame['counts'], frame['head_counts']):
+                            self.assertEqual(mean, [sum(h[b] for h in heads)/len(heads) for b in range(4)])
+                            if side == 'before' or frame['protected']:
+                                self.assertTrue(all(h == [196, 0, 0, 0] for h in heads))
+            retained = after['timeline'][-1]['frame_states']['frames']
+            self.assertTrue(any(len({sum(h) for h in heads}) > 1
+                                for frame in retained if frame['head_counts'] is not None
+                                for heads in frame['head_counts']))
+            self.assertTrue(before['answer']['answer'])
+            self.assertTrue(after['answer']['answer'])
+            self.assertFalse(hasattr(self.llm.model, '_old_forward'))
+            json.dumps(result, allow_nan=False)
 
     def test_invalid_budget_is_reported_per_side_and_restores_model(self):
         result = compare(self.observer, list(range(4)), self.frames, self.record,

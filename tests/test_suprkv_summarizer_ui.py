@@ -23,14 +23,18 @@ function load(source, name) {
 function assert(value, message) { if (!value) throw new Error(message); }
 const elements = {};
 globalThis.$ = id => elements[id] ??= {value: '2', checked: true, options: [{}],
-  classList: {remove() {}}, querySelectorAll() { return [{value: '0'}]; },
+  classList: {remove() {}, add() {}}, querySelectorAll() { return [{value: '0'}]; },
   replaceChildren(...children) { this.children = children; }, append() {}};
 globalThis.state = {result: null};
 globalThis.document = {querySelector() { return {}; }};
 $('mode').value = 'compression'; $('compressionSummarizer').value = 'main';
+$('compressionGranularity').value = 'layer';
 $('compressionCustomQuestions').value = ''; $('maxFrames').value = '';
 const parameters = load(app, 'parameters'), update = load(app, 'updateWindowLabels');
 assert(parameters().summarizer_model_path === null, 'main default');
+assert(parameters().compression_granularity === 'layer', 'original default');
+$('compressionGranularity').value = 'head';
+assert(parameters().compression_granularity === 'head', 'headwise switch');
 $('compressionSummarizer').value = 'llava-hf/llava-onevision-qwen2-0.5b-ov-hf';
 assert(parameters().summarizer_model_path.endsWith('0.5b-ov-hf'), 'preset model ID');
 $('compressionSummarizer').value = 'custom'; $('compressionSummarizerPath').value = '  /models/custom  ';
@@ -45,6 +49,7 @@ $('compressionScoring').value = 'summary'; update();
 assert(!$('compressionSummarizer').disabled && $('compressionSummarizerPath').required, 'restore summary controls');
 $('mode').value = 'video'; update();
 assert(!('summarizer_model_path' in parameters()), 'ordinary observation excludes summarizer');
+assert(!('compression_granularity' in parameters()), 'ordinary observation excludes compression switch');
 assert($('compressionSummarizerPath').disabled && !$('compressionSummarizerPath').required, 'hidden field must not block submit');
 
 for (const name of ['stopCachePlayback', 'prepareCompressionQuestions', 'renderCompressionAnswer',
@@ -61,12 +66,15 @@ const result = {compression_experiment: e, frames: []};
 render(result, '/result.json', true);
 assert($('compressionLabel').textContent.includes('1 → 1 个模型'), 'legacy model count');
 assert($('compressionLabel').textContent.includes('摘要配置：主模型'), 'legacy default summarizer');
+assert($('compressionLabel').textContent.includes('层级共享（原流程）'), 'legacy compression mode');
+e.config.compression_granularity = 'head';
 e.config.summarizer_model_path = 'auxiliary';
 e.runs.before.model_stats = {model_instances: 1, model_parameter_bytes: 100};
 e.runs.after.model_stats = {model_instances: 2, model_parameter_bytes: 150, summary_retries: 3, summary_failures: 1};
 render(result, '/result.json', false);
 assert($('compressionLabel').textContent.includes('1 → 2 个模型'), 'independent model count');
 assert($('compressionLabel').textContent.includes('重试 3 次 / 最终失败 1 次'), 'fallback counters');
+assert($('compressionLabel').textContent.includes('删除粒度：逐 KV head'), 'selected headwise result label');
 e.runs.after.commits = [{segment_id: 0, summary: 'real caption', summary_source: 'main-checkpoint',
   summarizer_error: 'empty auxiliary summary', summary_retried: true, summary_retry_succeeded: true, summary_error: ''}];
 render(result, '/result.json', false);
@@ -78,6 +86,19 @@ e.stages = [{label: '生成 summary', before_seconds: 0, after_seconds: 0, delta
 render(result, '/result.json', false);
 assert($('compressionLabel').textContent.includes('摘要配置：未启用'), 'summary disabled label');
 assert($('compressionCostTable').children[0].rows[0][2] === '未启用', 'summary stage disabled');
+globalThis.node = () => ({});
+globalThis.followLatestCacheState = () => {};
+const live = load(results, 'renderCompressionLive');
+const job = {id: 'headwise-job', preview: {frames: [{}, {}]}, compression_live: {revision: 1, side: 'after',
+  point: {frame_index: 0, kind: 'frame', compression_enabled: true, compression_granularity: 'head', frame_states: {layer_count: 2}}}};
+live(job);
+assert($('compressionLabel').textContent.includes('压缩后 · 逐 KV head'), 'live headwise mode');
+job.compression_live.revision = 2;
+job.compression_live.side = 'before';
+job.compression_live.point.compression_enabled = false;
+job.compression_live.point.compression_granularity = 'layer';
+live(job);
+assert($('compressionLabel').textContent.includes('原精度 基线（不压缩）'), 'fixed uncompressed baseline');
 print('UI behavior OK');
 '''
         result = subprocess.run(['gjs', '-c', script], cwd=Path(__file__).resolve().parents[1],

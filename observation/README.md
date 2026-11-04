@@ -259,7 +259,7 @@ segment、帧和层；summary 来源和原面板的 RoPE 模式独立保留。
 页面 Head 编号从 1 开始，并显示原生 GQA 对应的 KV Head；切层、切帧或联动 summary 面板时保留 Head 选择。
 切帧只切展示向量，整段概率和为 1；同时提供帧内均值剪枝预览、token 读数与 CSV。
 热力图、剪枝阈值、帧/段权重和与 CSV 均使用所选 head 的结果。各图色阶独立缩放，跨 head 比较需读取原始分数。
-单 head 和全部层剪枝预览不等于实际压缩的逐层、全部 heads 平均分类结果。
+单 Q head 和全部层剪枝预览不等于实际压缩的分类结果：默认按层聚合全部 heads，逐 KV head 模式仍需聚合同一 GQA 组的 Q heads；流式上下文也与普通观察不同。
 
 仅保存 `frame_query_means/video-{layer}.npy`（FP32，形状 `[视频帧数, query heads × head_dim]`），
 复用 `token_keys/video-{layer}.npy`，不保存完整视频 Q。结果元数据位于
@@ -339,9 +339,16 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 
 重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；本模式始终分段，默认 summary 策略生成摘要，不受注意力观察的启用复选框影响。
 
+「Token 删除粒度」选择压缩后使用的流程：
+
+- **层级共享（原流程，默认）**：`compression_granularity="layer"`，跨 head 平均分数，每层每帧共享 token 索引。
+- **逐 KV head**：`compression_granularity="head"`，每个 KV head 以自己的帧内均分划分高低分区，以连续 KV、索引和 head offsets 紧凑存储，支持各 head 保留不同数量的 token。
+
+压缩前固定使用未压缩的矩形 KV 基线，所选粒度只作用于压缩后。预算触发、recent 保护、渐进降位和整帧淘汰规则共用原流程。结果缓存按粒度区分；实时进度及最终结果标题显示所选模式。`runs.before/after` 和每个 `timeline` 状态点记录 `compression_enabled`、`compression_granularity`，完整 JSON 可核对实际执行配置。
+
 「Token 评分策略」支持 `summary`（默认）和 `frame_mean_query`。后者使用每帧的 RoPE 前 Q 均值，
-对本段原始 RoPE 前 K 计算缩放点积，保留各帧 Query 和 head，计算后再沿 Query 帧维和 head 维平均。
-使用 **softmax 前**分数逐层逐帧按帧内均值分类，等于均值归为高分。
+对本段原始 RoPE 前 K 计算缩放点积，保留各帧 Query 和 head，计算后沿 Query 帧维平均；层级共享再聚合全部 heads，逐 KV head 仅聚合同一 GQA 组的 Q heads。
+使用 **softmax 前**分数，按所选粒度逐层逐帧计算 token 均分阈值，等于均分归为高分。
 新策略跳过摘要模型加载、摘要生成和文字 Q 提取，忽略摘要模型配置；对应阶段显示“未启用”。
 分段只使用视觉 EMA 与帧数限制，不受摘要上下文容量约束。帧均值 Q 计入临时工作内存，段提交后释放，
 不计入持久 KV 预算。API `POST /api/jobs` 增加 `scoring_strategy`，配置、提交记录和结果 JSON 记录策略。
@@ -392,11 +399,13 @@ CUDA 分配量及峰值包含压缩侧新增权重；持久 KV 预算不包含�
 
 - 每帧显示剩余/原始 token 数、原精度/8bit/4bit/2bit 分布、删除数、剩余 token 的平均位宽及状态。
 - recent 帧标记为保护；未闭合段标记为未闭段；整帧淘汰后仍显示该帧，剩余数为 0；尚未编码的帧显示「未编码」，不作为已删除帧。
-- 各层独立分类和压缩。单层视图展示整数计数；全部层视图展示每层平均数及各层剩余数的最小–最大范围。色条宽度以每层原始 token 数为分母，灰色部分为删除数。
+- 各层独立分类和压缩。单层视图展示该层各 KV head 的平均 token 数，逐 head 模式下可能为小数；全部层视图再平均各层计数，并展示各层剩余数的最小–最大范围。色条宽度以原始每帧 token 数为分母，灰色部分为删除数。
 - 一个 token 位置的 K/V 共同计一次，不按 head 或 K/V 翻倍，sink 不属于视频帧。平均位宽按剩余 token 数加权，不含 scale、offset 和打包填充，不能替代实际显存统计。
 - 支持导出当前进度、版本、层选择对应的 CSV。
 
 `schema_version=24` 的 `timeline[].frame_states` 保存独立的纯数值快照：`layer_count`、`tokens_per_frame`、`bit_order=[16,8,4,2]` 及 `frames`；存活帧的 `counts[layer]` 为四档 token 数，淘汰帧为 `counts=null`。未来帧尚不出现在该进度的快照中。状态采集不保留 GPU tensor 引用、不执行 KV offload；采集用时单独记录为 `reporting_seconds`，从两侧 `encoding_seconds/total_seconds` 扣除，也不计入算法各阶段计时。旧结果会因源码指纹变化自动重新计算。
+
+当前快照另提供 `head_counts[layer][head]` 四档整数明细，`counts[layer]` 为各 head 的平均值，`count_unit="mean_tokens_per_kv_head"` 标明口径，`kv_heads[layer]` 记录 head 数。精确压缩收益继续读取实际张量字节，包含逐 head 索引和量化参数的开销。
 
 
 ### Segment 底色与动态状态

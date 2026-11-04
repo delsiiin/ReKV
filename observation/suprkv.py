@@ -104,7 +104,11 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
     initial_memory = cuda_memory(device)
     profiler = StageProfiler(device)
     began = time.perf_counter()
-    with borrowed_engine(model, processor, dict(config, compression_enabled=compressed), profiler, check_cancel, summarizer) as engine:
+    # The selected compression policy belongs only to the after pass. Keep the
+    # baseline's cache layout and protected-capacity check independent of it.
+    pass_config = dict(config, compression_enabled=compressed,
+                       compression_granularity=config.get('compression_granularity', 'layer') if compressed else 'layer')
+    with borrowed_engine(model, processor, pass_config, profiler, check_cancel, summarizer) as engine:
         timeline, commits = [], []
         last_commit = None
         reporting_seconds = 0.
@@ -120,6 +124,8 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
                 for frame in frame_states['frames']:
                     frame['segment_id'] = None
             timeline.append(dict(frame_index=index, timestamp=frames[index]['timestamp'], kind=kind,
+                                 compression_enabled=compressed,
+                                 compression_granularity=engine.cache.compression_granularity,
                                  persistent_tensor_bytes=stats['persistent_tensor_bytes'],
                                  persistent_cuda_bytes=stats['persistent_cuda_bytes'],
                                  managed_bytes=stats['persistent_bytes'],
@@ -163,6 +169,7 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
         profiler.synchronize()
         end_memory = cuda_memory(device)
         return dict(status='complete', answer=answers[0], answers=answers, timeline=timeline, commits=commits,
+                    compression_enabled=compressed, compression_granularity=engine.cache.compression_granularity,
                     cache=cache_stats, model_stats=engine.stats(), timings=profiler.result(), encoding_seconds=encoding_seconds,
                     total_seconds=time.perf_counter()-began-reporting_seconds, reporting_seconds=reporting_seconds,
                     initial_cuda=initial_memory,
@@ -200,6 +207,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         raise ValueError('Compression comparison requires matching nonempty frames/images')
     config = asdict(StreamingConfig(model_path=observation.model_path, device=observation.device,
         scoring_strategy=params.get('scoring_strategy', 'summary'),
+        compression_granularity=params.get('compression_granularity', 'layer'),
         summarizer_model_path=params.get('summarizer_model_path'),
         budget_tokens=params['compression_budget_tokens'], topk=params['compression_topk'],
         recent_frames=params['compression_recent_frames'], max_segment_frames=params['compression_max_segment_frames'],
@@ -210,8 +218,9 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
     questions += [dict(question_index=None, question=q) for q in params.get('custom_questions', [])]
     questions = [dict(q, question_id=i+1) for i, q in enumerate(questions)]
     runs = {}
+    compression_label = '逐 KV head' if config['compression_granularity'] == 'head' else '层级共享'
     for index, (name, compressed, label) in enumerate([
-            ('before', False, f'压缩前 · {dtype}'), ('after', True, '压缩后 · 预算约束')]):
+            ('before', False, f'压缩前 · {dtype}'), ('after', True, f'压缩后 · {compression_label} · 预算约束')]):
         check_cancel()
         def report(frame, total):
             progress('compression_'+name, f'{label}：处理帧 {frame+1}/{total}', .15+.4*index+.3*frame/total)
@@ -263,12 +272,13 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         cutoff_timestamp=frames[-1]['timestamp'], config=config, runs=runs, memory=memory, stages=stages,
         method=dict(model_instances=after.get('model_stats', {}).get('model_instances', 1),
             scoring_strategy=config['scoring_strategy'], compression_score='pre_softmax',
+            compression_granularity=config['compression_granularity'],
             summarizer_model_path=config['summarizer_model_path'],
             execution='sequential', cache_device=observation.device, dtype=dtype,
             offload=False, baseline=f'same streaming encoding and top-k retrieval; all {dtype}; no compression or summaries',
             timing='exclusive wall time, CUDA synchronized at stage boundaries; excludes model loading and video decoding',
             memory='unique persistent tensor storage; CUDA allocated/peak include weights and workspaces; reserved allocator memory is not savings',
-            frame_states='each progress point records per-frame, per-layer token counts [model dtype, INT8, INT4, INT2]; bit_order 16 denotes unquantized model dtype; evicted frames retain observed segment_id and have counts=null; baseline segment_id=null; no future frames; sink excluded',
+            frame_states='each progress point records per-frame, per-layer mean token counts per KV head [model dtype, INT8, INT4, INT2]; head_counts[layer][head] gives individual counts; bit_order 16 denotes unquantized model dtype; evicted frames retain observed segment_id and have counts=null; baseline segment_id=null; no future frames; sink excluded',
             retrieval_hits='once per question per frame across layers, including recent frames; segment hit means any member frame was retrieved; both sides use compressed-run segments; unavailable if compressed run failed',
             sampling='identical selected frames and questions; questions are answered independently in order at the last selected frame using the same video cache; reference answers are not inputs',
             measurement='single paired run, baseline first; first-use kernel initialization can affect timing')))

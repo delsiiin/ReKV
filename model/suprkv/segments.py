@@ -35,7 +35,7 @@ class OnlineSegmenter:
         self.count = 0  # Preserve EMA and the preceding visual frame.
 
 
-def summary_scores(query, key):
+def summary_scores(query, key, *, headwise=False):
     """FP32 scores; Q=[summary tokens, query heads, d], K=[kv heads, tokens, d]."""
     if query.ndim != 3 or key.ndim != 3 or not len(query):
         raise ValueError('Empty or malformed summary Q/K')
@@ -46,16 +46,18 @@ def summary_scores(query, key):
     key = key.float()
     if not torch.isfinite(query).all() or not torch.isfinite(key).all():
         raise ValueError('Nonfinite summary Q/K')
-    # Linearity gives exactly mean_{query,head}(Q K^T), without an S x N matrix.
+    # Pool queries within each GQA group, preserving independent KV heads.
     with torch.autocast(device_type=key.device.type, enabled=False):
         q = query.mean(0).reshape(kv_heads, heads // kv_heads, dim).mean(1)
-        return torch.einsum('hd,hnd->n', q, key) / (kv_heads * math.sqrt(dim))
+        if not headwise:
+            return torch.einsum('hd,hnd->n', q, key) / (kv_heads * math.sqrt(dim))
+        return torch.einsum('hd,hnd->hn', q, key) / math.sqrt(dim)
 
 
-def segment_summary_scores(query, keys):
+def segment_summary_scores(query, keys, *, headwise=False):
     """Score equally shaped frames in one layer, pooling its Query only once.
 
-    Return FP32 [frames, tokens]; callers must threshold each frame separately.
+    Return FP32 [frames, tokens], or [frames, kv_heads, tokens] with headwise=True.
     Only one layer's FP32 keys are materialized at a time by the cache caller.
     """
     if not keys or query.ndim != 3 or not len(query):
@@ -74,15 +76,17 @@ def segment_summary_scores(query, keys):
         raise ValueError('Nonfinite summary Q/K')
     with torch.autocast(device_type=key.device.type, enabled=False):
         q = query.mean(0).reshape(kv_heads, heads // kv_heads, dim).mean(1)
-        return torch.einsum('hd,fhnd->fn', q, batch) / (kv_heads * math.sqrt(dim))
+        if not headwise:
+            return torch.einsum('hd,fhnd->fn', q, batch) / (kv_heads * math.sqrt(dim))
+        return torch.einsum('hd,fhnd->fhn', q, batch) / math.sqrt(dim)
 
 
-def segment_frame_query_scores(query, keys):
-    """Mean pre-softmax logits over frame queries and query heads.
+def segment_frame_query_scores(query, keys, *, headwise=False):
+    """Mean pre-softmax logits over frame queries and each GQA group.
 
     Q=[frames, query heads, d], keys=list of [kv heads, tokens, d].
     Each query/head scores every token in the segment, without softmax or a
-    causal mask. Return FP32 [frames, tokens] for per-frame thresholding.
+    causal mask. Return [frames, tokens], or [frames, kv_heads, tokens] in headwise mode.
     """
     if not keys or query.ndim != 3 or len(query) != len(keys):
         raise ValueError('Expected one Query mean per segment frame')
@@ -102,7 +106,8 @@ def segment_frame_query_scores(query, keys):
         # Grouped contraction avoids repeating the entire Key tensor per Q head.
         q = query.reshape(len(keys), kv_heads, heads // kv_heads, dim)
         logits = torch.einsum('fhgd,hnd->hgfn', q, key) / math.sqrt(dim)
-        scores = logits.mean(dim=2).mean(dim=(0, 1))
+        scores = logits.mean(dim=2).mean(dim=1) if headwise else logits.mean(dim=2).mean(dim=(0, 1))
         if not torch.isfinite(scores).all():
             raise ValueError('Nonfinite frame attention scores')
-        return scores.reshape(len(keys), tokens)
+        return (scores.reshape(kv_heads, len(keys), tokens).permute(1, 0, 2).contiguous()
+                if headwise else scores.reshape(len(keys), tokens))

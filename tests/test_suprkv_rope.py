@@ -93,7 +93,7 @@ class PostRoPETests(unittest.TestCase):
 
     def make_partitioned(self):
         cache = StreamingKVCache([(torch.zeros(2, 2, 8), torch.zeros(2, 2, 8))],
-                                 100000, 4, group_size=8)
+                                 100000, 4, group_size=8, compression_granularity="head")
         raw = torch.zeros(2, 4, 8, dtype=torch.float16)
         raw[:, :, 0] = torch.tensor([3., -2., 1., -4.])
         post = reference_rotate(raw, torch.arange(10, 14), self.rope)
@@ -113,14 +113,14 @@ class PostRoPETests(unittest.TestCase):
         self.assertFalse(cache._score_keys)
         self.assertIsNone(transient())  # Even an open-frame snapshot must not pin raw K.
         layer = cache.frames[0].layers[0]
-        self.assertEqual(layer.high_indices.tolist(), [0, 2])
-        torch.testing.assert_close(layer.high_k, post[:, [0, 2]], rtol=0, atol=0)
-        torch.testing.assert_close(layer.high_v, value[:, [0, 2]], rtol=0, atol=0)
+        self.assertEqual(layer.high_indices.tolist(), [0, 2, 0, 2])
+        torch.testing.assert_close(layer.high_k, post[:, [0, 2]].flatten(0, 1), rtol=0, atol=0)
+        torch.testing.assert_close(layer.high_v, value[:, [0, 2]].flatten(0, 1), rtol=0, atol=0)
         torch.testing.assert_close(layer.representative, post.float().mean(1).half())
         packed = layer.drop_low().shrink(8)
         expected = PackedKV.quantize(post[:, [0, 2]], 8, axis='channel').shrink()
-        torch.testing.assert_close(packed.high_k.data, expected.data, rtol=0, atol=0)
-        torch.testing.assert_close(packed.high_k.scale, expected.scale, rtol=0, atol=0)
+        torch.testing.assert_close(packed.high_k.data, expected.data.flatten(), rtol=0, atol=0)
+        torch.testing.assert_close(packed.high_k.scale, expected.scale.flatten(), rtol=0, atol=0)
         torch.testing.assert_close(snapshot.frames[0].layers[0].high_k, post, rtol=0, atol=0)
         cache.audit_accounting()
 
@@ -141,13 +141,14 @@ class PostRoPETests(unittest.TestCase):
         expected = legacy_attention(q, torch.cat((raw_cached, k), -2), torch.cat((values, v), -2), self.rope, 64, 2)
         torch.testing.assert_close(actual, expected, rtol=.004, atol=.003)
         self.assertEqual(hits, {0})
-        torch.testing.assert_close(past.key, keys, rtol=0, atol=0)
-        self.assertEqual(past.key.shape[-2], 4)  # Retrieval query isn't persisted.
+        torch.testing.assert_close(torch.cat([h.key for h in past.heads], 1), keys, rtol=0, atol=0)
+        self.assertTrue(all(h.key.shape[-2] == 4 for h in past.heads))  # Query isn't persisted.
         actual, decoded = self.forward(q[:, :, :1], k[:, :, :1], v[:, :, :1], past, window=64)
         expected = legacy_attention(q[:, :, :1], torch.cat((raw_cached, k[:, :, :1]), -2),
                                     torch.cat((values, v[:, :, :1]), -2), self.rope, 64, 2)
         torch.testing.assert_close(actual, expected, rtol=.004, atol=.003)
-        self.assertEqual(decoded.positions.tolist(), [0, 1, 10, 12, 4])
+        for head in decoded.heads:
+            self.assertEqual(head.positions.tolist(), [0, 1, 10, 12, 4])
 
     def test_scoring_failure_and_uncompressed_commit_release_raw_keys(self):
         for mode in ('missing_summary', 'invalid_query', 'uncompressed'):

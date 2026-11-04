@@ -4,7 +4,8 @@ import importlib.util
 import torch
 from model.rekv.attention.dot_production_attention import get_multi_stage_dot_production_attention
 from .rotary import rotate_at
-from .packed_attention import PackedRotaryCache
+from .packed_attention import PackedRotaryCache, HeadwiseRotaryCache
+from .ragged_cache import RaggedKVCache, supported as ragged_supported
 
 
 @dataclass
@@ -53,6 +54,46 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
         v = project_v(key_value).view(batch, -1, num_heads_kv, dim_head).transpose(1, 2).contiguous()
         retrieving = isinstance(past_key_value, RetrieveLayer)
         encoding = isinstance(past_key_value, EncodeLayer)
+        # Compression produces distinct token sequences per KV head. Each GQA
+        # group keeps its own RoPE coordinates and cache length. Batch supported
+        # CUDA inference; retain the dense/packed/sliding compatibility paths.
+        headwise_past = past_key_value if isinstance(past_key_value, (HeadwiseRotaryCache, RaggedKVCache)) else None
+        if retrieving and any(f.layers[past_key_value.layer].high_offsets is not None
+                              for f in past_key_value.snapshot.frames):
+            use_packed = (packed_attention and q.is_cuda and batch == 1
+                          and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                          and torch.version.cuda is not None and dim_head <= 256
+                          and 0 < position_bias.inv_freq.numel()*2 <= dim_head
+                          and importlib.util.find_spec('triton') is not None
+                          and not torch.is_grad_enabled())
+            headwise_past, ids = past_key_value.snapshot.retrieve_layer(
+                past_key_value.layer, q, past_key_value.topk, past_key_value.profiler,
+                position_bias=position_bias, packed=use_packed, headwise=True,
+                batched=not use_packed and ragged_supported(q)
+                        and 0 < position_bias.inv_freq.numel()*2 <= dim_head)
+            past_key_value.hits.update(ids)
+        if isinstance(headwise_past, RaggedKVCache):
+            if ragged_supported(q) and headwise_past.max_length + length <= window:
+                result = headwise_past.attend(q, k, v, position_bias, commit=not retrieving)
+                result = result.transpose(1, 2).reshape(batch, length, num_heads*dim_head)
+                return attention_out(result), headwise_past
+            headwise_past = headwise_past.as_headwise()
+        if headwise_past is not None:
+            if num_heads % num_heads_kv or len(headwise_past.heads) != num_heads_kv:
+                raise ValueError('Invalid headwise GQA cache')
+            outputs, updated = [], []
+            group = num_heads // num_heads_kv
+            for head, past in enumerate(headwise_past.heads):
+                hq = q[:, head*group:(head+1)*group].transpose(1, 2).reshape(batch, length, group*dim_head)
+                hk = k[:, head:head+1].transpose(1, 2).reshape(batch, -1, dim_head)
+                hv = v[:, head:head+1].transpose(1, 2).reshape(batch, -1, dim_head)
+                result, current = forward(self, hq, hk, position_bias, use_cache, past,
+                                          lambda _: hq, lambda _: hk, lambda _: hv, lambda x: x,
+                                          dim_head, group, 1)
+                outputs.append(result)
+                updated.append(current)
+            return attention_out(torch.cat(outputs, -1)), (headwise_past if retrieving else
+                                                          HeadwiseRotaryCache(tuple(updated)))
         # QA normally fits in its deliberately enlarged window. Keep compressed
         # payloads through prefill and decode; fall back to the established
         # sliding/sink implementation if the window is exceeded.

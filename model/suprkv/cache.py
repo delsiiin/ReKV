@@ -6,7 +6,7 @@ import time
 
 import torch
 
-from .quantization import PackedKV
+from .quantization import PackedKV, CompactPackedKV
 from .segments import summary_scores, segment_summary_scores, segment_frame_query_scores
 from .profiling import measure
 from .accounting import MemoryLedger, TrackedDict
@@ -63,14 +63,18 @@ def resident_copy(x, dtype=torch.float16):
 @dataclass(frozen=True)
 class LayerFrame:
     high_indices: torch.Tensor
-    high_k: torch.Tensor | PackedKV
-    high_v: torch.Tensor | PackedKV
+    high_k: torch.Tensor | PackedKV | CompactPackedKV
+    high_v: torch.Tensor | PackedKV | CompactPackedKV
     low_indices: torch.Tensor
     low_k: object
     low_v: object
     representative: torch.Tensor
     bits: int = 16  # 16 denotes unquantized model dtype; otherwise integer code bits.
     dtype: torch.dtype = torch.float16
+    # None denotes the rectangular, unclassified/legacy layout. Classified
+    # payloads are [sum(head_lengths), D], with head-major flat token indices.
+    high_offsets: tuple | None = None
+    low_offsets: tuple | None = None
 
     @classmethod
     def full(cls, key, value, dtype=torch.float16):
@@ -81,14 +85,34 @@ class LayerFrame:
                    torch.empty(0, dtype=torch.int32, device=key.device), None, None,
                    key.float().mean(1).to(dtype), dtype=dtype)
 
-    def classify(self, query, score_key):
+    def classify(self, query, score_key, *, headwise=False):
         """Use pre-RoPE scores to select rows from the post-RoPE KV payload."""
         if score_key.shape != self.high_k.shape:
             raise ValueError('Scoring key must match the unpartitioned frame')
-        return self.classify_scores(summary_scores(query, score_key))
+        return self.classify_scores(summary_scores(query, score_key, headwise=headwise))
 
     def classify_scores(self, scores):
-        """Partition with this frame's mean; indexed payloads own their storage."""
+        """Partition each head at its frame-local mean; payloads own storage."""
+        if scores.ndim == 2:
+            if scores.shape != self.high_k.shape[:2]:
+                raise ValueError('Expected one score per KV head and token')
+            high = scores >= scores.mean(-1, keepdim=True)
+            counts = high.sum(-1).tolist()  # One synchronization per frame, not per head.
+            high_offsets, low_offsets = [0], [0]
+            for count in counts:
+                high_offsets.append(high_offsets[-1] + count)
+                low_offsets.append(low_offsets[-1] + scores.shape[-1] - count)
+            high_rows = high.flatten().nonzero(as_tuple=True)[0]
+            low_rows = (~high).flatten().nonzero(as_tuple=True)[0]
+            indices = self.high_indices.expand(scores.shape[0], -1).reshape(-1)
+            key, value = self.high_k.flatten(0, 1), self.high_v.flatten(0, 1)
+            return replace(self, high_indices=indices.index_select(0, high_rows),
+                           low_indices=indices.index_select(0, low_rows),
+                           high_k=key.index_select(0, high_rows), high_v=value.index_select(0, high_rows),
+                           low_k=key.index_select(0, low_rows), low_v=value.index_select(0, low_rows),
+                           high_offsets=tuple(high_offsets), low_offsets=tuple(low_offsets))
+        if scores.ndim != 1 or scores.shape[0] != self.high_k.shape[1]:
+            raise ValueError('Expected per-head scores or an explicit shared token mask')
         high = scores >= scores.mean()
         # Boolean indexing would rediscover these positions for all six payloads.
         high_rows = high.nonzero(as_tuple=True)[0]
@@ -105,8 +129,12 @@ class LayerFrame:
         if not self.high_indices.numel() or self.bits == 2:
             return self
         if self.bits == 16:
-            key = PackedKV.quantize(self.high_k, group_size, axis='channel', bits=8)
-            value = PackedKV.quantize(self.high_v, group_size, axis='token', bits=8)
+            if self.high_offsets is not None:
+                key = CompactPackedKV.quantize(self.high_k, self.high_offsets, group_size, axis='channel')
+                value = CompactPackedKV.quantize(self.high_v, self.high_offsets, group_size, axis='token')
+            else:
+                key = PackedKV.quantize(self.high_k, group_size, axis='channel', bits=8)
+                value = PackedKV.quantize(self.high_v, group_size, axis='token', bits=8)
         else:
             key, value = self.high_k.shrink(), self.high_v.shrink()
         return replace(self, high_k=key, high_v=value, bits=key.bits)
@@ -115,12 +143,57 @@ class LayerFrame:
         if not self.low_indices.numel():
             return self
         return replace(self, low_indices=torch.empty(0, dtype=torch.int32, device=self.high_indices.device),
-                       low_k=None, low_v=None)
+                       low_k=None, low_v=None,
+                       low_offsets=None if self.low_offsets is None else (0,) * len(self.low_offsets))
+
+    @property
+    def heads(self):
+        return self.representative.shape[0]
+
+    def head_parts(self, head):
+        """Views of high/low payloads for one KV head, without decoding."""
+        for key, value, ids, offsets in ((self.high_k, self.high_v, self.high_indices, self.high_offsets),
+                                         (self.low_k, self.low_v, self.low_indices, self.low_offsets)):
+            if offsets is not None:
+                start, end = offsets[head:head+2]
+                if end == start:
+                    continue
+                def view(payload):
+                    return payload.head(head) if isinstance(payload, CompactPackedKV) else payload[start:end][None]
+                yield view(key), view(value), ids[start:end]
+            elif ids.numel():
+                def view(payload):
+                    if isinstance(payload, PackedKV):
+                        return replace(payload, data=payload.data[head:head+1], scale=payload.scale[head:head+1],
+                                       offset=payload.offset[head:head+1], shape=(1, *payload.shape[1:]))
+                    return payload[head:head+1]
+                yield view(key), view(value), ids
+
+    def materialize_head(self, head):
+        keys, values, indices = [], [], []
+        for key, value, ids in self.head_parts(head):
+            keys.append(key.dequantize(dtype=self.dtype) if isinstance(key, PackedKV) else key)
+            values.append(value.dequantize(dtype=self.dtype) if isinstance(value, PackedKV) else value)
+            indices.append(ids)
+        indices = torch.cat(indices)
+        order = indices.argsort()
+        return torch.cat(keys, 1)[:, order].contiguous(), torch.cat(values, 1)[:, order].contiguous(), indices[order]
 
     def materialize(self, device=None):
         device = self.high_indices.device if device is None else torch.device(device)
         if device != self.high_indices.device:
             raise ValueError('Cache materialization must stay on the cache device; offload is disabled')
+        if self.high_offsets is not None:
+            parts = [self.materialize_head(h) for h in range(self.heads)]
+            lengths = [part[0].shape[1] for part in parts]
+            if len(set(lengths)) != 1:
+                raise ValueError('Unequal head lengths require materialize_head() or headwise retrieval')
+            # Recent frames retain both regions and therefore identical source
+            # positions. Other equal-length heads can have distinct positions.
+            ids = torch.stack([part[2] for part in parts])
+            if torch.equal(ids, ids[:1].expand_as(ids)):
+                ids = ids[0]
+            return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts]), ids
         keys = [self.high_k.dequantize(device, dtype=self.dtype) if isinstance(self.high_k, PackedKV) else self.high_k.to(device)]
         values = [self.high_v.dequantize(device, dtype=self.dtype) if isinstance(self.high_v, PackedKV) else self.high_v.to(device)]
         indices = [self.high_indices]
@@ -156,8 +229,13 @@ class CacheSnapshot:
     recent_ids: tuple
 
     def retrieve_layer(self, layer, query, topk=64, profiler=None, *,
-                       position_bias=None, with_rope_positions=False, packed=False):
-        """Select stable frame IDs, then materialize a ragged per-layer sequence."""
+                       position_bias=None, with_rope_positions=False, packed=False, headwise=False,
+                       batched=False):
+        """Select frames; headwise=True returns (HeadwiseRotaryCache, frame_ids).
+
+        The rectangular compatibility result requires equal total head lengths.
+        Its source positions may be [heads, tokens] when indices differ.
+        """
         if topk < len(self.recent_ids):
             raise ValueError('topk must accommodate the recent frames')
         protected = set(self.recent_ids)
@@ -187,6 +265,44 @@ class CacheSnapshot:
         selected.sort(key=lambda f: (f.timestamp, f.frame_id))
         device = query.device
         with measure(profiler, 'cache_materialization'):
+            if batched:
+                if position_bias is None or packed:
+                    raise ValueError('Batched dense retrieval requires RoPE and packed=False')
+                from .ragged_cache import from_frames
+                return (from_frames(self.sink[layer], selected, layer, position_bias, query.dtype),
+                        tuple(f.frame_id for f in selected))
+            compact = any(f.layers[layer].high_offsets is not None for f in selected)
+            if headwise or compact:
+                from .attention import RotaryCache
+                from .packed_attention import HeadwiseRotaryCache, from_frames
+                heads = []
+                frame_indices = [[] for _ in selected]
+                sink_k, sink_v = self.sink[layer]
+                for head in range(sink_k.shape[0]):
+                    if packed:
+                        if position_bias is None:
+                            raise ValueError('Packed retrieval requires explicit RoPE')
+                        heads.append(from_frames(self.sink[layer], selected, layer, position_bias, query.dtype, head=head))
+                    else:
+                        parts = [f.layers[layer].materialize_head(head) for f in selected]
+                        for indices, part in zip(frame_indices, parts):
+                            indices.append(part[2])
+                        keys = torch.cat([sink_k[head:head+1]] + [p[0] for p in parts], 1)[None]
+                        values = torch.cat([sink_v[head:head+1]] + [p[1] for p in parts], 1)[None]
+                        positions = torch.cat([torch.arange(sink_k.shape[1], device=device)] +
+                                              [p[2].long()+f.rope_start for f, p in zip(selected, parts)])
+                        heads.append(RotaryCache(keys, values, positions))
+                ids = tuple(f.frame_id for f in selected)
+                if headwise or packed:
+                    return HeadwiseRotaryCache(tuple(heads)), ids
+                if len({h.key.shape[-2] for h in heads}) != 1:
+                    raise ValueError('Unequal head lengths require headwise=True')
+                positions = torch.stack([h.positions for h in heads])
+                if torch.equal(positions, positions[:1].expand_as(positions)):
+                    positions = positions[0]
+                metadata = positions if with_rope_positions else tuple(
+                    (f.frame_id, tuple(indices)) for f, indices in zip(selected, frame_indices))
+                return torch.cat([h.key for h in heads], 1), torch.cat([h.value for h in heads], 1), ids, metadata
             if packed:
                 if position_bias is None:
                     raise ValueError('Packed retrieval requires explicit RoPE')
@@ -210,8 +326,11 @@ class CacheSnapshot:
 
 class StreamingKVCache:
     def __init__(self, sink, budget_tokens, frame_tokens, recent_frames=2, group_size=128, profiler=None,
-                 dtype=torch.float16):
+                 dtype=torch.float16, compression_granularity='layer'):
         self.profiler = profiler
+        if compression_granularity not in ('layer', 'head'):
+            raise ValueError('Invalid compression_granularity')
+        self.compression_granularity = compression_granularity
         if budget_tokens <= 0 or recent_frames < 1 or frame_tokens < 1:
             raise ValueError('Budget, recent_frames and frame_tokens must be positive')
         if group_size < 1 or group_size % 8:
@@ -242,9 +361,11 @@ class StreamingKVCache:
         layers = tuple(LayerFrame.full(torch.zeros(k.shape[0], frame_tokens, k.shape[-1], dtype=dtype),
                                       torch.zeros(k.shape[0], frame_tokens, k.shape[-1], dtype=dtype), dtype)
                        for k, _ in self.sink)
+        if self.compression_granularity == 'head':
+            layers = tuple(x.classify_scores(torch.zeros(x.heads, frame_tokens)) for x in layers)
         reserve = tuple(Frame(i, float(i), 0, tuple(replace(x,
-            low_k=torch.empty(x.high_k.shape[0], 0, x.high_k.shape[-1], dtype=dtype),
-            low_v=torch.empty(x.high_v.shape[0], 0, x.high_v.shape[-1], dtype=dtype))
+            low_k=torch.empty((*x.high_k.shape[:-2], 0, x.high_k.shape[-1]), dtype=dtype),
+            low_v=torch.empty((*x.high_v.shape[:-2], 0, x.high_v.shape[-1]), dtype=dtype))
             for x in layers), True) for i in range(recent_frames))
         # Each recent frame owns separate storage; the prototype above shares it.
         protected = footprint((self.sink, reserve)) + (recent_frames-1)*footprint(layers) + 4096
@@ -357,6 +478,8 @@ class StreamingKVCache:
         for layer in frame.layers:
             row = [layer.low_indices.numel(), 0, 0, 0]
             row[{16: 0, 8: 1, 4: 2, 2: 3}[layer.bits]] += layer.high_indices.numel()
+            if layer.high_offsets is not None:
+                row = [n / layer.heads for n in row]
             counts.append(tuple(row))
         return tuple(counts)
 
@@ -477,7 +600,7 @@ class StreamingKVCache:
             if any(key.shape != frame.layers[layer].high_k.shape for frame, key in zip(pending, keys)):
                 raise ValueError('Scoring key must match the unpartitioned frame')
             scorer = segment_frame_query_scores if scoring_strategy == 'frame_mean_query' else segment_summary_scores
-            scores = scorer(query, keys)
+            scores = scorer(query, keys, headwise=self.compression_granularity == 'head')
             for frame, row, frame_scores in zip(pending, classified, scores):
                 row.append(frame.layers[layer].classify_scores(frame_scores))
         return {frame.frame_id: tuple(row) for frame, row in zip(pending, classified)}
@@ -596,7 +719,7 @@ class StreamingKVCache:
         self.last_activation_id = question_id
 
     def frame_states(self, segment_ids=None):
-        """Detached scalar diagnostics; counts are token positions, not heads or K+V.
+        """Detached diagnostics; counts are mean token positions per KV head.
 
         Each row holds [unquantized, INT8, INT4, INT2] counts for every decoder layer.
         Missing frame IDs below next_id were evicted; future frames are not emitted.
@@ -608,12 +731,25 @@ class StreamingKVCache:
             frame = self.frames.get(frame_id)
             if frame is None:
                 result.append(dict(frame_id=frame_id, segment_id=(segment_ids or {}).get(frame_id),
-                                   status='evicted', protected=False, counts=None))
+                                   status='evicted', protected=False, counts=None, head_counts=None))
                 continue
             counts = [list(row) for row in self._frame_counts[frame_id]]
+            head_counts = []
+            for layer in frame.layers:
+                rows = []
+                for h in range(layer.heads):
+                    low = (layer.low_indices.numel() if layer.low_offsets is None else
+                           layer.low_offsets[h+1]-layer.low_offsets[h])
+                    high = (layer.high_indices.numel() if layer.high_offsets is None else
+                            layer.high_offsets[h+1]-layer.high_offsets[h])
+                    row = [low, 0, 0, 0]
+                    row[{16: 0, 8: 1, 4: 2, 2: 3}[layer.bits]] += high
+                    rows.append(row)
+                head_counts.append(rows)
             result.append(dict(frame_id=frame_id, segment_id=frame.segment_id, status='closed' if frame.closed else 'open',
-                               protected=frame_id in recent, counts=counts))
+                               protected=frame_id in recent, counts=counts, head_counts=head_counts))
         return dict(layer_count=len(self.sink), tokens_per_frame=self.frame_tokens,
+                    kv_heads=[k.shape[0] for k, _ in self.sink], count_unit='mean_tokens_per_kv_head',
                     bit_order=[16, 8, 4, 2], full_precision_dtype=str(self.dtype).removeprefix('torch.'), frames=result)
 
     def memory_stats(self):
@@ -622,6 +758,7 @@ class StreamingKVCache:
         pbytes = ledger.total
         working = self._working_ledger.total-pbytes
         return dict(cache_device=str(self.device), cache_dtype=str(self.dtype).removeprefix('torch.'), offload_enabled=False,
+                    compression_granularity=self.compression_granularity,
                     budget_bytes=self.budget, persistent_bytes=pbytes,
                     persistent_tensor_bytes=ledger.tensor_bytes,
                     persistent_cuda_bytes=ledger.cuda_bytes,

@@ -9,6 +9,12 @@ from .rotary import rotate_at
 
 
 @dataclass(frozen=True)
+class HeadwiseRotaryCache:
+    """Question-local caches with an independent logical length per KV head."""
+    heads: tuple
+
+
+@dataclass(frozen=True)
 class AttentionChunk:
     key: object
     value: object
@@ -133,21 +139,26 @@ def coalesce(chunks):
     return tuple(merged)
 
 
-def from_frames(sink, frames, layer, rope, dtype):
+def from_frames(sink, frames, layer, rope, dtype, *, head=None):
     key, value = sink
+    if head is not None:
+        key, value = key[head:head+1], value[head:head+1]
     ranks = torch.arange(key.shape[1], device=key.device)
     chunks = [AttentionChunk.create(key, value, ranks, ranks, rope)] if ranks.numel() else []
     length = key.shape[1]
     for frame in frames:
         entry = frame.layers[layer]
-        indices = torch.cat((entry.high_indices, entry.low_indices))
+        parts = list(entry.head_parts(head)) if head is not None else [
+            (entry.high_k, entry.high_v, entry.high_indices),
+            (entry.low_k, entry.low_v, entry.low_indices)]
+        indices = torch.cat([p[2] for p in parts])
         # high/low partitions are not chronological; ranks preserve the same
         # causal positions as materialize(). Storage itself need not be sorted.
         ranks = indices.argsort().argsort() + length
-        high = entry.high_indices.numel()
-        for k, v, ids, rank in (
-                (entry.high_k, entry.high_v, entry.high_indices, ranks[:high]),
-                (entry.low_k, entry.low_v, entry.low_indices, ranks[high:])):
+        offset = 0
+        for k, v, ids in parts:
+            rank = ranks[offset:offset+ids.numel()]
+            offset += ids.numel()
             if ids.numel():
                 chunks.append(AttentionChunk.create(k, v, rank, ids.long()+frame.rope_start, rope))
         length += indices.numel()

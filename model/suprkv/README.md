@@ -6,6 +6,20 @@ Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --met
 
 ## Token 评分策略
 
+压缩粒度通过 `--compression-granularity {layer,head}`（或 `--compression_granularity`）选择，与评分 Query 来源独立：
+
+- `layer`（默认）：原流程，跨 KV head 平均分数，每层每帧共用高低分 token 索引与矩形 KV；均分阈值、预算触发、量化和检索行为沿用原实现。
+- `head`：每个 KV head 按自己的帧内均分分类，使用连续 payload 和 offsets 存储各自保留的 token；预算、recent 保护和层×帧位宽策略不变。
+
+```bash
+# 原流程（也可省略该参数）
+bash run_suprkv.sh --compression-granularity layer
+# 逐 KV head 的独立分区和紧凑存储
+bash run_suprkv.sh --compression-granularity head
+```
+
+Python 使用 `StreamingConfig(compression_granularity='head')`；默认值为 `'layer'`。观察页“Token 删除粒度”提供相同开关。`head` 模式在原预算结果目录下增加 `compression_head/`，其后继续追加评分策略或摘要模型子目录；`layer` 保持原目录。两种模式均写入运行配置和缓存统计。
+
 默认 `StreamingConfig(scoring_strategy="summary")` 保留摘要评分流程。通过
 `--scoring-strategy frame_mean_query`（也支持 `--scoring_strategy`）切换到帧均值 Query：
 
@@ -16,8 +30,8 @@ python -m video_qa.run_eval --method suprkv --dataset rvs_ego --scoring-strategy
 流式编码时，每层将每帧图片 token 的 RoPE 前 Q 沿 token 维以 FP32 求均值，保留 heads，
 段结束后按帧序组成 `[F, Hq, D]` Query，与本段全部原始 RoPE 前 K 按原生 GQA 对应计算 `QKᵀ / √head_dim`。
 每个帧 Query、每个 head 独立计算与整段全部 Key token 的缩放点积，不做 softmax、不施加因果 mask；
-随后沿 Query 帧维 F 和 head 维求均值，得到各 Key token 的分数。点积前不合并帧或 head。
-实际分类使用 softmax 前分数，每层每帧独立以帧内均值为阈值，等于均值归为高分。
+默认 `layer` 沿 Query 帧维 F 和全部 head 维求均值，得到 `[F, N]` 分数；`head` 只沿 F 和同一 KV head 对应的 Q head 组求均值，得到 `[F, Hkv, N]` 分数。点积前不合并帧或 head。
+实际分类使用 softmax 前分数：`layer` 以每层每帧的 token 均分为阈值，`head` 以每层每帧每个 KV head 自己的 token 均分为阈值；等于均分归为高分。
 量化、预算、recent 保护和问答检索策略保持原有行为。
 
 该策略不加载摘要模型、不生成摘要、不提取文字 Q，忽略 `summarizer_model_path`，
@@ -132,7 +146,7 @@ if __name__ == '__main__':
 ## 算法
 
 - 分段复用 observation 的投影/池化前视觉特征距离、历史 EMA 阈值、首对帧 warmup；运行配置默认 `alpha=.2`、`min_segment_frames=4`。达到 `max_segment_frames=32` 或 summary 上下文容量上限时闭段，不重置 EMA。
-- summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与暂存的 **RoPE 前 K** 的点积均值，不做 softmax，不跨层平均。大于或等于该层帧内均值的 token 归为高分区，其余归为低分区。分区掩码作用于 **RoPE 后 K 和原始 V**；V 不应用 RoPE。summary 为空/计算失败时全帧按高分保留并记录原因。
+- summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与暂存的 **RoPE 前 K** 的点积均值，不做 softmax，不跨层平均。默认 `layer` 聚合摘要 token 和全部 heads，以该层帧内均分划分共享高低分区；`head` 只聚合摘要 token 和同组 Q heads，以每个 KV head 自己的帧内均分独立分类。大于或等于均分归为高分，其余归为低分。分区掩码作用于 **RoPE 后 K 和原始 V**，K/V 成对删留；V 不应用 RoPE。summary 为空/计算失败时全帧按高分保留并记录原因。
 - 持久缓存、量化载荷和问题快照中的 K 均为编码时局部 attention 使用的 RoPE 后 K。RoPE 前 K 仅作为分区评分工作内存，段提交成功或评分失败后均释放；不进入快照。未启用压缩的基线也存储 RoPE 后 K，但不保留评分副本。
 - sink 为初始化提示词；最新两帧是 recent，始终使用原始模型精度。未闭合段全精度暂存并可检索。各层的标签在段提交时固定。
 - 每个段提交后若超预算：直接丢弃所有已闭合非保护帧的低分区；若仍超预算，则将这些帧各层的高分区各降一级（16→8→4→2），每次事件最多降一级；仍不足才淘汰 retrieve 频率最低的整帧，频率相同则淘汰更早入库的帧，即按 `(hits, frame_id)` 升序淘汰（LFU，同频时 FIFO）。`hits` 为累计问题检索命中次数，`frame_id` 在入库时单调递增；每淘汰一帧后重新检查预算。
@@ -141,18 +155,24 @@ if __name__ == '__main__':
 
 ### 量化计算
 
-仅量化已经分类为高分的 K/V，输入形状为 `[H_kv, N_high, D]`，每层、每帧独立处理，`G=group_size` 必须为 8 的正整数倍。
+默认 `layer` 保留原有 `[Hkv, N, D]` 矩形 KV 和共享索引。以下紧凑布局适用于 `head` 模式。
+
+`head` 模式已经分类的高/低分区分别采用紧凑存储：`indices=[sum_h N_h]`、未量化 `K/V=[sum_h N_h, D]`，按 head 顺序拼接，用 `high_offsets/low_offsets` 定位各 head。offsets 是不可变的主机整数元组，读取时无需从 GPU 同步长度；KV 与位置索引保留在原设备。未分类帧和评分失败帧保留原有矩形布局。
+
+仅量化高分 K/V，每层、每帧、每个 head 独立分组，`G=group_size` 必须为 8 的正整数倍。`CompactPackedKV` 将各 head 的 code、scale、offset 分别拼成连续缓冲区；不填充到最长 head，仅保留量化打包所需的尾部对齐。位宽仍由层×帧统一逐级降低。下表给出单个 head 的逻辑布局：
 
 | 缓存 | 分组范围 | scale/offset 形状 | 内部打包方向 |
 | --- | --- | --- | --- |
-| K（`axis='channel'`） | 每个 channel 内的 G 个存活 token | `[H_kv, D, ceil(N_high/G)]` | 转为 `[H_kv, D, N_high]` 后沿 token 维打包 |
-| V（`axis='token'`） | 每个 token 内的 G 个 channel | `[H_kv, N_high, ceil(D/G)]` | 沿 channel 维打包 |
+| K（`axis='channel'`） | 每个 channel 内的 G 个存活 token | `[D, ceil(N_h/G)]` | 转为 `[D, N_h]` 后沿 token 维打包 |
+| V（`axis='token'`） | 每个 token 内的 G 个 channel | `[N_h, ceil(D/G)]` | 沿 channel 维打包 |
 
-K 的分组按高分 token 的原始顺序进行，不跨帧或层拼组；组内 token 共享该 channel 的量化参数。反量化后 K/V 都恢复为 `[H_kv, N_high, D]`，保持原始 token 顺序。较短帧的 K 尾组会增加每个有效 token 分摊的参数与填充开销，预算账本按实际 storage 字节计量。
+K 的分组按高分 token 的原始顺序进行，不跨 head、帧或层拼组；组内 token 共享该 channel 的量化参数。每个 head 反量化后恢复为 `[1, N_h, D]`，保持原始 token 顺序。较短 head 的 K 尾组会增加每个有效 token 分摊的参数与填充开销，预算账本按实际 storage 字节计量。
 
 这里的 K 是 RoPE 后 K。每帧记录编码时的旋转起点 `rope_start`，存活 token 的源位置为 `rope_start + 原始帧内索引`。检索拼接、删 token 或滑窗移动后，读取的 K 只施加位置差旋转 `R(目标位置−源位置)`，不对已旋转 K 再施加完整 RoPE。该处理保留 ReKV 的局部重排位置语义；sink 补充 attention 阶段单独变换到原有零位置语义。量化发生在源位置旋转之后，位置差旋转不会重新量化或改写持久缓存。
 
-底层 `StreamingKVCache.append_frame(timestamp, layers, score_keys=..., rope_start=...)` 的 `layers` 接收 RoPE 后 K/V，`score_keys` 接收逐层 RoPE 前 K；缺少评分 K 时分区会明确记录错误并按全高分保留，不会误用 RoPE 后 K 评分。decoder 返回的每层缓存为 `RotaryCache(key, value, positions)`，编码和后续解码必须传递位置元数据。
+底层 `StreamingKVCache.append_frame(timestamp, layers, score_keys=..., rope_start=...)` 的 `layers` 接收 RoPE 后 K/V，`score_keys` 接收逐层 RoPE 前 K；缺少评分 K 时分区会明确记录错误并按全高分保留，不会误用 RoPE 后 K 评分。编码使用 `RotaryCache(key, value, positions)`；`head` 模式的逐 head 检索与解码使用 `HeadwiseRotaryCache(heads)`，每个 head 持有独立的长度和位置，各自映射到原生 GQA 的 Q head 组。CPU/普通路径按 head 读取，CUDA packed 路径复用单组融合 kernel；滑窗溢出时每个 head 独立切换到原有 dense 路径。两种路径均不填充到最长 head。
+
+`retrieve_layer(..., headwise=True)` 返回 `(HeadwiseRotaryCache, frame_ids)`。矩形兼容接口只适用于总长度相同的 heads；源索引不同但长度相同时，位置数组为 `[Hkv, N]`。`LayerFrame.materialize_head(h)` 可读取单个 head；`materialize()` 只允许等长 heads，recent 帧因保留完整高低分区仍可使用此接口。
 
 第一次超预算压缩的路径是 **原始模型精度 → 16bit 整数编码 → 8bit 整数编码**。INT16 是本次压缩的中间阶段，不作为新增预算事件；未触发降位的高分区仍为原始模型精度，可压缩帧的低分区在超预算事件中直接删除。每个组取 `m=min(x)`、`M=max(x)`：
 
@@ -223,9 +243,42 @@ python tests/benchmark_suprkv_accounting.py \
 | `summary_seconds/score_compress_seconds/encode_seconds` | 当前进程中编码相关累计耗时；编码时间不含闭段 summary |
 | `answers[].qa_seconds` | 同步问题检索与完整答案生成耗时 |
 
+观察页 `frame_states.counts` 为每层各 KV head 的平均 token 数，仍以原始每帧 token 数为分母；`head_counts[layer][head]` 提供逐 head 的 `[原精度, INT8, INT4, INT2]` 明细。`count_unit='mean_tokens_per_kv_head'` 和逐层 `kv_heads` 标明口径。预算使用实际字节，不使用平均 token 数。
+
 分段/summary 的存在会增加编码延迟。此实现验证功能和预算约束，不预设答案质量提升或实时吞吐达标。主模型 OneVision 当前要求每帧 196 个语言模型 token；模型配置不匹配时明确报错。PM-KVQ 仅作为算法参考，不需要安装其旧版 Transformers Cache 类。
 
 ## 验证
+
+### Head 模式的批量问答路径
+
+`--compression-granularity head` 在 CUDA、batch=1、推理模式且未启用
+`--packed-attention` 时自动使用 `ragged_cache.py` / `ragged_kernels.py`。
+持久帧保持原有紧凑格式；问题级缓存按各 head 的实际长度加生成预留空间连续存放，
+不按最长 head 补齐。检索选择仍按层共享，token 分区仍逐 KV head 独立。
+
+- 一个恢复 kernel 处理该层全部帧/head/高低分区：反量化、合并时间顺序、
+  将存储坐标的 K 旋转到各 head 的逻辑坐标。分区索引本身有序，通过 lower_bound
+  合并排名，避免每帧每 head 单独 argsort、反量化和拼接。
+- 全部 GQA head 共用一次变长 attention 调用；使用 split-K 局部 softmax 和合并，
+  通过 offsets 和 lengths 跳过不存在的 token。
+- 生成时只旋转新 Q/K、把新 K/V 写入预留尾部。历史 K 不重复旋转、历史 KV 不逐步 cat。
+  默认每 head 预留 1024 token；异常长 prompt 超出容量时按需扩容。只复用单 token 的
+  小型 attention 工作区，prefill 工作区用后释放。
+- 问题级缓存可变，限同一问题顺序解码使用。检索 probe 写入临时尾部但不提交长度，
+  不污染后续 prompt，也不修改持久帧或快照。新问题重新检索和创建问题级缓存。
+- CUDA 不可用、batch 不受支持或窗口溢出时使用既有路径；显式 packed attention
+  继续使用低位直接读取后端。`layer` 原流程保持不变。
+
+正确性验证与固定输入基准：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m unittest discover -s tests -p 'test_suprkv_ragged.py'
+CUDA_VISIBLE_DEVICES=1 python tests/benchmark_suprkv_ragged.py --output /tmp/ragged-bench.json
+```
+
+真实问答可用 `tests/benchmark_suprkv_memory.py --gpu 1 --max-questions 6`
+包装 `bash run_suprkv.sh --compression-granularity head`；加 `--legacy-head`
+可在诊断中重放优化前的逐 head 路径，不改变生产开关。子路径微基准不能当作整模型加速比。
 
 ### 压缩 KV 的 CUDA 融合路径
 

@@ -239,7 +239,7 @@ class SuPrKVEvalTests(unittest.TestCase):
                 ('egoschema', 'eval_egoschema.py'), ('activitynet_qa', 'eval_open_ended.py'),
                 ('cgbench', 'eval_multiple_choice.py')):
             args = self.launcher_args('--dataset', dataset, '--budget_tokens', '4096',
-                                      '--max_new_tokens', '16', '--packed_attention')
+                                      '--max_new_tokens', '16', '--packed_attention', '--compression-granularity', 'head')
             with self.subTest(dataset=dataset), \
                     patch.object(run_eval, 'get_eval_settings', return_value=(1, str(self.directory))), \
                     patch.object(run_eval.multiprocessing, 'Process', return_value=Mock(exitcode=0)) as launch, \
@@ -254,6 +254,7 @@ class SuPrKVEvalTests(unittest.TestCase):
                 self.assertEqual(suprkv_stream_vqa.config_overrides(worker_args),
                                  suprkv_stream_vqa.config_overrides(args))
                 self.assertTrue(worker_args.packed_attention)
+                self.assertEqual(make_config(worker_args).compression_granularity, 'head')
                 self.assertIn(scorer, execute.call_args.args[0])
 
     def test_invalid_timestamps_do_not_encode_frames_and_close_model(self):
@@ -279,6 +280,7 @@ class SuPrKVEvalTests(unittest.TestCase):
                                   '--group-size', '64', '--ema-alpha', '0.3',
                                   '--min-segment-frames', '2', '--max-segment-frames', '16',
                                   '--scoring-strategy', 'frame_mean_query',
+                                  '--compression-granularity', 'head',
                                   '--summary-max-new-tokens', '128', '--max-new-tokens', '64')
         process = Mock(exitcode=0)
         with patch.object(run_eval.multiprocessing, 'Process', return_value=process) as launch, \
@@ -370,6 +372,24 @@ class SuPrKVEvalTests(unittest.TestCase):
         _, alternate = run_eval.get_eval_settings(launcher, 'rvs_ego', self.annotation)
         self.assertEqual(alternate, directory+'/scoring_frame_mean_query')
 
+    def test_compression_granularity_switch_and_result_isolation(self):
+        from video_qa.methods.suprkv import SuPrKVMethod
+        method = SuPrKVMethod()
+        for extra in ((), ('--scoring-strategy', 'frame_mean_query'),
+                      ('--summarizer-model-path', 'org/small-model')):
+            original = self.launcher_args(*extra)
+            explicit = self.launcher_args(*extra, '--compression-granularity', 'layer')
+            headwise = self.launcher_args(*extra, '--compression_granularity', 'head')
+            original_dir = method.result_dir(original, 'rvs_ego')
+            self.assertEqual(method.result_dir(explicit, 'rvs_ego'), original_dir)
+            self.assertEqual(method.result_dir(headwise, 'rvs_ego'),
+                             original_dir.replace('/budget_8192', '/budget_8192/compression_head'))
+            self.assertEqual(make_config(self.worker_args(*extra)).compression_granularity, 'layer')
+            self.assertEqual(make_config(self.worker_args(*extra, '--compression-granularity', 'head'))
+                             .compression_granularity, 'head')
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.worker_args('--compression-granularity', 'invalid')
+
     def test_rekv_specific_parameter_and_unsupported_model_are_rejected(self):
         for extra in (['--n_local', '15000'], ['--model', 'longva_7b']):
             with self.subTest(extra=extra), patch.object(run_eval, 'eval_rvs_ego') as launch, \
@@ -382,6 +402,7 @@ class SuPrKVEvalTests(unittest.TestCase):
         from model.suprkv.runtime import StreamingConfig
         config = make_config(self.worker_args('--device', 'cpu'))
         self.assertEqual(config, StreamingConfig(device='cpu'))
+        self.assertEqual(config.compression_granularity, 'layer')
         _, directory = run_eval.get_eval_settings(self.launcher_args(), 'rvs_ego', self.annotation)
         self.assertTrue(directory.endswith(f'/budget_{config.budget_tokens}'))
         config = make_config(self.worker_args('--device', 'cpu', '--model', 'llava_ov_0.5b',

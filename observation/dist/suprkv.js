@@ -19,7 +19,7 @@ function renderCompressionResult(result, url, cached) {
   const beforeStats = before.model_stats ?? {}, afterStats = after.model_stats ?? {};
   const summarizer = e.config?.summarizer_model_path ?? null;
   const frameQuery = e.config?.scoring_strategy === 'frame_mean_query';
-  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 评分：${frameQuery ? '帧均值 Query' : 'Summary Query'} · 摘要配置：${frameQuery ? '未启用' : (summarizer ?? '主模型')} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
+  $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 评分：${frameQuery ? '帧均值 Query' : 'Summary Query'} · 删除粒度：${e.config?.compression_granularity === 'head' ? '逐 KV head' : '层级共享（原流程）'} · 摘要配置：${frameQuery ? '未启用' : (summarizer ?? '主模型')} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
   $('compressionJson').hidden = false; $('compressionJson').href = url;
   const memory = e.memory, saved = memory.persistent_kv;
   const gpu = e.method.cache_device.startsWith('cuda');
@@ -278,7 +278,7 @@ function renderCompressionFrameStates() {
   }
   const {result, side, point, snapshot, layer} = selected;
   const records = new Map(snapshot.frames.map(frame => [frame.frame_id, frame]));
-  $('compressionFrameStatesMeta').textContent = `${side==='after'?'压缩后':'压缩前'} · 输入到帧 ${point.frame_index+1} (${fmt(point.timestamp,2)}s) · ${point.kind==='flush'?'末段提交完成':'当前帧入库后'} · ${layer==='all'?`全部 ${snapshot.layer_count} 层，每层平均`:`第 ${Number(layer)+1} 层`}`;
+  $('compressionFrameStatesMeta').textContent = `${side==='after'?'压缩后':'压缩前'} · 输入到帧 ${point.frame_index+1} (${fmt(point.timestamp,2)}s) · ${point.kind==='flush'?'末段提交完成':'当前帧入库后'} · ${layer==='all'?`全部 ${snapshot.layer_count} 层，每层平均`:`第 ${Number(layer)+1} 层`}${snapshot.count_unit==='mean_tokens_per_kv_head'?' · token 数按 KV head 平均':''}`;
   const table = compressionTable(['帧 / 时间', '状态', '剩余 / 原始 token', '精度分布', '已删除 token', '剩余平均位宽'], []);
   table.classList.add('cache-state-table');
   let previousSegment = null;
@@ -423,7 +423,8 @@ function renderCompressionLive(job) {
   $('results').hidden=true; $('emptyState').hidden=true; $('compressionResults').hidden=false;
   $('compressionResults').classList.add('is-live'); $('compressionJson').hidden=true;
   $('compressionStateFollowLabel').hidden=false;
-  $('compressionLabel').textContent=`实时计算 · ${update.side==='after'?'压缩后':'原精度 基线'} · 完成帧 ${update.point.frame_index+1}/${job.preview.frames.length}`;
+  const mode = update.point.compression_granularity === 'head' ? '逐 KV head' : '层级共享（原流程）';
+  $('compressionLabel').textContent=`实时计算 · ${update.side==='after'?`压缩后 · ${mode}`:'原精度 基线（不压缩）'} · 完成帧 ${update.point.frame_index+1}/${job.preview.frames.length}`;
   if($('compressionStateFollow').checked) followLatestCacheState(); else renderCompressionFrameStates();
 }
 function finishCompressionLive(status) {

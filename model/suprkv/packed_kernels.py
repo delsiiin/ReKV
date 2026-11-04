@@ -113,7 +113,10 @@ def _load(P, S, Z, h, t, d, T, D: tl.constexpr,
     scale = tl.load(S + param, valid, 0)
     offset = tl.load(Z + param, valid, 0)
     # Launch with enable_fp_fusion=False: match torch's separate mul/sub.
-    return code.to(tl.float32) * scale - offset
+    # Keep both FP32 rounding steps explicit before a possible FP16 store.
+    # On Blackwell, the otherwise equivalent expression can round differently
+    # when the compiler combines vector arithmetic and narrowing conversion.
+    return libdevice.sub_rn(libdevice.mul_rn(code.to(tl.float32), scale), offset)
 
 
 @triton.jit(do_not_specialize=['T', 'WORDS', 'GROUPS'])

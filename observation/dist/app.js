@@ -131,6 +131,7 @@ function parameters() {
     max_frames: $('maxFrames').value === '' ? null : Number($('maxFrames').value),
     ...($('mode').value === 'compression' ? {
       scoring_strategy: $('compressionScoring').value,
+      compression_granularity: $('compressionGranularity').value,
       summarizer_model_path: $('compressionScoring').value === 'frame_mean_query' || $('compressionSummarizer').value === 'main' ? null :
         ($('compressionSummarizer').value === 'custom' ? $('compressionSummarizerPath').value.trim() : $('compressionSummarizer').value),
       question_indices: [...$('compressionQuestions').querySelectorAll('input:checked')].map(input => Number(input.value)),
@@ -519,7 +520,7 @@ for (const [id, checked] of [['compressionQuestionsAll', true], ['compressionQue
     invalidate();
   });
 }
-['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionScoring', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
+['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionScoring', 'compressionGranularity', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));

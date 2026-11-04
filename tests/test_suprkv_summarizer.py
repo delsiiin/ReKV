@@ -67,6 +67,17 @@ class SummarizerTests(unittest.TestCase):
         return OneVisionEngine(dict(asdict(self.config), **updates), model=self.model,
                                processor=self.processor, summarizer=self.small)
 
+    def test_compression_granularity_reaches_cache_and_survives_reset(self):
+        for mode in ('layer', 'head'):
+            engine = self.engine(compression_granularity=mode, scoring_strategy='frame_mean_query')
+            for _ in range(2):
+                self.assertEqual(engine.cache.compression_granularity, mode)
+                engine.append_frame(self.image, 0.)
+                engine.close_segment()
+                entry = engine.cache.frames[0].layers[0]
+                self.assertEqual(entry.high_offsets is not None, mode == 'head')
+                engine.reset()
+
     def test_frame_query_strategy_captures_native_means_and_skips_all_summary_work(self):
         with patch.object(OneVisionSummarizer, 'load', side_effect=AssertionError('no loading')):
             engine = self.engine(scoring_strategy='frame_mean_query', summarizer_model_path='/missing/model')

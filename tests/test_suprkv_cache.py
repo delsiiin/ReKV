@@ -12,7 +12,7 @@ from observation.segments import segment_by_ema, vision_frame_distances, mean_se
 def make_cache(frames=6, layers=2, tokens=16, dim=128):
     torch.manual_seed(9)
     cache = StreamingKVCache([(torch.randn(2, 2, dim), torch.randn(2, 2, dim)) for _ in range(layers)],
-                             100000, tokens, group_size=128)
+                             100000, tokens, group_size=128, compression_granularity="head")
     queries = [torch.ones(3, 4, dim) * (-1 if layer % 2 else 1) for layer in range(layers)]
     for i in range(frames):
         data = []
@@ -280,16 +280,16 @@ class CacheTests(unittest.TestCase):
         second = cache.frames[1]
         cache.frames[1] = replace(second, layers=(second.layers[0].shrink(128).shrink(128).shrink(128), second.layers[1].drop_low()))
         states = cache.frame_states()
-        self.assertEqual(states['frames'][0]['counts'][0], [first.layers[0].low_indices.numel(), first.layers[0].high_indices.numel(), 0, 0])
-        self.assertEqual(states['frames'][0]['counts'][1], [first.layers[1].low_indices.numel(), 0, first.layers[1].high_indices.numel(), 0])
-        self.assertEqual(states['frames'][1]['counts'][0][-1], second.layers[0].high_indices.numel())
-        self.assertEqual(sum(states['frames'][1]['counts'][1]), second.layers[1].high_indices.numel())
+        self.assertEqual(states['frames'][0]['counts'][0], [first.layers[0].low_indices.numel()/2, first.layers[0].high_indices.numel()/2, 0, 0])
+        self.assertEqual(states['frames'][0]['counts'][1], [first.layers[1].low_indices.numel()/2, 0, first.layers[1].high_indices.numel()/2, 0])
+        self.assertEqual(states['frames'][1]['counts'][0][-1], second.layers[0].high_indices.numel()/2)
+        self.assertEqual(sum(states['frames'][1]['counts'][1]), second.layers[1].high_indices.numel()/2)
         self.assertEqual([f['frame_id'] for f in states['frames'] if f['protected']], [2, 3])
         known_segments = {f.frame_id:f.segment_id for f in cache.frames.values()}
         del cache.frames[0]
         self.assertEqual(cache.frame_states(known_segments)['frames'][0]['segment_id'], first.segment_id)
         evicted = cache.frame_states()['frames'][0]
-        self.assertEqual(evicted, dict(frame_id=0, segment_id=None, status='evicted', protected=False, counts=None))
+        self.assertEqual(evicted, dict(frame_id=0, segment_id=None, status='evicted', protected=False, counts=None, head_counts=None))
         # Earlier reports remain independent scalar data after later policy changes.
         self.assertEqual(original['frames'][0]['counts'], [[16, 0, 0, 0]]*2)
         json.dumps(states, allow_nan=False)
@@ -327,10 +327,12 @@ class CacheTests(unittest.TestCase):
                         self.assertIsNone(layer.low_v)
                         torch.testing.assert_close(layer.high_indices, before.high_indices)
                         torch.testing.assert_close(layer.representative, before.representative, rtol=0, atol=0)
-                        key, value, indices = layer.materialize()
-                        torch.testing.assert_close(key, layer.high_k.dequantize())
-                        torch.testing.assert_close(value, layer.high_v.dequantize())
-                        torch.testing.assert_close(indices, before.high_indices)
+                        for head in range(layer.heads):
+                            key, value, indices = layer.materialize_head(head)
+                            torch.testing.assert_close(key, layer.high_k.head(head).dequantize())
+                            torch.testing.assert_close(value, layer.high_v.head(head).dequantize())
+                            start, end = before.high_offsets[head:head+2]
+                            torch.testing.assert_close(indices, before.high_indices[start:end])
             self.assertEqual(cache.counts['dropped_low_frames'], 4)
         self.assertEqual(cache.memory_stats()['bits'], {'16': 4, '8': 0, '4': 0, '2': 8, '0': 0})
         self.assertIs(cache.frames[0].layers[0].shrink(128), cache.frames[0].layers[0])
@@ -410,13 +412,13 @@ class CacheTests(unittest.TestCase):
     def test_quantized_high_materialization_preserves_original_token_order(self):
         key = torch.tensor([3., -2., 1., -4.]).view(1, 4, 1).expand(2, 4, 128)
         value = key + 10
-        layer = LayerFrame.full(key, value).classify(torch.ones(3, 4, 128), key)
-        self.assertEqual(layer.high_indices.tolist(), [0, 2])
+        layer = LayerFrame.full(key, value).classify(torch.ones(3, 4, 128), key, headwise=True)
+        self.assertEqual(layer.high_indices.tolist(), [0, 2, 0, 2])
         compressed = layer.shrink(128)
         k, v, indices = compressed.materialize()
         self.assertEqual(indices.tolist(), [0, 1, 2, 3])
         expected_key = key.half().clone()
-        expected_key[:, [0, 2]] = compressed.high_k.dequantize()
+        expected_key[:, [0, 2]] = compressed.high_k.dequantize().view(2, 2, 128)
         torch.testing.assert_close(k, expected_key, rtol=0, atol=0)
         torch.testing.assert_close(v, value.half(), rtol=0, atol=0)
         pruned = compressed.drop_low()
@@ -459,11 +461,13 @@ class CacheTests(unittest.TestCase):
             cache.acquire_snapshot(1, cutoff=5.)
         snap = cache.acquire_snapshot(1, cutoff=6.)
         for layer in range(2):
-            k, v, ids, positions = snap.retrieve_layer(layer, torch.ones(1, 4, 3, 128), topk=7)
-            self.assertEqual(k.shape, v.shape)
+            retrieved, ids = snap.retrieve_layer(layer, torch.ones(1, 4, 3, 128), topk=7, headwise=True)
             self.assertEqual(len(set(ids)), 7)
             self.assertIn(6, ids)
-            self.assertEqual(k.shape[-2], 2+sum(len(x[1]) for x in positions))
+            for head, part in enumerate(retrieved.heads):
+                self.assertEqual(part.key.shape, part.value.shape)
+                self.assertEqual(part.key.shape[-2], 2+sum(
+                    f.layers[layer].materialize_head(head)[2].numel() for f in snap.frames))
         self.assertFalse(torch.equal(frame.layers[0].high_indices, frame.layers[1].high_indices))
         _, _, ids, _ = snap.retrieve_layer(0, torch.ones(1, 4, 3, 128), topk=2)
         self.assertEqual(ids, (5, 6))
@@ -543,7 +547,7 @@ class ResidentCudaTests(unittest.TestCase):
             return original_to(tensor, *args, **kwargs)
         with patch.object(torch.Tensor, 'cpu', side_effect=AssertionError('Tensor.cpu is forbidden')), \
                 patch.object(torch.Tensor, 'to', no_offload):
-            cache = StreamingKVCache(sink, 100000, 16)
+            cache = StreamingKVCache(sink, 100000, 16, compression_granularity="head")
             for i in range(6):
                 key = torch.randn(2, 16, 128, device=device)
                 cache.append_frame(i, [(key, key), (key, key)], score_keys=[key, key])
@@ -571,12 +575,12 @@ class ResidentCudaTests(unittest.TestCase):
             assert_device(cache.sink)
             torch.testing.assert_close(snap.frames[0].layers[0].materialize()[0], original)
             new_snapshot = type(snap)(cache.version, 2, cache.sink, tuple(cache.frames.values()), cache.recent_ids)
-            key, value, _, positions = new_snapshot.retrieve_layer(0, torch.ones(1, 4, 2, 128, device=device))
-            assert_device((key, value, [index for _, index in positions]))
+            retrieved, _ = new_snapshot.retrieve_layer(0, torch.ones(1, 4, 2, 128, device=device), headwise=True)
+            assert_device(retrieved)
             cache.release_snapshot(1)
             self.assertEqual(cache.memory_stats()['cache_device'], 'cuda:0')
             self.assertFalse(cache.memory_stats()['offload_enabled'])
-            self.assertEqual(cache.frame_states()['frames'][0]['counts'][0][3], cache.frames[0].layers[0].high_indices.numel())
+            self.assertEqual(cache.frame_states()['frames'][0]['counts'][0][3], cache.frames[0].layers[0].high_indices.numel()/2)
             with self.assertRaisesRegex(ValueError, 'offload'):
                 cache.frames[0].layers[0].materialize('cpu')
 

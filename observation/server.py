@@ -30,7 +30,7 @@ def validate_params(raw, dataset, default_dtype='float16'):
                'max_new_tokens', 'video_window_size', 'segment_enabled', 'segment_ema_alpha',
                'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
                'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
-               'question_indices', 'custom_questions', 'summarizer_model_path', 'scoring_strategy'}
+               'question_indices', 'custom_questions', 'summarizer_model_path', 'scoring_strategy', 'compression_granularity'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -84,6 +84,10 @@ def validate_params(raw, dataset, default_dtype='float16'):
     if mode != 'compression' and ('question_indices' in raw or 'custom_questions' in raw):
         raise ValueError('Multiple questions are supported in compression mode')
     if mode == 'compression':
+        granularity = raw.get('compression_granularity', 'layer')
+        if granularity not in ('layer', 'head'):
+            raise ValueError('Invalid compression_granularity')
+        compression['compression_granularity'] = granularity
         strategy = raw.get('scoring_strategy', 'summary')
         if strategy not in ('summary', 'frame_mean_query'):
             raise ValueError('Invalid scoring_strategy')

@@ -34,6 +34,9 @@
     <p class="field-note">相邻帧对应位置的 vision encoder 输出距离（投影、池化前）。阈值倍数固定为 1；第一对帧初始化 EMA，后续距离超过历史 EMA 则切分。每段单独生成总结。</p>
     <div id="compressionControls" hidden>
       <div class="section-label">04 / KV 压缩对照</div>
+      <label for="compressionGranularity">Token 删除粒度</label>
+      <select id="compressionGranularity"><option value="layer">层级共享（原流程，默认）</option><option value="head">逐 KV head（独立均分、紧凑存储）</option></select>
+      <p class="field-note">压缩前固定保留原精度 KV；此选项只作用于压缩后。两侧使用相同帧和问题，对比内存、耗时与回答。</p>
       <label for="compressionScoring">Token 评分策略</label>
       <select id="compressionScoring"><option value="summary">Summary Query（默认）</option><option value="frame_mean_query">帧均值 Query（跳过摘要）</option></select>
       <label for="compressionSummarizer">摘要模型</label>
