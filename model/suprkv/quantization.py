@@ -1,9 +1,16 @@
 """KIVI grouping directions with PM-KVQ INT16 initialization and packed shrinking."""
 from dataclasses import dataclass
 import importlib.util
+from numbers import Integral
 
 import torch
 import torch.nn.functional as F
+
+
+def _compact_quantization_supported(value, group_size):
+    return (value.is_cuda and torch.version.cuda is not None
+            and value.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and group_size <= 4096 and importlib.util.find_spec('triton') is not None)
 
 
 @dataclass(frozen=True)
@@ -154,12 +161,32 @@ class CompactPackedKV:
 
     @classmethod
     def quantize(cls, value, head_offsets, group_size, *, axis, bits=8, backend='auto'):
-        if value.ndim != 2 or head_offsets[0] != 0 or head_offsets[-1] != len(value):
+        head_offsets = tuple(head_offsets)
+        if (value.ndim != 2 or min(value.shape) < 1 or len(head_offsets) < 2
+                or any(not isinstance(n, Integral) for n in head_offsets)
+                or head_offsets[0] != 0 or head_offsets[-1] != len(value)):
             raise ValueError('Expected compact [total_head_tokens, dim] payload and offsets')
+        if any(end <= start for start, end in zip(head_offsets, head_offsets[1:])):
+            raise ValueError('Retained high regions must be nonempty in every head')
+        if axis not in ('channel', 'token'):
+            raise ValueError("axis must be 'channel' or 'token'")
+        if group_size < 1 or group_size % 8:
+            raise ValueError('group_size must be a positive multiple of eight')
+        if bits not in (16, 8, 4, 2):
+            raise ValueError('Only 16/8/4/2 bit storage is supported')
+        if backend not in ('auto', 'torch', 'triton'):
+            raise ValueError('backend must be auto, torch or triton')
+        use_triton = _compact_quantization_supported(value, group_size)
+        if backend == 'triton' and not use_triton:
+            raise ValueError('Triton quantization requires CUDA FP16/BF16/FP32 and group_size <= 4096')
+        if backend != 'torch' and use_triton:
+            from .packed_kernels import quantize_compact
+            data, scale, offset, data_offsets, parameter_offsets = quantize_compact(
+                value, head_offsets, group_size, axis, bits)
+            return cls(data, scale, offset, head_offsets, value.shape[-1], bits, group_size, axis,
+                       data_offsets, parameter_offsets)
         parts, data_offsets, parameter_offsets = [], [0], [0]
         for start, end in zip(head_offsets, head_offsets[1:]):
-            if end <= start:
-                raise ValueError('Retained high regions must be nonempty in every head')
             part = PackedKV.quantize(value[start:end][None], group_size, axis=axis, bits=bits, backend=backend)
             parts.append(part)
             data_offsets.append(data_offsets[-1] + part.data.numel())

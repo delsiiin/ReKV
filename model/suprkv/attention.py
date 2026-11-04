@@ -6,6 +6,7 @@ from model.rekv.attention.dot_production_attention import get_multi_stage_dot_pr
 from .rotary import rotate_at
 from .packed_attention import PackedRotaryCache, HeadwiseRotaryCache
 from .ragged_cache import RaggedKVCache, supported as ragged_supported
+from .segments import frame_query_mean
 
 
 @dataclass
@@ -133,7 +134,7 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
             if past_key_value.capture_scores:
                 past_key_value.score_key = k[0].detach().clone()
             if past_key_value.capture_frame_query:
-                past_key_value.frame_query = q[0].float().mean(dim=1).detach()
+                past_key_value.frame_query = frame_query_mean(q[0])
         elif past_key_value is None:
             pk, pv = k[:, :, :0], v[:, :, :0]
             positions = torch.empty(0, dtype=torch.long, device=q.device)

@@ -1,6 +1,7 @@
 """Single-writer immutable frame cache. KV stays on its originating device; snapshots never leave the owner process."""
 from dataclasses import dataclass, is_dataclass, replace
 import math
+import importlib.util
 import sys
 import time
 
@@ -58,6 +59,21 @@ def tensor_storage_bytes(value, device_type=None, seen=None, storages=None):
 
 def resident_copy(x, dtype=torch.float16):
     return x.detach().to(dtype=dtype).clone().contiguous()
+
+
+def _fused_partition_supported(entries, scores):
+    return (scores.is_cuda and torch.version.cuda is not None and scores.dtype == torch.float32
+            and 0 < scores.shape[-1] <= 4096 and not scores.requires_grad
+            and importlib.util.find_spec('triton') is not None
+            and all(entry.high_k.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    and entry.high_k.dtype == entries[0].high_k.dtype
+                    and entry.high_v.shape == entry.high_k.shape
+                    and entry.high_k.shape == entries[0].high_k.shape
+                    and entry.high_indices.shape == (scores.shape[-1],)
+                    and entry.high_indices.dtype == torch.int32
+                    and all(x.device == scores.device and x.is_contiguous() and not x.requires_grad
+                            for x in (entry.high_k, entry.high_v, entry.high_indices))
+                    and entry.high_v.dtype == entry.high_k.dtype for entry in entries))
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,19 @@ class LayerFrame:
                        low_indices=self.high_indices.index_select(0, low_rows),
                        low_k=self.high_k.index_select(1, low_rows),
                        low_v=self.high_v.index_select(1, low_rows))
+
+    @staticmethod
+    def classify_batch(entries, scores):
+        """Partition a layer's unclassified frames, with one CUDA counts readback."""
+        if not entries or scores.ndim != 3 or scores.shape[0] != len(entries):
+            raise ValueError('Expected [frames, KV heads, tokens] scores')
+        if any(entry.high_offsets is not None or entry.high_k.shape[:2] != scores.shape[1:]
+               for entry in entries):
+            raise ValueError('Scores must match unpartitioned frame KV')
+        if _fused_partition_supported(entries, scores):
+            from .scoring_kernels import partition_frames
+            return [replace(entry, **parts) for entry, parts in zip(entries, partition_frames(entries, scores))]
+        return [entry.classify_scores(row) for entry, row in zip(entries, scores)]
 
     def shrink(self, group_size):
         """Lower the retained high region by one precision level."""
@@ -601,8 +630,13 @@ class StreamingKVCache:
                 raise ValueError('Scoring key must match the unpartitioned frame')
             scorer = segment_frame_query_scores if scoring_strategy == 'frame_mean_query' else segment_summary_scores
             scores = scorer(query, keys, headwise=self.compression_granularity == 'head')
-            for frame, row, frame_scores in zip(pending, classified, scores):
-                row.append(frame.layers[layer].classify_scores(frame_scores))
+            entries = [frame.layers[layer] for frame in pending]
+            if scoring_strategy == 'frame_mean_query' and self.compression_granularity == 'head':
+                partitioned = LayerFrame.classify_batch(entries, scores)
+            else:
+                partitioned = [entry.classify_scores(row) for entry, row in zip(entries, scores)]
+            for row, entry in zip(classified, partitioned):
+                row.append(entry)
         return {frame.frame_id: tuple(row) for frame, row in zip(pending, classified)}
 
     def clear_frame_queries(self):

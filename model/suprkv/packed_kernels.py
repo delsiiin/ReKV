@@ -6,6 +6,8 @@ This implementation uses Triton and the resident cache's own layout/affine
 convention, including FP32 parameters and rounding to the model dtype.
 Imported lazily so CPU/reference operation does not require Triton.
 """
+from contextlib import nullcontext
+
 import torch
 import triton
 import triton.language as tl
@@ -18,18 +20,9 @@ def _lower_codes(code, N: tl.constexpr):
              + (2**(3*N-1)-2**(2*N-1)+2**(N-1))) >> (3*N)) & ((1 << N)-1)
 
 
-# Retained token counts differ by frame AND layer. Specializing these sizes
-# produces hundreds of binaries during a single observation run. Keep only
-# the quantization format/tile shape static; suppress alignment/==1 variants
-# for all variable sizes and strides as well.
-@triton.jit(do_not_specialize=['LENGTH', 'PAD', 'ROWS', 'GROUPS', 'SH', 'SR', 'SC'])
-def _quantize(X, P, S, Z, LENGTH, PAD, ROWS, GROUPS, GROUP: tl.constexpr,
-              SH, SR, SC, BITS: tl.constexpr, BLOCK: tl.constexpr):
-    row, g = tl.program_id(0), tl.program_id(1)
-    i = tl.arange(0, BLOCK)
-    col = g * GROUP + i
-    valid = (i < GROUP) & (col < LENGTH)
-    x = tl.load(X + row // ROWS * SH + row % ROWS * SR + col * SC, valid, 0).to(tl.float32)
+@triton.jit
+def _encode_group(x, valid, BITS: tl.constexpr, BLOCK: tl.constexpr):
+    """Shared arithmetic for rectangular and compact quantization."""
     lo = tl.min(tl.where(valid, x, float('inf')), 0)
     hi = tl.max(tl.where(valid, x, float('-inf')), 0)
     scale = tl.minimum(tl.maximum((hi-lo)/65535., 1.e-5), 1.e5)
@@ -51,11 +44,90 @@ def _quantize(X, P, S, Z, LENGTH, PAD, ROWS, GROUPS, GROUP: tl.constexpr,
     lanes = tl.arange(0, PACK)
     codes = tl.reshape(code, (BLOCK // PACK, PACK))
     word = tl.sum(codes << ((PACK-1-lanes[None, :]) * BITS), 1)
+    return word, scale, -lo
+
+
+# Retained token counts differ by frame AND layer. Specializing these sizes
+# produces hundreds of binaries during a single observation run. Keep only
+# the quantization format/tile shape static; suppress alignment/==1 variants
+# for all variable sizes and strides as well.
+@triton.jit(do_not_specialize=['LENGTH', 'PAD', 'ROWS', 'GROUPS', 'SH', 'SR', 'SC'])
+def _quantize(X, P, S, Z, LENGTH, PAD, ROWS, GROUPS, GROUP: tl.constexpr,
+              SH, SR, SC, BITS: tl.constexpr, BLOCK: tl.constexpr):
+    row, g = tl.program_id(0), tl.program_id(1)
+    i = tl.arange(0, BLOCK)
+    col = g * GROUP + i
+    valid = (i < GROUP) & (col < LENGTH)
+    x = tl.load(X + row // ROWS * SH + row % ROWS * SR + col * SC, valid, 0).to(tl.float32)
+    word, scale, offset = _encode_group(x, valid, BITS, BLOCK)
+    PACK: tl.constexpr = 16 // BITS
     wi = tl.arange(0, BLOCK // PACK)
     wc = g * (GROUP // PACK) + wi
     tl.store(P + row * (PAD // PACK) + wc, word, (wi < GROUP // PACK) & (wc < PAD // PACK))
     tl.store(S + row * GROUPS + g, scale)
-    tl.store(Z + row * GROUPS + g, -lo)
+    tl.store(Z + row * GROUPS + g, offset)
+
+
+@triton.jit(do_not_specialize=['D', 'ST', 'SD', 'HEADS'])
+def _quantize_compact(X, P, S, Z, DESC, ERROR, D, ST, SD, HEADS,
+                      CHANNEL: tl.constexpr, GROUP: tl.constexpr, BITS: tl.constexpr,
+                      BLOCK: tl.constexpr, BH: tl.constexpr):
+    job = tl.program_id(0)
+    h = tl.arange(0, BH)
+    # Each head contributes rows * groups jobs. Scheduling only real jobs
+    # avoids padding either storage or the launch grid to the longest head.
+    ends = tl.load(DESC + h * 5 + 4, h < HEADS, 0x7fffffffffffffff)
+    head = tl.sum((job >= ends).to(tl.int32), 0)
+    desc = DESC + head * 5
+    first = tl.load(desc - 1, head > 0, 0)
+    start, tokens = tl.load(desc), tl.load(desc + 1)
+    data_start, param_start = tl.load(desc + 2), tl.load(desc + 3)
+    length = tokens if CHANNEL else D
+    groups = tl.cdiv(length, GROUP)
+    row, g = (job - first) // groups, (job - first) % groups
+    i = tl.arange(0, BLOCK)
+    col = g * GROUP + i
+    valid = (i < GROUP) & (col < length)
+    token, channel = (col, row) if CHANNEL else (row, col)
+    x = tl.load(X + (start + token) * ST + channel * SD, valid, 0).to(tl.float32)
+    if tl.sum(((x != x) | (tl.abs(x) == float('inf'))) & valid, 0) > 0:
+        tl.atomic_or(ERROR, 1)
+    word, scale, offset = _encode_group(x, valid, BITS, BLOCK)
+    PACK: tl.constexpr = 16 // BITS
+    words = tl.cdiv(length, 8) * 8 // PACK
+    wi = tl.arange(0, BLOCK // PACK)
+    wc = g * (GROUP // PACK) + wi
+    tl.store(P + data_start + row * words + wc, word, (wi < GROUP // PACK) & (wc < words))
+    tl.store(S + param_start + row * groups + g, scale)
+    tl.store(Z + param_start + row * groups + g, offset)
+
+
+def quantize_compact(value, head_offsets, group_size, axis, bits):
+    """All heads write directly to the final buffers; one finite check readback."""
+    dim = value.shape[-1]
+    data_offsets, parameter_offsets, descriptors, jobs = [0], [0], [], 0
+    for start, end in zip(head_offsets, head_offsets[1:]):
+        tokens = end - start
+        rows, length = (dim, tokens) if axis == 'channel' else (tokens, dim)
+        groups = triton.cdiv(length, group_size)
+        jobs += rows * groups
+        descriptors.append((start, tokens, data_offsets[-1], parameter_offsets[-1], jobs))
+        data_offsets.append(data_offsets[-1] + rows * triton.cdiv(length, 8) * 8 // (16 // bits))
+        parameter_offsets.append(parameter_offsets[-1] + rows * groups)
+    data = torch.empty(data_offsets[-1], dtype=torch.int16, device=value.device)
+    scale = torch.empty(parameter_offsets[-1], dtype=torch.float32, device=value.device)
+    offset = torch.empty_like(scale)
+    desc = torch.tensor(descriptors, dtype=torch.int64, device=value.device)
+    error = torch.zeros((), dtype=torch.int32, device=value.device)
+    context = torch.cuda.device(value.device) if value.is_cuda else nullcontext()
+    with context:
+        _quantize_compact[(jobs,)](
+            value, data, scale, offset, desc, error, dim, *value.stride(), len(descriptors),
+            axis == 'channel', group_size, bits, triton.next_power_of_2(group_size),
+            triton.next_power_of_2(len(descriptors)), enable_fp_fusion=False)
+    if error.item():
+        raise ValueError('Expected nonempty finite [heads, tokens, channels] KV')
+    return data, scale, offset, tuple(data_offsets), tuple(parameter_offsets)
 
 
 @triton.jit(do_not_specialize=['WORDS', 'PARAMS'])

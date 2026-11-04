@@ -249,6 +249,65 @@ python tests/benchmark_suprkv_accounting.py \
 
 ## 验证
 
+### Head + frame_mean_query 的评分与分区融合
+
+CUDA/Triton 上，`head + frame_mean_query` 自动使用 `scoring_kernels.py`：
+
+- 按目标帧、KV head 和 token tile 计算每个帧 Query/GQA head 的 FP32 点积，
+  块内完成缩放与均值归约，只输出 `[F, Hkv, N]` 分数。不提前平均 Query，
+  不写出 `[Hkv, G, F, F*N]` logits，也不创建整段 FP32 K 副本。
+- 每层全部帧/head 批量执行阈值比较、稳定前缀和与计数，计数只回传一次。
+  随后一个 scatter kernel 写出高低分 K/V 和原始索引，不调用逐帧 `nonzero`。
+  各帧的高低分区仍分别拥有精确大小的独立存储，保留预算释放与快照语义。
+- 评分中的输入/输出有限值检查合并进 kernel，错误标记每层读取一次；
+  加上分区计数读取，正常提交每层有两次必要的设备结果回传。
+  任意层评分失败仍整段按原始高分区提交，OOM 继续传播。
+
+评分支持 FP16/BF16/FP32 KV、head dimension ≤ 256；批量分区支持每帧
+1–4096 token 的连续原始 KV。CPU、不支持的 dtype/形状或需要梯度的输入
+使用原 PyTorch 路径。`layer` 和 `summary` 保留原路径。
+分块归约改变浮点加法顺序，分数按 FP32 误差容限验证，不承诺任意输入下逐位相同；
+测试同时比较实际 token 分区，包括精确均值 ties 和均值两侧的邻近分数。
+
+```bash
+python -m unittest discover -s tests -p 'test_suprkv_scoring_fusion.py' -v
+python tests/benchmark_suprkv_scoring.py --compare-reference
+# 无 CUDA 时执行真实 Triton kernel 的 CPU 解释器，仅验证算术/寻址和集成逻辑：
+TRITON_INTERPRET=1 python -m unittest discover -s tests -p 'test_suprkv_scoring_fusion.py' -v
+```
+
+评分基准默认测 `head + frame_mean_query`，`--compare-reference` 同时关闭两个
+融合路径作为对照；可通过 `--compression-granularity`、`--scoring-strategy`
+选择其他组合。它报告预热后的闭段时延与临时显存峰值，不包含模型编码、量化或冷编译。
+
+### Compact 首次量化与帧 Query 均值融合
+
+`CompactPackedKV.quantize()` 在 CUDA/Triton 上按各 head 的实际分组数统一调度，
+一次 kernel 直接写出最终连续的 data、scale、offset，不再逐 head 启动量化并拼接结果。
+K、V 保持各自的分组方向，head 边界、尾组 padding、MSB-first 位序和逐级降位公式不变。
+有限值检查合并到该 kernel，每份 K 或 V 载荷只回传一次错误标记。
+输入支持非连续二维布局；`backend='torch'` 保留逐 head 参考实现，
+CPU、非 FP16/BF16/FP32 或 group size > 4096 继续走兼容路径。
+
+`frame_mean_query` 编码中的 RoPE 前 Q 捕获通过一次 kernel 完成转换与 token 均值，
+保留各 Q head，FP32 累加并仅写出 `[Hq, D]`，不创建完整 FP32 Q 副本。
+该捕获适用于 layer/head 两种压缩粒度，支持 head dimension ≤ 256、每帧
+1–4096 token；其余情况使用原 PyTorch 归约。它不新增逐帧主机同步，
+非有限均值继续交给闭段评分检查，保留整段回退行为。
+均值按 FP32 容限验证；浮点归约顺序变化不承诺任意输入的分区逐位一致。
+
+```bash
+python -m unittest discover -s tests -p 'test_suprkv_p1_fusion.py' -v
+python tests/benchmark_suprkv_p1.py --device cuda:0
+TRITON_INTERPRET=1 python -m unittest discover -s tests -p 'test_suprkv_p1_fusion.py' -v
+```
+
+P1 基准分别测帧 Query 均值、K 首次 INT8、V 首次 INT8，报告预热时延与额外显存。
+量化对照保留旧的逐 head CUDA 量化，避免把更换量化后端的收益算作批处理收益。
+解释器测试仅用 NumPy nearest-even `rint` 模拟不支持解释执行的 `libdevice.nearbyint`；
+其余量化寻址、分组、降位、打包和 Query 归约执行真实 kernel 代码。
+解释器及离线编译均不能替代真实 GPU 的正确性与性能验证。
+
 ### Head 模式的批量问答路径
 
 `--compression-granularity head` 在 CUDA、batch=1、推理模式且未启用

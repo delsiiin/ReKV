@@ -1,5 +1,6 @@
 """Incremental equivalent of observation's historical-EMA segmenter."""
 import math
+import importlib.util
 
 import torch
 
@@ -33,6 +34,24 @@ class OnlineSegmenter:
 
     def close(self):
         self.count = 0  # Preserve EMA and the preceding visual frame.
+
+
+def _fused_frame_query_mean_supported(query):
+    return (query.is_cuda and torch.version.cuda is not None
+            and query.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and 0 < query.shape[-1] <= 256 and 0 < query.shape[1] <= 4096
+            and importlib.util.find_spec('triton') is not None)
+
+
+def frame_query_mean(query):
+    """Detached FP32 pre-RoPE frame mean: [Q heads, tokens, D] -> [Q heads, D]."""
+    if query.ndim != 3 or min(query.shape) < 1 or not query.is_floating_point():
+        raise ValueError('Expected nonempty floating [query heads, tokens, dim] Query')
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        if _fused_frame_query_mean_supported(query):
+            from .scoring_kernels import frame_query_mean as fused_mean
+            return fused_mean(query)
+        return query.float().mean(dim=1).detach()
 
 
 def summary_scores(query, key, *, headwise=False):
@@ -81,6 +100,15 @@ def segment_summary_scores(query, keys, *, headwise=False):
         return torch.einsum('hd,fhnd->fhn', q, batch) / math.sqrt(dim)
 
 
+def _fused_frame_scores_supported(query, keys):
+    key = keys[0]
+    return (key.is_cuda and torch.version.cuda is not None and 0 < key.shape[-1] <= 256
+            and all(k.dtype == key.dtype and not k.requires_grad for k in keys)
+            and key.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and query.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and not query.requires_grad and importlib.util.find_spec('triton') is not None)
+
+
 def segment_frame_query_scores(query, keys, *, headwise=False):
     """Mean pre-softmax logits over frame queries and each GQA group.
 
@@ -98,6 +126,9 @@ def segment_frame_query_scores(query, keys, *, headwise=False):
     if min(kv_heads, tokens, dim, heads) < 1 or heads % kv_heads or query.shape[-1] != dim:
         raise ValueError('Invalid GQA head mapping')
     with torch.autocast(device_type=key.device.type, enabled=False):
+        if headwise and _fused_frame_scores_supported(query, keys):
+            from .scoring_kernels import frame_query_scores
+            return frame_query_scores(query, keys)
         query = query.to(device=key.device, dtype=torch.float32)
         key = torch.cat(keys, dim=1).float()
         if not (torch.isfinite(query).all() & torch.isfinite(key).all()):
