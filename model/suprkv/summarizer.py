@@ -5,6 +5,7 @@ from typing import Protocol
 import torch
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
+from model.video_backbone import question_prompt, preprocess_video, video_features
 from observation.engine import question_inputs, greedy_token_ids
 from observation.segments import SUMMARY_SYSTEM, summary_prompt
 
@@ -34,6 +35,8 @@ class Summarizer(Protocol):
 
 class OneVisionSummarizer:
     """Works with an independent model or borrows the main model's native decoder."""
+    family = 'onevision'
+
     def __init__(self, model, processor, model_path, decoder_context=nullcontext):
         self.model, self.processor = model, processor
         self.model_path = model_path
@@ -94,3 +97,22 @@ class OneVisionSummarizer:
                 max_new_tokens, {self.tokenizer.eos_token_id}, check_cancel)
         return self.tokenizer.decode(ids, skip_special_tokens=True,
             clean_up_tokenization_spaces=False).strip()
+
+
+class VideoLlavaSummarizer(OneVisionSummarizer):
+    """Native summaries with Video-LLaVA's chat syntax and a single BOS."""
+    family = 'video_llava'
+
+    @torch.inference_mode()
+    def encode_frame(self, image):
+        pixels = preprocess_video(self.processor, self.family, torch.as_tensor(image)[None])
+        features = video_features(self.model, self.family, pixels.to(self.device, self.dtype))
+        return features.detach().clone()
+
+    def prompt_ids(self, frames):
+        system = f'USER: {SUMMARY_SYSTEM}\n'
+        ids = self.tokenizer(system, return_tensors='pt').input_ids.to(self.device)
+        suffix = self.tokenizer(question_prompt(self.family, summary_prompt(frames)),
+                                return_tensors='pt').input_ids.to(self.device)
+        suffix = suffix[:, 1:]
+        return ids, suffix

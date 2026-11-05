@@ -2,7 +2,19 @@
 
 Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --method suprkv`。`video_qa.suprkv_stream_vqa` 中的 `SuPrKVStreamVQA` 与原 `ReKVStreamVQA` 一样继承 `BaseVQA`，复用 `work()` 加载数据和模型、`analyze()` 遍历视频和保存 CSV。`video_qa.run_eval` 中的 `eval_rvs_ego` 和 `eval_rvs_movie` 分别实现各自的启动、合并和评分流程，并按 `--method` 选择 ReKV 或 SuPr-KV；测试与性能基准文件统一使用 `suprkv` 命名。
 
-采用 ReKV 单进程顺序执行方式的 GPU 常驻压缩后端（默认单模型，可选独立摘要模型），支持 LLaVA-OneVision Qwen2 checkpoint。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
+采用 ReKV 单进程顺序执行方式的 GPU 常驻压缩后端（默认单模型，可选独立摘要模型），支持 `video_qa/model_paths.py` 的 `MODEL_PATHS` 中全部模型：LLaVA-OneVision、Video-LLaVA 和 Qwen2.5-VL。所有方法共用这一模型列表。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
+
+Video-LLaVA 通过 `--model video_llava_7b` 选择，复用现有的视觉特征和对话格式。
+原 checkpoint 每帧为 257 个 token；运行时根据视觉配置确定实际帧大小。
+支持 `summary` / `frame_mean_query` 评分和 `layer` / `head` 压缩。
+直接使用 Python 时，设置 `model_family='video_llava'`，并传入相应 `model_path`。
+
+Qwen2.5-VL 使用 `--model qwen2_5_vl_3b`、`qwen2_5_vl_7b` 或 `qwen2_5_vl_72b`；
+`--model_path` 可覆盖为本地同类模型。Python 入口需设置
+`StreamingConfig(model_path='Qwen/Qwen2.5-VL-7B-Instruct', model_family='qwen2_5_vl')`。
+每个采样帧独立编码为 196 个视觉 token，检索与问答沿用现有一维 RoPE 重定位；
+主模型摘要使用逐帧图像的原生空间 MRoPE。两种评分策略、两种压缩粒度均可使用。
+独立摘要模型仍为 OneVision。完整语义与运行示例见 [主文档](../../README.md#qwen25-vl-with-all-inference-methods)。
 
 ## Token 评分策略
 
@@ -92,7 +104,7 @@ SuPr-KV 支持 `rvs_ego`、`rvs_movie` 两个流式开放问答数据集，使�
 
 离线数据集支持 `mlvu`、`qaego4d`、`egoschema`、`activitynet_qa` 和 `cgbench`，例如 `python -m video_qa.run_eval --method suprkv --dataset qaego4d --max_samples 5`。`SuPrKVOfflineVQA` 逐帧编码完整视频并结束最后一个片段，再复用该视频缓存回答全部问题，无需 `end_time`。开放题沿用 ReKV 的输出字段；选择题另存 `choices`、`correct_choice`、`pred_choice`、`qa_acc`（百分数），`question_type` 映射为 `task`。无公开答案时沿用 ReKV 取首个选项的约定，此时 `qa_acc` 不能视为真实准确率。离线开放题直接复用 `ReKVOfflineVQA.video_open_qa`，选择题复用 `BaseVQA.format_mcqa_prompt` 和 ReKV 的 OneVision 对话模板：检索仅输入原始问题；选择题生成 prompt 包含选项，并以 `Best option: (` 开始回答。开放题默认生成 1024 个新 token、选择题生成 16 个，覆盖 runtime 的 `--max_new_tokens`。两者均使用贪心生成和 EOS 停止，解码清理及非空答案的选项解析与 ReKV 一致；SuPr-KV 保留空选择题答案记错的处理。只生成离线预测可运行 `python -m video_qa.suprkv_offline_vqa --anno_path data/qaego4d/test_mc.json --save_dir results/suprkv_offline`。
 
-每个 worker 的主模型及可选摘要模型均只加载一次，在视频之间调用 `reset()` 复用权重。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，沿用原 ReKV 的编号方式，由 worker 索引分配 GPU（第 0 个 worker 使用 GPU 0，以此类推）。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的 checkpoint；仅支持 OneVision Qwen2 系列。
+每个 worker 的主模型及可选摘要模型均只加载一次，在视频之间调用 `reset()` 复用权重。`--num_chunks` 是 worker 数量，每个 worker 使用一张 GPU，沿用原 ReKV 的编号方式，由 worker 索引分配 GPU（第 0 个 worker 使用 GPU 0，以此类推）。SuPr-KV 目前不支持单模型跨 GPU 切分，72B 模型也必须能放入单张设备。`--model_path` 可覆盖 `--model` 对应的同架构 checkpoint。
 
 `--n_local` 是 ReKV 的局部注意力窗口，不能作为 SuPr-KV 预算使用；SuPr-KV 模式会明确拒绝该参数。使用 `--budget_tokens` 设置压缩缓存预算、`--recent_frames` 设置保护的最近帧数。SuPr-KV 扩展参数同时接受下划线和连字符写法。
 
@@ -113,7 +125,7 @@ python -m video_qa.suprkv_stream_vqa \
 `add_suprkv_arguments()` 逐项声明方法参数并提供作用说明，可用 `python -m video_qa.suprkv_stream_vqa --help` 查看。默认缓存预算为 8192 个 FP16 等效 token；流式问答和片段摘要默认分别最多生成 256 个新 token，离线问答使用上述 ReKV 的 1024/16 上限。
 
 默认从 Hugging Face 加载 `llava-hf/llava-onevision-qwen2-7b-ov-hf`，首次使用自动下载并缓存。
-可用 `--model_path` 指定其他 OneVision 模型 ID 或本地目录，用 `HF_HOME` 指定模型缓存目录。ReKV 与 SuPr-KV 共用 `video_qa/sampling.py`，采用原 ReKV 的采样规则：NPY 视为每秒一帧，使用 `np.linspace(0, 总帧数 - 1, int(总帧数 × sample_fps), dtype=int)`；MP4 使用 `int(round(原视频平均FPS) / sample_fps)` 的固定整数步长。这与 observation 在开始时间过滤、帧数限制之前的正常采样结果一致。MP4 时间戳仍由帧索引除以未取整的平均 FPS 估算，并非逐帧容器时间戳。两种方法的 RVS 问答均恢复原 ReKV 的 `int(end_time * sample_fps)` 数组切片边界，右边界不包含在内，超出视频长度时自然截断。ReKV 按问题批量编码新增帧，SuPr-KV 逐帧编码；重复边界不重复编码。SuPr-KV 回答时使用已编码帧的缓存快照，不再按标注时间做第二次过滤，因为数组切片选中的源帧时间可能等于或超过 `end_time`。
+可用 `--model_path` 指定同架构模型 ID 或本地目录，用 `HF_HOME` 指定模型缓存目录。ReKV 与 SuPr-KV 共用 `video_qa/sampling.py`，采用原 ReKV 的采样规则：NPY 视为每秒一帧，使用 `np.linspace(0, 总帧数 - 1, int(总帧数 × sample_fps), dtype=int)`；MP4 使用 `int(round(原视频平均FPS) / sample_fps)` 的固定整数步长。这与 observation 在开始时间过滤、帧数限制之前的正常采样结果一致。MP4 时间戳仍由帧索引除以未取整的平均 FPS 估算，并非逐帧容器时间戳。两种方法的 RVS 问答均恢复原 ReKV 的 `int(end_time * sample_fps)` 数组切片边界，右边界不包含在内，超出视频长度时自然截断。ReKV 按问题批量编码新增帧，SuPr-KV 逐帧编码；重复边界不重复编码。SuPr-KV 回答时使用已编码帧的缓存快照，不再按标注时间做第二次过滤，因为数组切片选中的源帧时间可能等于或超过 `end_time`。
 
 ### 与 ReKV 的代码对应
 

@@ -130,31 +130,6 @@ class NativeRuntimeTests(unittest.TestCase):
                 self.assertEqual(loader.call_args.kwargs['device_map'], 'cpu')
                 self.assertEqual(loader.call_args.kwargs['dtype'], torch.float32)
 
-    @torch.inference_mode()
-    def test_longva_original_backbone_features_and_decoding(self):
-        from transformers import CLIPVisionConfig, CLIPVisionModel, CLIPImageProcessor
-        from longva.model import LlavaQwenConfig, LlavaQwenForCausalLM
-        with tempfile.TemporaryDirectory() as directory:
-            vision_path = Path(directory) / 'vision'
-            CLIPVisionModel(CLIPVisionConfig(
-                hidden_size=32, intermediate_size=48, num_hidden_layers=2,
-                num_attention_heads=4, image_size=8, patch_size=2)).save_pretrained(vision_path)
-            CLIPImageProcessor(size={'shortest_edge': 8}, crop_size={'height': 8, 'width': 8}).save_pretrained(vision_path)
-            model = LlavaQwenForCausalLM(LlavaQwenConfig(
-                vocab_size=32, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
-                num_attention_heads=4, num_key_value_heads=2, mm_vision_tower=str(vision_path),
-                mm_vision_select_layer=-1, mm_hidden_size=32, mm_projector_type='linear',
-                mm_spatial_pool_mode='average', mm_spatial_pool_stride=2)).eval()
-            processor = model.get_vision_tower().image_processor
-            processor.tokenizer = Tokenizer()
-            runtime = NativeRuntime(model, processor, 'longva')
-            runtime.append_frame(np.zeros((8, 8, 3), dtype=np.uint8), 0.)
-            self.assertEqual(runtime.frames[0].shape, (1, 4, 32))
-            answer = runtime.question_answering({'prompt': runtime.get_prompt('q')}, max_new_tokens=3)
-            self.assertEqual(len(answer.split()), 3)
-            runtime.close()
-            self.assertEqual(runtime.frames, [])
-
 
 class RecordingRuntime:
     processor = None
@@ -336,7 +311,7 @@ from video_qa import run_eval, base, native_offline_vqa, native_stream_vqa
 from model.native.runtime import NativeRuntime
 run_eval.build_parser()
 base.build_parser('native')
-assert not any(name.startswith(('model.rekv', 'model.suprkv', 'flash_attn', 'longva')) for name in sys.modules)
+assert not any(name.startswith(('model.rekv', 'model.suprkv', 'flash_attn')) for name in sys.modules)
 '''
         subprocess.run([sys.executable, '-c', script], check=True, capture_output=True, text=True)
 

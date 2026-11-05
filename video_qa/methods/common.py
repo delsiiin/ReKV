@@ -52,7 +52,7 @@ class Method:
         return command
 
     def devices(self, args, index):
-        count = 4 if args.model == 'llava_ov_72b' else 1
+        count = 4 if args.model in ('llava_ov_72b', 'qwen2_5_vl_72b') else 1
         return ','.join(str(count * index + offset) for offset in range(count))
 
     def solver(self, mode):

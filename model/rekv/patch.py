@@ -1,5 +1,5 @@
 import torch
-from transformers import LlamaModel, MistralModel, Qwen2Model
+from transformers import LlamaModel, MistralModel, Qwen2Model, Qwen2_5_VLTextModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from model.rekv.attention import RotaryEmbeddingESM, rekv_attention_forward
@@ -34,9 +34,10 @@ def huggingface_forward(forward):
 
 def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, attention_factory=None, **kwargs):
     attn_kwargs = {**(attn_kwargs or {}), **kwargs}
-    decoder = model if isinstance(model, (LlamaModel, MistralModel, Qwen2Model)) else getattr(model, "model", None)
-    if not isinstance(decoder, (LlamaModel, MistralModel, Qwen2Model)):
-        raise ValueError(f"Only supports llama, mistral and qwen2 models, not {model.__class__.__name__}.")
+    decoder_types = (LlamaModel, MistralModel, Qwen2Model, Qwen2_5_VLTextModel)
+    decoder = model if isinstance(model, decoder_types) else getattr(model, "model", None)
+    if not isinstance(decoder, decoder_types):
+        raise ValueError(f"Unsupported ReKV decoder: {model.__class__.__name__}.")
 
     def model_forward(
         self,
@@ -94,7 +95,8 @@ def patch_hf(model, attn_kwargs=None, base=None, distance_scale=None, attention_
         )
         return output if return_dict else output.to_tuple()
 
-    # RoPE is now owned by the decoder, and its settings live in rope_parameters.
+    # Retrieval uses contiguous 1D positions, including for Qwen2.5-VL. Its
+    # native MRoPE remains available through _old_forward for isolated summaries.
     config = decoder.config
     rope_parameters = config.rope_parameters
     head_dim = decoder.layers[0].self_attn.head_dim

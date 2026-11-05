@@ -390,13 +390,11 @@ class SuPrKVEvalTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.worker_args('--compression-granularity', 'invalid')
 
-    def test_rekv_specific_parameter_and_unsupported_model_are_rejected(self):
-        for extra in (['--n_local', '15000'], ['--model', 'longva_7b']):
-            with self.subTest(extra=extra), patch.object(run_eval, 'eval_rvs_ego') as launch, \
-                    redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit):
-                    run_eval.main(['--method', 'suprkv', '--dataset', 'rvs_ego', *extra])
-                launch.assert_not_called()
+    def test_rekv_specific_parameter_is_rejected(self):
+        with patch.object(run_eval, 'eval_rvs_ego') as launch, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                run_eval.main(['--method', 'suprkv', '--dataset', 'rvs_ego', '--n_local', '15000'])
+            launch.assert_not_called()
 
     def test_shared_model_resolution_and_actual_runtime_defaults(self):
         from model.suprkv.runtime import StreamingConfig

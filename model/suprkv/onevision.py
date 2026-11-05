@@ -9,7 +9,8 @@ import torch
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
 from model.rekv.patch import patch_hf
-from observation.engine import INIT_PROMPT, question_inputs, greedy_token_ids
+from model.video_backbone import INITIAL_PROMPTS, question_prompt
+from observation.engine import greedy_token_ids
 from observation.segments import selected_vision_features, capture_queries
 from .attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
 from .cache import StreamingKVCache
@@ -32,6 +33,12 @@ def native_decoder(decoder):
 
 
 class OneVisionEngine:
+    family = 'onevision'
+    frame_tokens = 196
+    model_class = LlavaOnevisionForConditionalGeneration
+    processor_class = LlavaOnevisionProcessor
+    summarizer_class = OneVisionSummarizer
+
     def __init__(self, config, *, model=None, processor=None, profiler=None,
                  check_cancel=lambda: None, summarizer: Summarizer | None = None):
         self.config = config
@@ -47,28 +54,25 @@ class OneVisionEngine:
         if (model is None) != (processor is None):
             raise ValueError('Provide both model and processor, or neither')
         if model is None:
-            self.processor = LlavaOnevisionProcessor.from_pretrained(config['model_path'])
-            self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-                config['model_path'], dtype=torch.float16,
-                device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
+            self.model, self.processor = self._load_model(config)
         else:
             self.model, self.processor = model, processor
         if self.model.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError('Streaming model requires float16, bfloat16 or float32')
         self.dtype = self.model.dtype
         self.decoder = self.model.model.language_model
+        self.frame_tokens = self._frame_token_count()
         self._model_parameter_bytes = sum(p.numel()*p.element_size() for p in self.model.parameters())
         self.device = self.decoder.get_input_embeddings().weight.device
         self.tokenizer = self.processor.tokenizer
-        self.prefix = self.tokenizer(INIT_PROMPT, return_tensors='pt').input_ids.to(self.device)
-        self.frame_tokens = 196
+        self.prefix = self.tokenizer(INITIAL_PROMPTS[self.family], return_tensors='pt').input_ids.to(self.device)
         self.sink_tokens = self.prefix.shape[1]
         local = config['recent_frames']*self.frame_tokens
         patch_hf(self.decoder, attention_factory=streaming_attention_forward,
                  n_local=local, n_init=self.sink_tokens,
                  packed_attention=config.get('packed_attention', False),
                  fattn=str(device).startswith('cuda') and self.dtype != torch.float32)
-        self.main_summarizer = OneVisionSummarizer(self.model, self.processor,
+        self.main_summarizer = self.summarizer_class(self.model, self.processor,
             config.get('model_path', 'main'), partial(native_decoder, self.decoder))
         path = validate_summarizer_path(config.get('summarizer_model_path')) if self.scoring_strategy == 'summary' else None
         self.summarizer = None
@@ -81,6 +85,22 @@ class OneVisionEngine:
         self.cache = None
         self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.)
         self.reset()
+
+    def _load_model(self, config):
+        processor = self.processor_class.from_pretrained(config['model_path'])
+        device = config['device']
+        model = self.model_class.from_pretrained(
+            config['model_path'], dtype=torch.float32 if str(device) == 'cpu' else torch.float16,
+            device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
+        return model, processor
+
+    def _frame_token_count(self):
+        return self.frame_tokens
+
+    def _question_ids(self, text):
+        ids = self.tokenizer(text, return_tensors='pt').input_ids
+        # Video-LLaVA's BOS belongs only to the initial sink prompt.
+        return ids[:, 1:] if self.family == 'video_llava' else ids
 
     def _set_window(self, mode, max_new_tokens=None):
         limit = self.config.get('max_new_tokens', 256) if max_new_tokens is None else max_new_tokens
@@ -133,6 +153,19 @@ class OneVisionEngine:
         finally:
             self.timings['summarizer_vision_seconds'] += time.monotonic()-began
 
+    def _frame_features(self, image):
+        pixels = self.processor.video_processor(videos=[image], do_sample_frames=False,
+                    return_tensors='pt').pixel_values_videos.to(self.device, self.dtype)
+        output = self.model.model.get_video_features(pixel_values=pixels,
+                    vision_feature_layer=self.model.config.vision_feature_layer,
+                    vision_feature_select_strategy=self.model.config.vision_feature_select_strategy,
+                    return_dict=True)
+        feature = output.pooler_output.reshape(1, -1, self.decoder.config.hidden_size)
+        raw = (selected_vision_features(output, self.model.config.vision_feature_layer,
+                                       self.model.config.vision_feature_select_strategy)[0]
+               if self.compression_enabled else None)
+        return feature, raw
+
     @torch.inference_mode()
     @stage('video_encoding')
     def append_frame(self, image, timestamp):
@@ -140,13 +173,7 @@ class OneVisionEngine:
         began = time.monotonic()
         closed_seconds = 0.
         with measure(self.profiler, 'vision_encoding'):
-            pixels = self.processor.video_processor(videos=[image], do_sample_frames=False,
-                        return_tensors='pt').pixel_values_videos.to(self.device, self.dtype)
-            output = self.model.model.get_video_features(pixel_values=pixels,
-                        vision_feature_layer=self.model.config.vision_feature_layer,
-                        vision_feature_select_strategy=self.model.config.vision_feature_select_strategy,
-                        return_dict=True)
-            feature = output.pooler_output.reshape(1, -1, self.decoder.config.hidden_size)
+            feature, raw = self._frame_features(image)
             if feature.shape[1] != self.frame_tokens:
                 raise ValueError(f'Expected {self.frame_tokens} frame tokens; got {feature.shape[1]}')
         info = dict(index=self.cache.next_id, timestamp=float(timestamp))
@@ -154,9 +181,7 @@ class OneVisionEngine:
         if self.compression_enabled:
             reserve = self.config['summary_max_new_tokens']
             with measure(self.profiler, 'segmentation'):
-                raw = selected_vision_features(output, self.model.config.vision_feature_layer,
-                                              self.model.config.vision_feature_select_strategy)
-                boundary = self.segmenter.push(raw[0])
+                boundary = self.segmenter.push(raw)
                 context_full = (self.scoring_strategy == 'summary' and
                     self._summary_length(self.features+[feature], self.frame_info+[info]) + reserve > self.main_summarizer.context_limit)
             if self.frame_info and (boundary or context_full):
@@ -316,15 +341,14 @@ class OneVisionEngine:
         hits = set()
         contexts = [RetrieveLayer(snapshot, layer, self.config['topk'], hits, getattr(self, 'profiler', None))
                     for layer in range(len(self.decoder.layers))]
-        ids = self.tokenizer(question, return_tensors='pt').input_ids.to(self.device)
+        ids = self._question_ids(question).to(self.device)
         self._set_window('qa', max_new_tokens=limit)
         with measure(getattr(self, 'profiler', None), 'retrieval'):
             result = self.decoder(input_ids=ids, past_key_values=contexts, use_cache=True, return_dict=True)
         past = result.past_key_values
         del result, contexts, snapshot
         on_retrieved(hits)
-        prompt_ids = (question_inputs(self.tokenizer, question) if prompt is None else
-                      self.tokenizer(prompt, return_tensors='pt').input_ids)
+        prompt_ids = self._question_ids(question_prompt(self.family, question) if prompt is None else prompt)
         output = self.decoder(input_ids=prompt_ids.to(self.device),
                               past_key_values=past, use_cache=True, return_dict=True)
         del past

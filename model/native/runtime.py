@@ -1,46 +1,43 @@
 """Full-context inference with the original, unpatched language model.
 
-Only visual embeddings persist across questions. Each question starts with the
-entire visible prefix and gets a fresh native KV cache, discarded after decoding.
+Visual embeddings (or sampled frames for the native Qwen video processor) persist
+across questions. Each question starts with the entire visible prefix and gets a
+fresh native KV cache, discarded after decoding.
 """
 import torch
 
-from model.video_backbone import INITIAL_PROMPTS, question_prompt, preprocess_video, video_features
+from model.video_backbone import INITIAL_PROMPTS, model_family, question_prompt, preprocess_video, video_features
 
 
 class NativeRuntime:
     def __init__(self, model, processor, family, max_new_tokens=None):
         self.model, self.processor, self.family = model, processor, family
         self.tokenizer = processor.tokenizer
-        self.decoder = model.model if family == 'longva' else model.model.language_model
+        self.decoder = model.model.language_model
         self.max_new_tokens = max_new_tokens
         self.reset()
 
     @classmethod
-    def load(cls, model_name, model_path, *, device=None, max_new_tokens=None):
+    def load(cls, model_name, model_path, *, device=None, max_new_tokens=None, sample_fps=None):
         # Import only the selected original backbone. Never import a ReKV loader or patch.
         options = dict(device_map=device or 'auto', low_cpu_mem_usage=True,
                        dtype=torch.float32 if device == 'cpu' else torch.float16)
-        if model_name.startswith('llava_ov_'):
+        family = model_family(model_name)
+        if family == 'onevision':
             from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
             model = LlavaOnevisionForConditionalGeneration.from_pretrained(model_path, **options)
             processor = LlavaOnevisionProcessor.from_pretrained(model_path)
-            family = 'onevision'
-        elif model_name == 'video_llava_7b':
+        elif family == 'video_llava':
             from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
             model = VideoLlavaForConditionalGeneration.from_pretrained(model_path, **options)
             processor = VideoLlavaProcessor.from_pretrained(model_path)
-            family = 'video_llava'
-        elif model_name == 'longva_7b':
-            from transformers import AutoTokenizer
-            from longva.model import LlavaQwenForCausalLM
-            model = LlavaQwenForCausalLM.from_pretrained(model_path, **options)
-            tower = model.get_vision_tower()
-            if not tower.is_loaded:
-                tower.load_model(device_map=device or 'auto')
-            processor = tower.image_processor
-            processor.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-            family = 'longva'
+        elif family == 'qwen2_5_vl':
+            from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
+            from .qwen2_5_vl import Qwen2_5_VLNativeRuntime
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, **options)
+            processor = Qwen2_5_VLProcessor.from_pretrained(model_path)
+            return Qwen2_5_VLNativeRuntime(model.eval(), processor, 'qwen2_5_vl',
+                                         max_new_tokens, sample_fps=sample_fps)
         else:
             raise ValueError(f'Unsupported native model: {model_name}')
         return cls(model.eval(), processor, family, max_new_tokens)

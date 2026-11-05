@@ -27,8 +27,11 @@ class StreamingConfig:
     summarizer_model_path: str | None = None
     scoring_strategy: str = 'summary'
     compression_granularity: str = 'layer'
+    model_family: str = 'onevision'
 
     def __post_init__(self):
+        if self.model_family not in ('onevision', 'qwen2_5_vl', 'video_llava'):
+            raise ValueError('Unsupported SuPr-KV model_family')
         if self.compression_granularity not in ('layer', 'head'):
             raise ValueError('Invalid compression_granularity')
         if self.scoring_strategy not in ('summary', 'frame_mean_query'):
@@ -70,8 +73,15 @@ class StreamingRuntime:
     def __init__(self, config=None, model_factory=None):
         self.config = config or StreamingConfig()
         if model_factory is None:
-            from .onevision import OneVisionEngine
-            model_factory = OneVisionEngine
+            if self.config.model_family == 'qwen2_5_vl':
+                from .qwen2_5_vl import Qwen2_5_VLEngine
+                model_factory = Qwen2_5_VLEngine
+            elif self.config.model_family == 'video_llava':
+                from .video_llava import VideoLlavaEngine
+                model_factory = VideoLlavaEngine
+            else:
+                from .onevision import OneVisionEngine
+                model_factory = OneVisionEngine
         self.model = model_factory(asdict(self.config))
         self.question_id = 0
         self.closed = False
@@ -104,9 +114,9 @@ class StreamingRuntime:
         return self._call('close_segment')
 
     def get_prompt(self, query, mc=False):
-        """Use the shared OneVision chat suffix."""
+        """Use the selected backbone's chat suffix."""
         from model.video_backbone import question_prompt
-        return question_prompt('onevision', query, mc=mc)
+        return question_prompt(self.config.model_family, query, mc=mc)
 
     def question_answering(self, input_text, max_new_tokens=128, retrieved_indices=None):
         """Adapt ReKV's separate retrieval question and generation prompt."""

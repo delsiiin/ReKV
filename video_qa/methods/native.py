@@ -23,7 +23,8 @@ class NativeMethod(Method):
     def load(self, args):
         from model.native.runtime import NativeRuntime
         runtime = NativeRuntime.load(args.model, args.model_path or MODEL_PATHS[args.model],
-                                     device=args.device, max_new_tokens=args.max_new_tokens)
+                                     device=args.device, max_new_tokens=args.max_new_tokens,
+                                     sample_fps=args.sample_fps)
         return runtime, runtime.processor
 
     def close(self, model):

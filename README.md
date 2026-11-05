@@ -22,7 +22,7 @@ Through comprehensive experimentation, we validate the efficacy and practicality
 ├── model
 │   ├── rekv    ReKV model adapters, attention, and retrieval cache
 │   ├── suprkv  SuPr-KV runtime, compression, and retrieval
-│   └── longva  vendored LongVA model dependency (installed separately)
+│   └── native original model inference
 ├── model_zoo   optional local Video-LLM checkpoints
 ├── results     evaluation results
 └── video_qa    code for StreamingVQA & OfflineVQA
@@ -32,6 +32,11 @@ ReKV modules are imported from `model.rekv` (for example,
 `model.rekv.llava_onevision_rekv` and `model.rekv.patch`); SuPr-KV modules
 are imported from `model.suprkv`. SuPr-KV reuses the decoder patch,
 attention primitives, and QA adapter from `model.rekv`.
+
+`video_qa/model_paths.py` contains the single model registry, `MODEL_PATHS`.
+Every listed model supports all three methods (`native`, `rekv`, `suprkv`) on
+both offline and streaming routes. Architecture resolution is shared across
+methods; there are no separate method-specific model lists.
 
 ## Preparation
 
@@ -43,8 +48,8 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
   - [llava-onevision-qwen2-0.5b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-0.5b-ov-hf)
   - [llava-onevision-qwen2-7b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-7b-ov-hf)
   - [llava-onevision-qwen2-72b-ov-hf](https://huggingface.co/llava-hf/llava-onevision-qwen2-72b-ov-hf)
-  - [LongVA-7B](https://huggingface.co/lmms-lab/LongVA-7B)
   - [Video-LLaVA-7B-hf](https://huggingface.co/LanguageBind/Video-LLaVA-7B-hf)
+  - Qwen2.5-VL Instruct: `qwen2_5_vl_3b`, `qwen2_5_vl_7b`, `qwen2_5_vl_72b` (all methods: native, ReKV and SuPr-KV)
 - Download benchmarks under `data/`
   - [MLVU-dev-mc](https://huggingface.co/datasets/MLVU/MVLU)
   - [QAEgo4D-test-mc](https://huggingface.co/datasets/Becomebright/QAEgo4D-MC-test/tree/main)
@@ -114,7 +119,7 @@ See [the observation guide](observation/README.md) for inputs and metric definit
 # Yet, llava_ov_72b needs 4x 80GB GPUs. So set num_chunks to num_gpus//4.
 num_chunks=8
 
-# Supported model: llava_ov_0.5b llava_ov_7b llava_ov_72b video_llava_7b longva_7b
+# Supported model: llava_ov_0.5b llava_ov_7b llava_ov_72b video_llava_7b qwen2_5_vl_3b qwen2_5_vl_7b qwen2_5_vl_72b
 model=llava_ov_0.5b
 
 # Supported dataset: qaego4d egoschema cgbench mlvu activitynet_qa rvs_ego rvs_movie
@@ -147,7 +152,7 @@ Our code is based on [InfLLM](https://github.com/thunlp/InfLLM), [StreamingLLM](
 
 ## suprKV: Summary-guided progressive KV compression
 
-The optional suprKV OneVision backend uses one GPU-resident model for sequential encoding and QA, with no KV offload. It supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/suprkv/README.md). Dataset evaluation uses `python -m video_qa.run_eval --method suprkv`; run `python -m video_qa.run_eval --help` for available options.
+The optional suprKV backend supports every model in `MODEL_PATHS`: OneVision, Video-LLaVA and Qwen2.5-VL. It uses one GPU-resident model for sequential encoding and QA, with no KV offload. It supports summary-scored, per-layer FP16/8/4/2-bit caches, token pruning, and frame eviction under a persistent-memory budget. See [usage, memory accounting, and tests](model/suprkv/README.md). Dataset evaluation uses `python -m video_qa.run_eval --method suprkv`; run `python -m video_qa.run_eval --help` for available options.
 
 Run `bash run_suprkv.sh` with its configured sample limit, or evaluate all annotated RVS-Ego videos with `python -m video_qa.run_eval --method suprkv --model llava_ov_7b --dataset rvs_ego --num_chunks 1 --max_samples 0 --sample_fps 0.5 --retrieve_size 64 --budget_tokens 4096`. SuPr-KV shares ReKV's dataset, sampling, retrieval, sample-limit and worker arguments; `--budget_tokens` is a separate cache budget, not an alias for ReKV's `--n_local`. SuPr-KV supports the streaming `rvs_ego` and `rvs_movie` routes, with one main model per GPU worker and the same six CSV columns as ReKV stream output; method configuration and cache statistics are saved separately in `.stats.jsonl`. `SuPrKVStreamVQA` uses the shared `BaseVQA` and streaming traversal. All dataset routes share worker launch, result merging and scoring in `run_eval`, selecting an inference method via `--method`; use `--only_eval` to score existing results. For predictions only, run `python -m video_qa.suprkv_stream_vqa --anno_path data/rvs/ego/ego4d_oe.json --save_dir results/suprkv_stream`; this worker does not merge or score results.
 
@@ -161,14 +166,68 @@ Observation's **KV 压缩前后对照 → 摘要模型** offers the same option;
 Offline evaluation also supports `mlvu`, `qaego4d`, `egoschema`, `activitynet_qa`, and `cgbench`, for example `python -m video_qa.run_eval --method suprkv --dataset qaego4d --max_samples 5`. `SuPrKVOfflineVQA` encodes every sampled frame and finalizes the last segment before answering all questions for that video. It preserves ReKV's open-ended and multiple-choice CSV fields, including question types, and writes the same separate cache statistics as the stream worker. For offline predictions only, run `python -m video_qa.suprkv_offline_vqa --anno_path data/qaego4d/test_mc.json --save_dir results/suprkv_offline`. Offline QA uses the shared open-question method and multiple-choice prompt construction: retrieval uses only the original question, multiple-choice generation includes the options and `Best option: (` prefix, and generation limits are 1024 tokens for open questions and 16 for choices. These per-question limits override the runtime's `--max_new_tokens` without changing stream defaults or video compression. Both methods use greedy generation and EOS stopping; decoding and nonempty answer parsing follow ReKV. SuPr-KV continues to mark empty multiple-choice answers incorrect.
 
 
+## Qwen2.5-VL with all inference methods
+
+All three methods (`native`, `rekv`, `suprkv`), on both offline and streaming
+routes, accept `qwen2_5_vl_3b`, `qwen2_5_vl_7b`,
+and `qwen2_5_vl_72b`. The presets load the corresponding
+`Qwen/Qwen2.5-VL-{3B,7B,72B}-Instruct` checkpoint. Use `--model_path /path/to/checkpoint`
+to load local weights while retaining the matching `--model` preset.
+
+```bash
+python -m video_qa.run_eval --method native --model qwen2_5_vl_7b \
+    --dataset rvs_ego --max_samples 5
+python -m video_qa.run_eval --method rekv --model qwen2_5_vl_7b \
+    --dataset rvs_ego --max_samples 5 --n_local 15000
+python -m video_qa.run_eval --method suprkv --model qwen2_5_vl_7b \
+    --dataset rvs_ego --max_samples 5 --budget_tokens 8192
+```
+
+The ReKV/SuPr-KV adapters use fixed 392×392 RGB frames and 196 visual tokens per sampled frame.
+Each frame is independently padded to one temporal patch by the Qwen video processor;
+adjacent sampled frames are never merged. This keeps retrieval indices, recent-frame
+protection and memory accounting aligned with the existing frame-based algorithms.
+ReKV requires `n_local >= 196` and automatically bounds encoding chunks by this window.
+
+**Position encoding:** retrieval encoding and QA use the existing ReKV/SuPr-KV
+one-dimensional RoPE relocation, with Qwen's checkpoint frequencies. They do not
+reproduce native full-video temporal/spatial MRoPE. SuPr-KV's isolated main-model
+summaries use native spatial MRoPE with each sampled frame represented as an image,
+and continue decoding at the corresponding RoPE offset. Both scoring strategies
+(`summary`, `frame_mean_query`) and compression granularities (`layer`, `head`) are supported.
+An optional independent summary model still uses the OneVision loader.
+
+**Native Qwen2.5-VL:** `--method native` loads the original
+`Qwen2_5_VLForConditionalGeneration` and calls its processor and `generate()`.
+The checkpoint's dynamic spatial resizing, temporal patch merging, MRoPE, and
+generation cache are preserved. It retains sampled RGB frames on CPU and processes
+the complete visible video anew for each question, including native padding for
+odd frame counts. Sampling is performed once by the shared benchmark sampler;
+the processor receives the resulting FPS inferred from source timestamps (the
+requested `--sample_fps` for a single frame). Question caches and RoPE deltas are
+cleared between answers. Native visual token counts may differ from the fixed
+196-token-per-frame retrieval adapters.
+
+For direct Python use, set both fields:
+`StreamingConfig(model_path='Qwen/Qwen2.5-VL-7B-Instruct', model_family='qwen2_5_vl')`.
+SuPr-KV keeps the model on one selected device; the 72B preset therefore requires
+enough memory on that device. ReKV and native use automatic device placement (the
+evaluation launcher assigns four visible GPUs per 72B worker). Native additionally
+accepts `--device` to override placement.
+
+CPU regression tests use tiny randomly initialized models without downloads:
+`python -m unittest discover -s tests -p 'test_qwen2_5_vl*.py' -v`.
+The real ReKV ContextManager smoke test additionally requires CUDA.
+
 ## Original language-model inference and method extensions
 
 Use `--method native` for full-context inference with the original language model.
-This is a baseline for the **LLM processing stage**: frame sampling, vision encoder,
+For OneVision and Video-LLaVA, this is a baseline for the **LLM processing stage**: frame sampling, vision encoder,
 visual token pooling and prompts remain the same as the existing model adapters.
 The decoder is loaded from the original model class with no ReKV/SuPr-KV attention
-patch, retrieval, quantization, token pruning or cache eviction. All model presets
-in `video_qa/model_paths.py` are supported, including OneVision, Video-LLaVA and LongVA.
+patch, retrieval, quantization, token pruning or cache eviction. Qwen2.5-VL uses its
+original multimodal processor and full generation model as described above.
+All presets in `video_qa/model_paths.py` support native inference.
 
 ```bash
 # Offline benchmark, first five videos
@@ -184,7 +243,8 @@ python -m video_qa.native_offline_vqa --model llava_ov_7b \
     --anno_path data/qaego4d/test_mc.json --save_dir results/native_test
 ```
 
-Visual features are encoded once per sampled frame. Each question prefills the
+For OneVision and Video-LLaVA, visual features are encoded once per sampled
+frame; Qwen2.5-VL reprocesses the visible sampled video per question. Each question prefills the
 complete visible video prefix and its question from scratch, then generates greedily
 with the model's native KV cache and EOS stopping. Question/answer tokens are never
 carried into another question. Streaming uses the same `int(end_time * sample_fps)`

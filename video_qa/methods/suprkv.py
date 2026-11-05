@@ -1,7 +1,8 @@
 import hashlib
 import re
 
-from video_qa.model_paths import MODEL_PATHS, SUPRKV_MODELS
+from video_qa.model_paths import MODEL_PATHS
+from model.video_backbone import model_family
 from .common import Method, add_option, add_retrieval_arguments, retrieval_size
 
 
@@ -51,9 +52,8 @@ def config_overrides(args):
 def make_config(args):
     from model.suprkv.runtime import StreamingConfig
 
-    if args.model not in SUPRKV_MODELS:
-        raise ValueError('SuPr-KV supports only LLaVA-OneVision Qwen2 models')
     values = dict(model_path=MODEL_PATHS[args.model], device=args.device or 'cuda:0',
+                  model_family=model_family(args.model),
                   topk=retrieval_size(args), packed_attention=args.packed_attention)
     values.update(config_overrides(args))
     return StreamingConfig(**values)
@@ -72,8 +72,6 @@ class SuPrKVMethod(Method):
         add_option(parser, '--device', default=None)
 
     def validate(self, args):
-        if args.model not in SUPRKV_MODELS:
-            raise ValueError('SuPr-KV supports only LLaVA-OneVision Qwen2 models')
         if retrieval_size(args) < 1:
             raise ValueError('retrieve_size must be positive')
 

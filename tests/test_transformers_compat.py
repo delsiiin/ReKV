@@ -14,7 +14,6 @@ from safetensors.torch import save_file
 from transformers import (
     LlamaConfig, LlamaForCausalLM, MistralConfig, MistralForCausalLM,
     Qwen2Config, Qwen2ForCausalLM, LlavaOnevisionConfig, VideoLlavaConfig,
-    CLIPVisionModel, CLIPVisionConfig, CLIPImageProcessor,
     LlavaOnevisionVideoProcessor, VideoLlavaVideoProcessor,
 )
 
@@ -22,12 +21,6 @@ from model.rekv.patch import patch_hf
 from model.rekv.attention.kv_cache_manager import ContextManager
 from model.rekv.llava_onevision_rekv import LlavaOneVision_ReKV
 from model.rekv.video_llava_rekv import VideoLlava_ReKV
-from model.rekv.longva_rekv import LongVA_ReKV
-from longva.model import (
-    LlavaConfig, LlavaLlamaForCausalLM, LlavaMistralConfig,
-    LlavaMistralForCausalLM, LlavaQwenConfig, LlavaQwenForCausalLM,
-)
-from longva.model.multimodal_resampler.qformer import BertConfig, BertLMHeadModel
 
 
 def tiny_config(config_class, **kwargs):
@@ -84,25 +77,6 @@ class TransformersCompatibilityTests(unittest.TestCase):
                                  return_dict=False)
                 self.assertEqual(result[0].shape, (2, 4, 64))
 
-    @torch.no_grad()
-    def test_longva_forward_generation_and_reload(self):
-        for config_class, model_class in [
-            (LlavaConfig, LlavaLlamaForCausalLM),
-            (LlavaQwenConfig, LlavaQwenForCausalLM),
-            (LlavaMistralConfig, LlavaMistralForCausalLM),
-        ]:
-            with self.subTest(model=model_class.__name__):
-                model = model_class(tiny_config(config_class)).eval()
-                ids = torch.tensor([[1, 2, 3]])
-                self.assertEqual(model(ids, logits_to_keep=1).logits.shape, (1, 1, 32))
-                self.assertEqual(model.generate(ids, max_new_tokens=2, min_new_tokens=2).shape[-1], 2)
-                with tempfile.TemporaryDirectory() as directory:
-                    model.save_pretrained(directory)
-                    restored = model_class.from_pretrained(directory, local_files_only=True).eval()
-                    torch.testing.assert_close(restored(ids).logits, model(ids).logits)
-                patch(model)
-                self.assertEqual(model(ids, past_key_values=empty_cache(model), use_cache=True).logits.shape,
-                                 (1, 3, 32))
 
     @torch.no_grad()
     def test_multimodal_video_features_and_reload(self):
@@ -158,53 +132,6 @@ class TransformersCompatibilityTests(unittest.TestCase):
                 self.assertEqual(model.lm_head(output.last_hidden_state).shape,
                                  (1, 2 * tokens_per_frame, 32))
 
-    @torch.no_grad()
-    def test_longva_vision_checkpoint_loading(self):
-        # Nested from_pretrained runs inside the outer loader's meta context.
-        with tempfile.TemporaryDirectory() as directory:
-            vision_path = Path(directory) / 'clip'
-            model_path = Path(directory) / 'longva'
-            CLIPVisionModel(CLIPVisionConfig(
-                hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                num_attention_heads=4, image_size=8, patch_size=2,
-            )).save_pretrained(vision_path)
-            CLIPImageProcessor(size={'shortest_edge': 8}, crop_size={'height': 8, 'width': 8}).save_pretrained(vision_path)
-            config = tiny_config(
-                LlavaQwenConfig, mm_vision_tower=str(vision_path), mm_vision_select_layer=-1,
-                mm_hidden_size=32, mm_projector_type='linear',
-                mm_spatial_pool_mode='average', mm_spatial_pool_stride=2,
-            )
-            options = dict(n_frame_tokens=4, init_prompt_ids=[1, 2], n_local=32, topk=2, chunk_size=1)
-            model = LongVA_ReKV(config, **options).eval()
-            video = torch.randn(2, 3, 8, 8)
-            expected = model._get_video_features(video)
-            model.save_pretrained(model_path)
-            restored = LongVA_ReKV.from_pretrained(model_path, local_files_only=True, **options).eval()
-            torch.testing.assert_close(restored._get_video_features(video), expected)
-            patch(restored)
-            output = restored.model(inputs_embeds=expected, past_key_values=empty_cache(restored), use_cache=True)
-            self.assertEqual(output.last_hidden_state.shape, (1, 8, 64))
-
-    @torch.no_grad()
-    def test_qformer_cross_attention_and_pruning(self):
-        config = BertConfig(vocab_size=32, hidden_size=32, intermediate_size=64,
-                            num_hidden_layers=2, num_attention_heads=4, encoder_width=32,
-                            add_cross_attention=True, cross_attention_freq=1, query_length=2)
-        model = BertLMHeadModel(config).eval()
-        args = dict(query_embeds=torch.randn(1, 2, 32), encoder_hidden_states=torch.randn(1, 4, 32),
-                    encoder_attention_mask=torch.ones(1, 4), head_mask=torch.ones(4))
-        self.assertEqual(model.bert(**args).last_hidden_state.shape, (1, 2, 32))
-        for beams in [1, 2]:
-            generated = model.generate(
-                torch.tensor([[1, 2, 3]]), query_embeds=args['query_embeds'],
-                encoder_hidden_states=args['encoder_hidden_states'],
-                max_new_tokens=2, min_new_tokens=2, num_beams=beams, pad_token_id=0,
-            )
-            self.assertEqual(generated.shape, (1, 5))
-        model.bert.encoder.layer[0].attention.prune_heads([1])
-        model.bert.encoder.layer[0].attention.prune_heads([1, 2])
-        args.pop('head_mask')
-        self.assertEqual(model.bert(**args).last_hidden_state.shape, (1, 2, 32))
 
     @unittest.skipUnless(torch.cuda.is_available(), 'ReKV ContextManager requires CUDA')
     @torch.no_grad()
