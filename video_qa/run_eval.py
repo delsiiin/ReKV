@@ -53,6 +53,8 @@ DATASETS = {
 def evaluate(args, dataset):
     anno_path, mode, scorer = DATASETS[dataset]
     method = get_method(getattr(args, 'method', 'rekv'))
+    if args.sample_fps is None:
+        args.sample_fps = method.default_sample_fps
     num_chunks, save_dir = get_eval_settings(args, dataset, anno_path)
     if not args.only_eval:
         processes = []
@@ -127,7 +129,8 @@ def build_parser():
     parser.add_argument("--max_samples", '--max-samples', type=nonnegative_int, default=0,
                         help="Maximum video samples across all chunks; 0 uses the full dataset.")
     parser.add_argument("--only_eval", '--only-eval', action="store_true")
-    parser.add_argument("--sample_fps", '--sample-fps', type=float, default=1)
+    parser.add_argument("--sample_fps", '--sample-fps', type=float, default=None,
+                        help='Sampling FPS: default 2 for infinipot, 1 for other methods.')
     parser.add_argument("--debug", type=str, default='false')
     for method in METHODS.values():
         method.add_arguments(parser)

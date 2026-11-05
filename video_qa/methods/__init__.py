@@ -3,8 +3,9 @@ from .native import NativeMethod
 from .rekv import ReKVMethod
 from .suprkv import SuPrKVMethod
 from .streamkv import StreamKVMethod
+from .infinipot import InfiniPotMethod
 
-METHODS = {method.name: method for method in (ReKVMethod(), SuPrKVMethod(), NativeMethod(), StreamKVMethod())}
+METHODS = {method.name: method for method in (ReKVMethod(), SuPrKVMethod(), NativeMethod(), StreamKVMethod(), InfiniPotMethod())}
 
 
 def get_method(name):
@@ -16,6 +17,8 @@ def get_method(name):
 
 def validate_arguments(args, method):
     """Reject explicitly supplied options belonging to other methods."""
+    if getattr(args, 'sample_fps', None) is None:
+        args.sample_fps = method.default_sample_fps
     for candidate in METHODS.values():
         for name in set(candidate.options) - set(method.options):
             value = getattr(args, name, None)

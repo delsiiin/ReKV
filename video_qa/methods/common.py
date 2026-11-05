@@ -18,6 +18,7 @@ def retrieval_size(args):
 
 class Method:
     name = None
+    default_sample_fps = 1
     options = ()
     defaults = {}
 

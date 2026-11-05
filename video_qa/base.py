@@ -140,7 +140,8 @@ def str2bool(value):
 
 def build_parser(method='rekv'):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sample_fps", '--sample-fps', type=float, default=1)
+    parser.add_argument("--sample_fps", '--sample-fps', type=float,
+                        default=get_method(method).default_sample_fps)
     parser.add_argument("--num_chunks", '--num-chunks', type=int, default=1)
     parser.add_argument("--max_samples", '--max-samples', type=nonnegative_int, default=0,
                         help="Maximum video samples before chunking; 0 uses the full dataset.")

@@ -23,6 +23,7 @@ Through comprehensive experimentation, we validate the efficacy and practicality
 │   ├── rekv    ReKV model adapters, attention, and retrieval cache
 │   ├── suprkv  SuPr-KV runtime, compression, and retrieval
 │   ├── streamkv semantic segments, guided compression, adaptive retrieval
+│   ├── infinipot Qwen block prefill and TaR + Value Norm KV compression
 │   └── native original model inference
 ├── model_zoo   optional local Video-LLM checkpoints
 ├── results     evaluation results
@@ -49,6 +50,17 @@ defaults, the separate reference experiment profile, and differential tests.
 ```bash
 bash run_streamkv.sh --num_chunks 1 --max_samples 5
 python -m video_qa.run_eval --method streamkv --model llava_ov_7b --dataset mlvu --max_samples 5
+```
+
+`infinipot` adapts the supplied InfiniPot-V implementation to all seven dataset
+routes using the Qwen2.5-VL presets. Its default release profile uses 32 temporal
+grids per block, retains 24, samples up to 768 raw frames at 2 FPS, and generates
+up to 300 tokens. RVS questions replay only their visible video prefix.
+See [algorithm flow, source parameters, and validation](model/infinipot/README.md).
+
+```bash
+bash run_infinipot.sh --dataset mlvu --max_samples 5
+bash run_infinipot.sh --dataset rvs_movie --max_samples 1
 ```
 
 ## Preparation

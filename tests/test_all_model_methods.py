@@ -36,15 +36,21 @@ class Tokenizer:
 
 
 class AllModelMethodsTests(unittest.TestCase):
-    def test_every_method_accepts_every_model_in_launcher_and_workers(self):
+    def test_method_model_support_in_launcher_and_workers(self):
         for name in MODEL_PATHS:
             for method_name, method in METHODS.items():
                 with self.subTest(model=name, method=method_name):
                     args = run_eval.build_parser().parse_args([
                         '--method', method_name, '--model', name, '--dataset', 'rvs_ego'])
-                    validate_arguments(args, method)
                     worker = base.build_parser(method_name).parse_args([
                         '--model', name, '--anno_path', 'unused', '--save_dir', 'unused'])
+                    required_family = {'streamkv': 'onevision', 'infinipot': 'qwen2_5_vl'}.get(method_name)
+                    if required_family and model_family(name) != required_family:
+                        for parsed in (args, worker):
+                            with self.assertRaises(ValueError):
+                                validate_arguments(parsed, method)
+                        continue
+                    validate_arguments(args, method)
                     validate_arguments(worker, method)
                     if method_name == 'suprkv':
                         config = make_config(args)
