@@ -442,7 +442,11 @@ class EvaluationTests(unittest.TestCase):
     def test_launcher_remains_lightweight_and_result_namespace_excludes_previous_variant(self):
         subprocess.run([sys.executable,'-c',"from video_qa.run_eval import build_parser; import sys; build_parser(); assert 'torch' not in sys.modules"],check=True)
         args=run_eval.build_parser().parse_args(['--method','streamkv','--dataset','mlvu'])
-        self.assertIn('/streamkv/source/',get_method('streamkv').result_dir(args,'mlvu'))
+        method=get_method('streamkv')
+        # The launcher resolves method-specific sampling defaults at validation.
+        validate_arguments(args,method)
+        self.assertEqual(args.sample_fps,1)
+        self.assertIn('/streamkv/source/',method.result_dir(args,'mlvu'))
 
 
 if __name__=='__main__': unittest.main()
