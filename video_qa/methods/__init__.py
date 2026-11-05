@@ -2,8 +2,9 @@
 from .native import NativeMethod
 from .rekv import ReKVMethod
 from .suprkv import SuPrKVMethod
+from .streamkv import StreamKVMethod
 
-METHODS = {method.name: method for method in (ReKVMethod(), SuPrKVMethod(), NativeMethod())}
+METHODS = {method.name: method for method in (ReKVMethod(), SuPrKVMethod(), NativeMethod(), StreamKVMethod())}
 
 
 def get_method(name):
@@ -18,6 +19,6 @@ def validate_arguments(args, method):
     for candidate in METHODS.values():
         for name in set(candidate.options) - set(method.options):
             value = getattr(args, name, None)
-            if value is not None and value is not False:
+            if value is not None and (value is not False or candidate.defaults.get(name) is True):
                 raise ValueError(f'--{name} is not supported by --method {method.name}')
     method.validate(args)

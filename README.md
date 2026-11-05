@@ -22,6 +22,7 @@ Through comprehensive experimentation, we validate the efficacy and practicality
 ├── model
 │   ├── rekv    ReKV model adapters, attention, and retrieval cache
 │   ├── suprkv  SuPr-KV runtime, compression, and retrieval
+│   ├── streamkv semantic segments, guided compression, adaptive retrieval
 │   └── native original model inference
 ├── model_zoo   optional local Video-LLM checkpoints
 ├── results     evaluation results
@@ -34,9 +35,21 @@ are imported from `model.suprkv`. SuPr-KV reuses the decoder patch,
 attention primitives, and QA adapter from `model.rekv`.
 
 `video_qa/model_paths.py` contains the single model registry, `MODEL_PATHS`.
-Every listed model supports all three methods (`native`, `rekv`, `suprkv`) on
+Every listed model supports `native`, `rekv`, and `suprkv` on
 both offline and streaming routes. Architecture resolution is shared across
 methods; there are no separate method-specific model lists.
+
+`streamkv` supports the same seven datasets as the existing methods, using
+the LLaVA-OneVision presets on both routes. Its segmentation, budget
+allocation, attention, generation and CUDA cache manager follow the supplied
+`StreamKV/` source. Streaming questions re-encode the complete visible prefix.
+See [StreamKV source adaptation](model/streamkv/README.md) for the Python CLI
+defaults, the separate reference experiment profile, and differential tests.
+
+```bash
+bash run_streamkv.sh --num_chunks 1 --max_samples 5
+python -m video_qa.run_eval --method streamkv --model llava_ov_7b --dataset mlvu --max_samples 5
+```
 
 ## Preparation
 

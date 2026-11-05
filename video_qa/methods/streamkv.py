@@ -1,0 +1,72 @@
+"""StreamKV configuration and dispatch; no model imports in the launcher."""
+import argparse
+from dataclasses import asdict, fields
+
+from model.streamkv.config import StreamKVConfig
+from model.video_backbone import model_family
+from video_qa.model_paths import MODEL_PATHS
+from .common import Method, add_option
+
+
+def boolean(value):
+    if value.lower() in ('true', '1', 'yes'):
+        return True
+    if value.lower() in ('false', '0', 'no'):
+        return False
+    raise argparse.ArgumentTypeError('Expected true or false')
+
+
+class StreamKVMethod(Method):
+    name = 'streamkv'
+    defaults = asdict(StreamKVConfig())
+    options = (*defaults, 'model_path')
+
+    def config(self, args):
+        return StreamKVConfig(**{name: getattr(args, name, None) if getattr(args, name, None) is not None else default
+                                 for name, default in self.defaults.items()})
+
+    def add_arguments(self, parser):
+        for field in fields(StreamKVConfig):
+            kwargs = dict(type=boolean if field.type is bool else field.type, default=None)
+            if field.name == 'segment_mode':
+                kwargs['choices'] = ('semantic', 'uniform')
+            add_option(parser, '--' + field.name, '--' + field.name.replace('_', '-'), **kwargs)
+        add_option(parser, '--model_path', '--model-path', default=None)
+
+    def validate(self, args):
+        if model_family(args.model) != 'onevision':
+            raise ValueError('streamkv currently supports only llava_ov_0.5b, llava_ov_7b and llava_ov_72b')
+        config = self.config(args)
+        if config.retrieve_chunk_size > config.retrieve_size:
+            raise ValueError('retrieve_chunk_size must be <= retrieve_size')
+
+    def worker_arguments(self, args):
+        # Explicit false values must reach the worker: the algorithm defaults
+        # to enabled summary and local retrieval, unlike store_true CLI flags.
+        command = []
+        for name, value in asdict(self.config(args)).items():
+            command.extend(['--' + name, str(value)])
+        if getattr(args, 'model_path', None):
+            command.extend(['--model_path', args.model_path])
+        return command
+
+    def result_dir(self, args, dataset):
+        c = self.config(args)
+        # All algorithm settings participate, preventing silent run collisions.
+        setting = (f'{c.segment_mode}_{c.min_segment_size}-{c.max_segment_size}_theta{c.segment_theta:g}'
+                   f'_summary{int(c.use_segment_summary)}_compress{c.compression_ratio:g}-{c.compress_temp:g}'
+                   f'_retrieve{c.retrieve_size}-{c.retrieve_temp:g}'
+                   f'_recent{int(c.retrieve_local)}-{c.retrieve_local_size}_local{c.n_local}'
+                   f'_chunk{c.retrieve_chunk_size}')
+        return f'results/streamkv/source/{args.model}/{dataset}/{setting}/fps_{args.sample_fps:g}'
+
+    def load(self, args):
+        from model.streamkv.runtime import StreamKVRuntime
+        runtime = StreamKVRuntime.load(getattr(args, 'model_path', None) or MODEL_PATHS[args.model], self.config(args))
+        return runtime, runtime.processor
+
+    def analyzer_kwargs(self, args):
+        return dict(record_metadata={'method': self.name, **asdict(self.config(args))})
+
+    def close(self, model):
+        model.close()
