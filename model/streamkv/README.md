@@ -66,7 +66,7 @@ Python CLI 默认值与参考 `video_qa/run_eval.py` / `video_qa/base.py` 一致
 | `num_chunks` | 1 | 8 |
 | 数据集 | 显式指定 | `rvs_movie` |
 
-模型默认 `llava_ov_7b`，支持三个源代码 OneVision 预设。模型加载保持 FP16 和 `device_map='auto'`。
+模型默认 `llava_ov_7b`，支持三个源代码 OneVision 预设。模型保持 FP16，通过共享加载器固定到进程内 `cuda:0`；eval 用 `--gpus` 或 `CUDA_VISIBLE_DEVICES` 为每个进程分配一张 GPU，72B 也使用同一规则。
 `n_init`、`n_encode` 来自原提示的 token 数；`block_size=exc_block_size=196`、
 `max_cached_block=128`、`fattn=True`、`pin_memory=True`、`async_global_stream=True`。
 不再提前要求 `n_local` 容纳最大段及摘要；保留源码对实际段和执行块的断言。

@@ -2,6 +2,7 @@ import torch
 from transformers import VideoLlavaProcessor, VideoLlavaForConditionalGeneration
 from logzero import logger
 
+from model.loading import load_pretrained
 from model.video_backbone import INITIAL_PROMPTS, question_prompt, video_features
 from model.rekv.patch import patch_hf
 from model.rekv.abstract_rekv import Abstract_ReKV
@@ -108,12 +109,11 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
 
 
 def load_model(model_path='LanguageBind/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
-    device = 'cuda'
     n_frame_tokens = 257
     processor = VideoLlavaProcessor.from_pretrained(model_path)
     
     init_prompt = INITIAL_PROMPTS['video_llava']
-    init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids.to(device)
+    init_prompt_ids = processor.tokenizer(init_prompt, return_tensors="pt").input_ids
     inf_llm_config = {
         'n_init': init_prompt_ids.shape[1] if n_init is None else n_init,
         'n_local': n_local,
@@ -125,10 +125,8 @@ def load_model(model_path='LanguageBind/Video-LLaVA-7B-hf', n_init=None, n_local
         'exc_block_size': n_frame_tokens,
         'pin_memory': True,
     }
-    model = VideoLlava_ReKV.from_pretrained(
-        model_path, 
-        device_map="auto",
-        low_cpu_mem_usage=True, 
+    model = load_pretrained(
+        VideoLlava_ReKV, model_path,
         dtype=torch.float16,
         processor=processor,
         n_frame_tokens=n_frame_tokens,
@@ -137,6 +135,7 @@ def load_model(model_path='LanguageBind/Video-LLaVA-7B-hf', n_init=None, n_local
         topk=topk,
         chunk_size=chunk_size,
     )
+    model.init_prompt_ids = init_prompt_ids.to(model.get_input_embeddings().weight.device)
     patch_hf(model.language_model, **inf_llm_config)
     
     for k, v in inf_llm_config.items():

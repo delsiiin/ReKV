@@ -52,9 +52,5 @@ class Method:
                 command.extend(['--' + name] if value is True else ['--' + name, str(value)])
         return command
 
-    def devices(self, args, index):
-        count = 4 if args.model in ('llava_ov_72b', 'qwen2_5_vl_72b') else 1
-        return ','.join(str(count * index + offset) for offset in range(count))
-
     def solver(self, mode):
         return f'video_qa.{self.name}_{mode}_vqa'

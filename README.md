@@ -140,9 +140,9 @@ See [the observation guide](observation/README.md) for inputs and metric definit
 
 ```bash
 # The number of processes utilized for parallel evaluation.
-# Normally, set it to the number of GPUs on your machine.
-# Yet, llava_ov_72b needs 4x 80GB GPUs. So set num_chunks to num_gpus//4.
+# One GPU per process for every method and model size.
 num_chunks=8
+gpus=0,1,2,3,4,5,6,7
 
 # Supported model: llava_ov_0.5b llava_ov_7b llava_ov_72b video_llava_7b qwen2_5_vl_3b qwen2_5_vl_7b qwen2_5_vl_72b
 model=llava_ov_0.5b
@@ -152,6 +152,7 @@ model=llava_ov_0.5b
 dataset=qaego4d
 
 python -m video_qa.run_eval \
+    --gpus "$gpus" \
     --num_chunks $num_chunks \
     --model ${model} \
     --dataset ${dataset} \
@@ -159,6 +160,24 @@ python -m video_qa.run_eval \
     --n_local 15000 \
     --retrieve_size 64
 ```
+
+Every eval worker loads its complete model on its local `cuda:0` using the shared
+single-device loader. `--num_chunks` controls the process count (capped by the
+number of selected videos); `--gpus` lists GPU IDs in worker order. For example:
+
+```bash
+# Worker 0 uses GPU 2; worker 1 uses GPU 5.
+bash run_rekv.sh --num_chunks 2 --gpus 2,5
+CUDA_VISIBLE_DEVICES=2,5 bash run_suprkv.sh --num_chunks 2
+```
+
+The launcher uses `--gpus` first, then `CUDA_VISIBLE_DEVICES`, then `0,1,...` when
+neither is set. Extra GPU entries are unused; too few entries fail before workers
+start. GPU UUIDs and MIG identifiers are also accepted. Eval uses local `cuda:0`;
+select physical GPUs with the GPU list, not `--device cuda:N`. All model sizes,
+including 72B, must fit on one GPU per worker; there is no automatic model sharding
+or weight offload. Model-specific precision and attention implementations remain
+unchanged. The scripts expose a `gpus` variable and accept CLI overrides.
 
 ## Citation
 
@@ -235,10 +254,10 @@ cleared between answers. Native visual token counts may differ from the fixed
 
 For direct Python use, set both fields:
 `StreamingConfig(model_path='Qwen/Qwen2.5-VL-7B-Instruct', model_family='qwen2_5_vl')`.
-SuPr-KV keeps the model on one selected device; the 72B preset therefore requires
-enough memory on that device. ReKV and native use automatic device placement (the
-evaluation launcher assigns four visible GPUs per 72B worker). Native additionally
-accepts `--device` to override placement.
+All methods keep the model on one selected device; the 72B preset therefore requires
+enough memory on that device. Eval assigns one GPU per worker via `--gpus` or
+`CUDA_VISIBLE_DEVICES`. Native and SuPr-KV direct worker entry points additionally
+accept `--device` for local single-device checks.
 
 CPU regression tests use tiny randomly initialized models without downloads:
 `python -m unittest discover -s tests -p 'test_qwen2_5_vl*.py' -v`.
@@ -279,8 +298,8 @@ truncate frames or switch to a compressed method.
 
 Native results go to `results/native/<model>/<dataset>/fps_<fps>` (with the usual
 `/samples_<N>` suffix). They contain the shared QA fields without retrieval columns.
-`--model_path` can select local weights; `--device cpu` is available for small-model
-checks. Native `--max_new_tokens` overrides all answer limits; otherwise the defaults
+`--model_path` can select local weights; `--device cpu` is available in direct worker
+entry points for small-model checks. Native `--max_new_tokens` overrides all answer limits; otherwise the defaults
 are 1024 for offline open answers, 256 for streaming open answers and 16 for choices.
 Retrieval and compression options such as `--retrieve_size`, `--n_local` and
 `--budget_tokens` are rejected for native inference. Existing ReKV and SuPr-KV
@@ -291,7 +310,8 @@ The extension points are:
 - `video_qa/base.py`: common prompts, answer records, CSV output and worker setup.
 - `video_qa/flows.py`: shared offline/streaming traversal and frame boundaries.
 - `video_qa/methods/`: method-owned CLI options, validation, lazy model loading,
-  resource cleanup, result layout and device assignment. Register a method in
+  resource cleanup and result layout. GPU assignment is shared in `run_eval` and
+  single-device model loading in `model/loading.py`. Register a method in
   `METHODS`; the launcher and base worker need no new method branches.
 - Method entry points combine an offline/streaming flow with lifecycle hooks:
   `start_video`, `consume_frame`, optional `finish_encoding` and `finish_video`.

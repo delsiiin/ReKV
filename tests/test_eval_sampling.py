@@ -94,10 +94,10 @@ class EvalSamplingTests(unittest.TestCase):
                 self.assertIn('/2_0.csv', merge_commands[0])
                 self.assertIn('/2_1.csv', merge_commands[1])
 
-    def test_stream_routes_forward_parameters_and_keep_model_gpu_assignment(self):
+    def test_stream_routes_forward_parameters_and_use_one_gpu_per_worker(self):
         for method, model, devices in (('rekv', 'llava_ov_7b', ['0', '1']),
                                         ('suprkv', 'llava_ov_7b', ['0', '1']),
-                                        ('rekv', 'llava_ov_72b', ['0,1,2,3', '4,5,6,7'])):
+                                        ('rekv', 'llava_ov_72b', ['0', '1'])):
             for dataset in ('rvs_ego', 'rvs_movie'):
                 args = run_eval.build_parser().parse_args([
                     '--method', method, '--model', model, '--dataset', dataset,

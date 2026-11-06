@@ -4,6 +4,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
 
 from .qwen2_5_vl_vision import FRAME_TOKENS, frame_features
 from model.video_backbone import INITIAL_PROMPTS, question_prompt
+from model.loading import load_pretrained
 from .abstract_rekv import Abstract_ReKV
 from .llava_onevision_rekv import LlavaOneVision_ReKV
 from .patch import patch_hf
@@ -54,8 +55,8 @@ def load_model(model_path='Qwen/Qwen2.5-VL-7B-Instruct', n_init=None,
         raise ValueError('Require 1 <= chunk_size <= topk')
     processor = Qwen2_5_VLProcessor.from_pretrained(model_path)
     ids = processor.tokenizer(INITIAL_PROMPTS['qwen2_5_vl'], return_tensors='pt').input_ids
-    model = Qwen2_5_VL_ReKV.from_pretrained(
-        model_path, device_map='auto', low_cpu_mem_usage=True, dtype=torch.float16,
+    model = load_pretrained(
+        Qwen2_5_VL_ReKV, model_path, dtype=torch.float16,
         processor=processor, n_frame_tokens=FRAME_TOKENS, init_prompt_ids=ids,
         n_local=n_local, topk=topk, chunk_size=chunk_size)
     model.init_prompt_ids = ids.to(model.get_input_embeddings().weight.device)

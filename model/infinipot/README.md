@@ -101,8 +101,9 @@ RVS 保留 source timestamp `< end_time` 的帧，不读取未来；`start_time`
 
 支持当前模型表中的 `qwen2_5_vl_3b`、`qwen2_5_vl_7b`、`qwen2_5_vl_72b`。
 源项目还支持 Qwen2-VL，但当前仓库没有其 preset；LLaVA 不具备源算法依赖的 Qwen
-视频接口与 MRoPE，故不宣称支持。加载保留 `dtype='auto'`、`device_map='auto'`、
-`attn_implementation='flash_attention_2'`。
+视频接口与 MRoPE，故不宣称支持。加载保留 `dtype='auto'` 和
+`attn_implementation='flash_attention_2'`，通过共享加载器固定到进程内 `cuda:0`。
+eval 用 `--gpus` 或 `CUDA_VISIBLE_DEVICES` 为每个进程分配一张 GPU，72B 也使用同一规则。
 
 ```bash
 # 发布实验配置；可覆盖 dataset、模型、样本上限、参数

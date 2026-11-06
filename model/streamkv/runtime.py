@@ -7,6 +7,7 @@ import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from model.video_backbone import question_prompt
+from model.loading import load_pretrained
 from .abstract_streamkv import Abstract_StreamKV
 from .config import StreamKVConfig
 from .generation import StreamKVGeneration
@@ -84,8 +85,7 @@ class StreamKVRuntime(StreamKVGeneration, Abstract_StreamKV):
     def load(cls, model_path, config=None):
         from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
         processor = LlavaOnevisionProcessor.from_pretrained(model_path)
-        model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-            model_path, device_map='auto', low_cpu_mem_usage=True, dtype=torch.float16)
+        model = load_pretrained(LlavaOnevisionForConditionalGeneration, model_path, dtype=torch.float16)
         return cls(model, processor, config)
 
     @property

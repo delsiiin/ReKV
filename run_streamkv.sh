@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # Override settings by appending CLI options, e.g. bash run_streamkv.sh --max_samples 5
 python -m video_qa.run_eval \
+    --gpus "$gpus" \
     --method streamkv \
     --model llava_ov_7b \
     --dataset rvs_movie \

@@ -9,6 +9,7 @@ import torch
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
 from model.rekv.patch import patch_hf
+from model.loading import load_pretrained
 from model.video_backbone import INITIAL_PROMPTS, question_prompt
 from observation.engine import greedy_token_ids
 from observation.segments import selected_vision_features, capture_queries
@@ -89,9 +90,10 @@ class OneVisionEngine:
     def _load_model(self, config):
         processor = self.processor_class.from_pretrained(config['model_path'])
         device = config['device']
-        model = self.model_class.from_pretrained(
-            config['model_path'], dtype=torch.float32 if str(device) == 'cpu' else torch.float16,
-            device_map=device, attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
+        model = load_pretrained(
+            self.model_class, config['model_path'], device=device,
+            dtype=torch.float32 if str(device) == 'cpu' else torch.float16,
+            attn_implementation='sdpa').eval()
         return model, processor
 
     def _frame_token_count(self):

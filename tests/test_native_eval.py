@@ -227,7 +227,7 @@ class NativeEvaluationTests(unittest.TestCase):
                 worker_args = base.build_parser('native').parse_args(command[3:])
                 self.assertEqual(worker_args.max_new_tokens, 32)
                 self.assertEqual(worker_args.model_path, '/custom/weights')
-                self.assertEqual(device, '0,1,2,3')
+                self.assertEqual(device, '0')
                 self.assertNotIn('--retrieve_size', command)
                 self.assertIn(f'results/native/llava_ov_72b/{dataset}/fps_1', command)
         for option in ('--retrieve_size', '--n_local', '--retrieve_chunk_size', '--budget_tokens'):

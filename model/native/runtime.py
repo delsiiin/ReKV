@@ -6,6 +6,7 @@ fresh native KV cache, discarded after decoding.
 """
 import torch
 
+from model.loading import load_pretrained
 from model.video_backbone import INITIAL_PROMPTS, model_family, question_prompt, preprocess_video, video_features
 
 
@@ -20,21 +21,21 @@ class NativeRuntime:
     @classmethod
     def load(cls, model_name, model_path, *, device=None, max_new_tokens=None, sample_fps=None):
         # Import only the selected original backbone. Never import a ReKV loader or patch.
-        options = dict(device_map=device or 'auto', low_cpu_mem_usage=True,
+        options = dict(device=device,
                        dtype=torch.float32 if device == 'cpu' else torch.float16)
         family = model_family(model_name)
         if family == 'onevision':
             from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
-            model = LlavaOnevisionForConditionalGeneration.from_pretrained(model_path, **options)
+            model = load_pretrained(LlavaOnevisionForConditionalGeneration, model_path, **options)
             processor = LlavaOnevisionProcessor.from_pretrained(model_path)
         elif family == 'video_llava':
             from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
-            model = VideoLlavaForConditionalGeneration.from_pretrained(model_path, **options)
+            model = load_pretrained(VideoLlavaForConditionalGeneration, model_path, **options)
             processor = VideoLlavaProcessor.from_pretrained(model_path)
         elif family == 'qwen2_5_vl':
             from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
             from .qwen2_5_vl import Qwen2_5_VLNativeRuntime
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, **options)
+            model = load_pretrained(Qwen2_5_VLForConditionalGeneration, model_path, **options)
             processor = Qwen2_5_VLProcessor.from_pretrained(model_path)
             return Qwen2_5_VLNativeRuntime(model.eval(), processor, 'qwen2_5_vl',
                                          max_new_tokens, sample_fps=sample_fps)

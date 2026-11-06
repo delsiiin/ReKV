@@ -4,6 +4,7 @@ import argparse
 import subprocess
 import multiprocessing
 import shlex
+import re
 
 from video_qa.sampling import load_samples, nonnegative_int
 from video_qa.model_paths import MODEL_PATHS
@@ -39,6 +40,25 @@ def get_eval_settings(args, dataset, anno_path):
     return num_chunks, save_dir
 
 
+def worker_gpus(args, num_workers):
+    """Resolve GPU IDs in worker order, before starting any inference process."""
+    if getattr(args, 'device', None) not in (None, 'cuda', 'cuda:0'):
+        raise ValueError('Evaluation workers use cuda:0; select GPUs with --gpus or CUDA_VISIBLE_DEVICES')
+    selection = getattr(args, 'gpus', None)
+    if selection is None:
+        selection = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if selection is None:
+        return [str(index) for index in range(num_workers)]
+    devices = [value.strip() for value in selection.split(',')]
+    if any(not re.fullmatch(r'(?:[0-9]+|GPU-[A-Za-z0-9-]+|MIG-[A-Za-z0-9/-]+)', value)
+           for value in devices):
+        raise ValueError('GPU list must contain comma-separated GPU indices or GPU/MIG UUIDs')
+    if len(devices) < num_workers:
+        raise ValueError(f'{num_workers} workers require at least {num_workers} GPU entries; '
+                         f'got {len(devices)}. Set --gpus or CUDA_VISIBLE_DEVICES, or reduce --num_chunks')
+    return devices[:num_workers]
+
+
 DATASETS = {
     'mlvu': ('data/mlvu/dev_debug_mc.json', 'offline', 'multiple_choice'),
     'qaego4d': ('data/qaego4d/test_mc.json', 'offline', 'multiple_choice'),
@@ -57,8 +77,10 @@ def evaluate(args, dataset):
         args.sample_fps = method.default_sample_fps
     num_chunks, save_dir = get_eval_settings(args, dataset, anno_path)
     if not args.only_eval:
+        devices = worker_gpus(args, num_chunks)
         processes = []
         for index in range(num_chunks):
+            print(f'Worker {index}: GPU {devices[index]} -> cuda:0')
             command = ['python', '-m', method.solver(mode),
                        '--model', args.model,
                        '--sample_fps', str(args.sample_fps),
@@ -67,7 +89,7 @@ def evaluate(args, dataset):
                        '--num_chunks', str(num_chunks), '--chunk_idx', str(index)]
             command.extend(method.worker_arguments(args))
             process = multiprocessing.Process(target=exec,
-                args=(command, True, method.devices(args, index)))
+                args=(command, True, devices[index]))
             processes.append(process)
             process.start()
         for process in processes:
@@ -126,6 +148,9 @@ def build_parser():
     parser.add_argument("--model", type=str, default="llava_ov_7b", choices=MODEL_PATHS)
     parser.add_argument("--dataset", type=str, required=True, choices=DATASETS)
     parser.add_argument("--num_chunks", '--num-chunks', type=int, default=1)
+    parser.add_argument('--gpus', default=None,
+                        help='Comma-separated GPU IDs in worker order, one GPU per worker. '
+                             'Defaults to CUDA_VISIBLE_DEVICES, otherwise 0,1,...')
     parser.add_argument("--max_samples", '--max-samples', type=nonnegative_int, default=0,
                         help="Maximum video samples across all chunks; 0 uses the full dataset.")
     parser.add_argument("--only_eval", '--only-eval', action="store_true")

@@ -4,6 +4,7 @@ from types import MethodType
 
 import torch
 
+from model.loading import load_pretrained
 from .config import InfiniPotConfig
 from .core import InfiniPotCore
 from .rope import source_rope_index
@@ -32,8 +33,8 @@ class InfiniPotRuntime(InfiniPotCore):
     @classmethod
     def load(cls, model_path, config=None, *, max_new_tokens=None):
         from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, dtype='auto', device_map='auto', attn_implementation='flash_attention_2')
+        model = load_pretrained(Qwen2_5_VLForConditionalGeneration,
+                               model_path, dtype='auto', attn_implementation='flash_attention_2')
         return cls(model.eval(), AutoProcessor.from_pretrained(model_path), config,
                    max_new_tokens=max_new_tokens)
 

@@ -157,7 +157,7 @@ class NativeQwenTests(unittest.TestCase):
                 worker = base.build_parser('native').parse_args(command[3:])
                 self.assertEqual(worker.model, name)
                 self.assertEqual(worker.model_path, '/local/qwen')
-                self.assertEqual(devices, '0,1,2,3' if name.endswith('72b') else '0')
+                self.assertEqual(devices, '0')
 
     def test_offline_and_streaming_flows_use_only_visible_frames(self):
         runtime = self.runtime

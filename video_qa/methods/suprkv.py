@@ -92,9 +92,6 @@ class SuPrKVMethod(Method):
             directory += f'/summarizer_{name}-{digest}'
         return directory
 
-    def devices(self, args, index):
-        return str(index)
-
     def load(self, args):
         from model.suprkv.runtime import StreamingRuntime
         return StreamingRuntime(make_config(args)), None

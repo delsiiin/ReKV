@@ -6,6 +6,7 @@ import torch
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
 from model.video_backbone import question_prompt, preprocess_video, video_features
+from model.loading import load_pretrained
 from observation.engine import question_inputs, greedy_token_ids
 from observation.segments import SUMMARY_SYSTEM, summary_prompt
 
@@ -52,9 +53,8 @@ class OneVisionSummarizer:
     def load(cls, model_path, device, dtype):
         try:
             processor = LlavaOnevisionProcessor.from_pretrained(model_path)
-            model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-                model_path, dtype=dtype, device_map=str(device),
-                attn_implementation='sdpa', low_cpu_mem_usage=True).eval()
+            model = load_pretrained(LlavaOnevisionForConditionalGeneration,
+                model_path, dtype=dtype, device=device, attn_implementation='sdpa').eval()
         except torch.cuda.OutOfMemoryError:
             raise
         except (OSError, ValueError, RuntimeError) as exc:

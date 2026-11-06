@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+gpus="${CUDA_VISIBLE_DEVICES:-0}"
 # InfiniPot-V/scripts/run_sample.sh experiment profile; append CLI overrides.
 python -m video_qa.run_eval \
+    --gpus "$gpus" \
     --method infinipot \
     --model qwen2_5_vl_7b \
     --dataset mlvu \
