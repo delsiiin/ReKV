@@ -378,7 +378,7 @@ class RuntimeDifferentialTests(unittest.TestCase):
 
 
 class EvaluationTests(unittest.TestCase):
-    def test_stream_rebuilds_full_prefix_even_at_repeated_or_decreasing_cutoffs(self):
+    def test_stream_reuses_repeated_prefix_and_rebuilds_changed_cutoffs(self):
         runtime=Mock()
         runtime.get_prompt.side_effect=lambda q,mc=False:q
         runtime.question_answering.return_value='B)'
@@ -387,9 +387,9 @@ class EvaluationTests(unittest.TestCase):
         flow=StreamKVStreamVQA(anno=[sample],save_dir='/tmp',sample_fps=1,qa_model=runtime)
         flow.load_video=lambda _: np.arange(8)[:,None,None,None]
         flow.analyze_a_video(sample)
-        self.assertEqual([len(c.args[0]) for c in runtime.encode_video.call_args_list],[4,8,8,2])
+        self.assertEqual([len(c.args[0]) for c in runtime.encode_video.call_args_list],[4,8,2])
         self.assertEqual(runtime.clear_cache.call_count,4)
-        self.assertEqual(runtime.encode_init_prompt.call_count,4)
+        self.assertEqual(runtime.encode_init_prompt.call_count,3)
         self.assertTrue(all(c.kwargs['max_new_tokens']==256 for c in runtime.question_answering.call_args_list))
 
     def test_offline_encodes_video_once_with_no_artificial_question_boundaries(self):

@@ -43,7 +43,9 @@ methods; there are no separate method-specific model lists.
 `streamkv` supports the same seven datasets as the existing methods, using
 the LLaVA-OneVision presets on both routes. Its segmentation, budget
 allocation, attention, generation and CUDA cache manager follow the supplied
-`StreamKV/` source. Streaming questions re-encode the complete visible prefix.
+`StreamKV/` source. Streaming questions sharing the same sampled prefix reuse
+the video archive and retrieve independently; a changed prefix is re-encoded.
+This retains one archive without cloning a second full video KV snapshot.
 See [StreamKV source adaptation](model/streamkv/README.md) for the Python CLI
 defaults, the separate reference experiment profile, and differential tests.
 

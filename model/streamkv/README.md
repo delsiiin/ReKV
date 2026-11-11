@@ -16,7 +16,7 @@
 | `runtime.py` | 原 OneVision 模型/patch 接口 | 模型 API 适配及可选预算模式入口 |
 | `budget.py` | 新增实验变体 | 对全部历史帧块引导评分、按预算保留并重建检索索引 |
 | `video_qa/streamkv_sampling.py` | 原 `StreamKVStreamVQA.load_video` | 原样提取视频/NPY/帧目录采样方法 |
-| `video_qa/streamkv_stream_vqa.py` | 原流式评测 | 保留逐问题重算前缀；记录写入当前 BaseVQA |
+| `video_qa/streamkv_stream_vqa.py` | 原流式评测 | 相同采样前缀复用视频归档；前缀变化时重算；记录写入当前 BaseVQA |
 | `video_qa/streamkv_offline_vqa.py` | 原离线评测 | 完整视频一次编码，然后依次回答 |
 
 `selection.py`、`segmentation.py` 只导出上述源码函数，不再包含替代算法。
@@ -40,9 +40,15 @@
    Q 先在原 dtype 求均值，再转 FP32 点积。
 8. 完整问题提示使用检索结果进行贪心生成，保留原 `topk(2)` 取第一个 token 的行为、EOS 和缓存分支。
 
-**流式问题之间不增量复用 KV。** 每个问题（包括相同时间点的重复问题）都执行
-`clear_cache → encode_init_prompt → encode_video(video[:cutoff]) → question_answering`。
-时间乘法保留原 `torch.tensor([start_time, end_time]) * sample_fps` 的运算和整数截断。
+**流式评测复用当前采样前缀的视频归档。** 首题或实际截取帧数变化时执行
+`clear_cache → encode_init_prompt → encode_video(video[:cutoff])`；相同前缀的后续问题
+跳过视觉编码、分段、视频 prefill 和压缩，但仍逐题执行检索预算分配、检索和生成。
+时间乘法保留原 `torch.tensor([start_time, end_time]) * sample_fps` 的运算和整数截断，
+按切片后的实际帧数判断是否相同，因此不同时间戳也可能命中同一前缀。
+前缀增长、缩短或切换视频都会重算，不把旧尾段当成可直接追加的增量状态。
+仅保留当前视频归档；问答沿用独立的检索/生成 KV，不深拷贝整份历史归档，不新增一份
+视频 KV 快照。检索的 LRU 缓存可以在问题之间保持热状态，仍受原块池上限约束。
+视频处理结束或编码/问答异常时释放缓存；异常会向上传播，重新执行时从新缓存开始。
 当前 ReKV 数据集若省略 `start_time`，使用 0；源码的普通流式切片本来也始终从视频开头开始。
 
 ## 参数
@@ -93,7 +99,7 @@ Python 接口为 `StreamKVConfig(budget_tokens=8192)`，传给 `StreamKVRuntime.
 
 这个上限在每段编码结束后成立。初始提示、`n_local` 编码窗口、GPU 工作缓冲区、
 问题生成缓存及编码当前段的临时峰值不计入预算，因此它不是进程总内存或显存上限。
-流式评测仍逐问题重算可见前缀。预算值写入结果元数据和目录的 `_budget<N>` 后缀。
+流式评测同样复用相同采样前缀，变化时重算。预算值写入结果元数据和目录的 `_budget<N>` 后缀。
 
 ## 运行
 
@@ -129,6 +135,7 @@ python -m video_qa.run_eval --method streamkv --dataset mlvu --max_samples 5
 ```bash
 python -m unittest discover -s tests -p 'test_streamkv.py' -v
 python -m unittest discover -s tests -p 'test_streamkv_budget.py' -v
+PYTHONPATH=tests python -m unittest test_streamkv_reuse -v
 ```
 
 测试直接读取 `StreamKV/`：检查核心源码一致性、原函数差分、FP16/FP32 分段、
@@ -136,6 +143,9 @@ python -m unittest discover -s tests -p 'test_streamkv_budget.py' -v
 两套默认参数以及调度/采样。
 `test_streamkv_budget.py` 不依赖上游源码目录，覆盖预算参数传递、连续段压缩、摘要计费、
 帧块取整、全历史评分、缓存索引重映射、压缩后问答以及默认比例路径兼容性。
+`test_streamkv_reuse.py` 也不依赖上游目录，覆盖重复/舍入后相同/越界截断/缩短前缀、
+视频边界和异常释放。真实小模型对照原逐题重算入口，在均匀/语义分段、无压缩/比例压缩/
+固定预算、摘要开关的组合中检查检索索引、逐次 logits、答案及视频归档张量不变。
 小型随机 OneVision 模型测试使用仅存在于测试中的 CPU CUDA-plumbing 替身：
 仅替换设备断言、分配和 stream/event 操作，源算法及缓存逻辑保持不变。
 另有无此替身的 CUDA 对照测试，在无 GPU 时跳过。没有真实权重跨旧版/新版 Transformers

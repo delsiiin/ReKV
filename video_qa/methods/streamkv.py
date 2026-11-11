@@ -75,7 +75,10 @@ class StreamKVMethod(Method):
         return runtime, runtime.processor
 
     def analyzer_kwargs(self, args):
-        return dict(record_metadata={'method': self.name, **asdict(self.config(args))})
+        metadata = {'method': self.name, **asdict(self.config(args))}
+        # Use the column name expected by evaluation scripts.
+        metadata['chunk_size'] = metadata.pop('retrieve_chunk_size')
+        return dict(record_metadata=metadata)
 
     def close(self, model):
         model.close()
