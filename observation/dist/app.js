@@ -61,6 +61,12 @@ function updateWindowLabels() {
   const compressionMode = $('mode').value === 'compression';
   $('compressionControls').hidden = !compressionMode;
   const frameQueryScoring = $('compressionScoring').value === 'frame_mean_query';
+  const scopeSelectable = compressionMode && frameQueryScoring && $('compressionGranularity').value === 'head';
+  $('compressionScoringScopeControls').hidden = !scopeSelectable;
+  $('compressionScoringScope').disabled = !scopeSelectable;
+  const frameBatchScoring = scopeSelectable && $('compressionScoringScope').value === 'frame';
+  $('compressionFrameBatchControls').hidden = !frameBatchScoring;
+  $('compressionFrameBatchSize').disabled = !frameBatchScoring;
   $('compressionSummarizer').disabled = compressionMode && frameQueryScoring;
   const customSummary = compressionMode && !frameQueryScoring && $('compressionSummarizer').value === 'custom';
   $('compressionSummarizerCustom').hidden = !customSummary;
@@ -132,6 +138,10 @@ function parameters() {
     ...($('mode').value === 'compression' ? {
       scoring_strategy: $('compressionScoring').value,
       compression_granularity: $('compressionGranularity').value,
+      ...($('compressionScoring').value === 'frame_mean_query' && $('compressionGranularity').value === 'head' ?
+        {scoring_scope: $('compressionScoringScope').value,
+         ...($('compressionScoringScope').value === 'frame' ?
+           {frame_score_batch_size: Number($('compressionFrameBatchSize').value)} : {})} : {}),
       summarizer_model_path: $('compressionScoring').value === 'frame_mean_query' || $('compressionSummarizer').value === 'main' ? null :
         ($('compressionSummarizer').value === 'custom' ? $('compressionSummarizerPath').value.trim() : $('compressionSummarizer').value),
       question_indices: [...$('compressionQuestions').querySelectorAll('input:checked')].map(input => Number(input.value)),
@@ -520,7 +530,7 @@ for (const [id, checked] of [['compressionQuestionsAll', true], ['compressionQue
     invalidate();
   });
 }
-['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionScoring', 'compressionGranularity', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
+['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionScoring', 'compressionGranularity', 'compressionScoringScope', 'compressionFrameBatchSize', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));

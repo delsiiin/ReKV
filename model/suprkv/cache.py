@@ -8,7 +8,7 @@ import time
 import torch
 
 from .quantization import PackedKV, CompactPackedKV
-from .segments import summary_scores, segment_summary_scores, segment_frame_query_scores
+from .segments import summary_scores, segment_summary_scores, segment_frame_query_scores, frame_local_query_scores
 from .profiling import measure
 from .accounting import MemoryLedger, TrackedDict
 from .rotary import rotate_at
@@ -355,11 +355,16 @@ class CacheSnapshot:
 
 class StreamingKVCache:
     def __init__(self, sink, budget_tokens, frame_tokens, recent_frames=2, group_size=128, profiler=None,
-                 dtype=torch.float16, compression_granularity='layer'):
+                 dtype=torch.float16, compression_granularity='layer', scoring_scope='segment'):
         self.profiler = profiler
         if compression_granularity not in ('layer', 'head'):
             raise ValueError('Invalid compression_granularity')
         self.compression_granularity = compression_granularity
+        if scoring_scope not in ('segment', 'frame'):
+            raise ValueError('Invalid scoring_scope')
+        if scoring_scope == 'frame' and compression_granularity != 'head':
+            raise ValueError('scoring_scope=frame requires head compression')
+        self.scoring_scope = scoring_scope
         if budget_tokens <= 0 or recent_frames < 1 or frame_tokens < 1:
             raise ValueError('Budget, recent_frames and frame_tokens must be positive')
         if group_size < 1 or group_size % 8:
@@ -629,7 +634,9 @@ class StreamingKVCache:
             if any(key.shape != frame.layers[layer].high_k.shape for frame, key in zip(pending, keys)):
                 raise ValueError('Scoring key must match the unpartitioned frame')
             scorer = segment_frame_query_scores if scoring_strategy == 'frame_mean_query' else segment_summary_scores
-            scores = scorer(query, keys, headwise=self.compression_granularity == 'head')
+            frame_local = scoring_strategy == 'frame_mean_query' and self.scoring_scope == 'frame'
+            scores = (frame_local_query_scores(query, keys) if frame_local else
+                      scorer(query, keys, headwise=self.compression_granularity == 'head'))
             entries = [frame.layers[layer] for frame in pending]
             if scoring_strategy == 'frame_mean_query' and self.compression_granularity == 'head':
                 partitioned = LayerFrame.classify_batch(entries, scores)
@@ -646,6 +653,8 @@ class StreamingKVCache:
     def close_segment(self, queries, error='', *, scoring_strategy='summary'):
         if scoring_strategy not in ('summary', 'frame_mean_query'):
             raise ValueError('Invalid scoring_strategy')
+        if self.scoring_scope == 'frame' and scoring_strategy != 'frame_mean_query':
+            raise ValueError('scoring_scope=frame requires frame_mean_query scoring')
         began = time.monotonic()
         pending = [self.frames[i] for i in self._open_ids]
         if not pending:
@@ -671,7 +680,8 @@ class StreamingKVCache:
         self.version += 1
         self.last_event = dict(version=self.version, quantized=0, dropped_low=0, evicted=0,
                                before_bytes=0, after_bytes=0, elapsed_seconds=0.0,
-                               trigger='segment_commit', score_error=error)
+                               trigger='frame_batch_commit' if self.scoring_scope == 'frame' else 'segment_commit',
+                               score_error=error)
         self.last_event['before_bytes'] = self.persistent_bytes()
         self._enforce_budget()
         self.last_event['elapsed_seconds'] = time.monotonic()-began
@@ -793,6 +803,7 @@ class StreamingKVCache:
         working = self._working_ledger.total-pbytes
         return dict(cache_device=str(self.device), cache_dtype=str(self.dtype).removeprefix('torch.'), offload_enabled=False,
                     compression_granularity=self.compression_granularity,
+                    scoring_scope=self.scoring_scope,
                     budget_bytes=self.budget, persistent_bytes=pbytes,
                     persistent_tensor_bytes=ledger.tensor_bytes,
                     persistent_cuda_bytes=ledger.cuda_bytes,

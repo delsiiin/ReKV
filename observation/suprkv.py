@@ -52,7 +52,8 @@ def borrowed_engine(model, processor, config, profiler, check_cancel, summarizer
             engine.clear_segment()
             engine.summarizer = None
             engine.main_summarizer = None
-            engine.segmenter.previous = None
+            if engine.segmenter is not None:
+                engine.segmenter.previous = None
         for module, name, owned, value in reversed(saved):
             if owned:
                 setattr(module, name, value)
@@ -107,6 +108,7 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
     # The selected compression policy belongs only to the after pass. Keep the
     # baseline's cache layout and protected-capacity check independent of it.
     pass_config = dict(config, compression_enabled=compressed,
+                       scoring_scope=config.get('scoring_scope', 'segment') if compressed else 'segment',
                        compression_granularity=config.get('compression_granularity', 'layer') if compressed else 'layer')
     with borrowed_engine(model, processor, pass_config, profiler, check_cancel, summarizer) as engine:
         timeline, commits = [], []
@@ -126,6 +128,8 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
             timeline.append(dict(frame_index=index, timestamp=frames[index]['timestamp'], kind=kind,
                                  compression_enabled=compressed,
                                  compression_granularity=engine.cache.compression_granularity,
+                                 scoring_scope='frame' if engine.framewise_scoring else 'segment',
+                                 frame_score_batch_size=engine.frame_score_batch_size,
                                  persistent_tensor_bytes=stats['persistent_tensor_bytes'],
                                  persistent_cuda_bytes=stats['persistent_cuda_bytes'],
                                  managed_bytes=stats['persistent_bytes'],
@@ -208,6 +212,8 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
     config = asdict(StreamingConfig(model_path=observation.model_path, device=observation.device,
         scoring_strategy=params.get('scoring_strategy', 'summary'),
         compression_granularity=params.get('compression_granularity', 'layer'),
+        frame_score_batch_size=params.get('frame_score_batch_size', 1),
+        scoring_scope=params.get('scoring_scope', 'segment'),
         summarizer_model_path=params.get('summarizer_model_path'),
         budget_tokens=params['compression_budget_tokens'], topk=params['compression_topk'],
         recent_frames=params['compression_recent_frames'], max_segment_frames=params['compression_max_segment_frames'],
@@ -262,8 +268,9 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         left = before.get('timings', {}).get(key, {}).get('seconds', 0.) if before['status']=='complete' else None
         right = after.get('timings', {}).get(key, {}).get('seconds', 0.) if after['status']=='complete' else None
         stages.append(dict(id=key, label=label, algorithm=algorithm, before_seconds=left, after_seconds=right,
-                           enabled=config['scoring_strategy'] == 'summary' or key not in
-                               ('summarizer_vision_encoding', 'summary_generation', 'summary_query'),
+                           enabled=(config['scoring_strategy'] == 'summary' or key not in
+                               ('summarizer_vision_encoding', 'summary_generation', 'summary_query')) and not
+                               (key == 'segmentation' and config['scoring_scope'] == 'frame'),
                            delta_seconds=right-left if left is not None and right is not None else None))
     progress('compression_complete', '压缩对照完成' if complete else '对照部分失败；查看各侧状态', .99)
     return dict(frames=frames, compression_experiment=dict(status='complete' if complete else 'partial',

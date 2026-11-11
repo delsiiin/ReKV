@@ -116,8 +116,22 @@ def segment_frame_query_scores(query, keys, *, headwise=False):
     Each query/head scores every token in the segment, without softmax or a
     causal mask. Return [frames, tokens], or [frames, kv_heads, tokens] in headwise mode.
     """
+    return _frame_query_scores(query, keys, headwise=headwise)
+
+
+def frame_local_query_scores(query, keys):
+    """Score each frame with only its own Query mean, batched across frames.
+
+    Q=[frames, query heads, d], K=list of [kv heads, tokens, d].
+    Average only within each GQA group after the dot product; return
+    FP32 [frames, kv heads, tokens], independent of the other batch members.
+    """
+    return _frame_query_scores(query, keys, headwise=True, frame_local=True)
+
+
+def _frame_query_scores(query, keys, *, headwise, frame_local=False):
     if not keys or query.ndim != 3 or len(query) != len(keys):
-        raise ValueError('Expected one Query mean per segment frame')
+        raise ValueError('Expected one Query mean per frame')
     key = keys[0]
     if key.ndim != 3 or any(k.shape != key.shape or k.device != key.device for k in keys):
         raise ValueError('Scoring keys must have matching frame shapes and devices')
@@ -128,14 +142,20 @@ def segment_frame_query_scores(query, keys, *, headwise=False):
     with torch.autocast(device_type=key.device.type, enabled=False):
         if headwise and _fused_frame_scores_supported(query, keys):
             from .scoring_kernels import frame_query_scores
-            return frame_query_scores(query, keys)
+            return frame_query_scores(query, keys, frame_local=frame_local)
         query = query.to(device=key.device, dtype=torch.float32)
-        key = torch.cat(keys, dim=1).float()
+        key = (torch.stack(keys) if frame_local else torch.cat(keys, dim=1)).float()
         if not (torch.isfinite(query).all() & torch.isfinite(key).all()):
             raise ValueError('Nonfinite frame Q/K')
         # Keep frame queries and GQA heads separate until after the dot product.
         # Grouped contraction avoids repeating the entire Key tensor per Q head.
         q = query.reshape(len(keys), kv_heads, heads // kv_heads, dim)
+        if frame_local:
+            logits = torch.einsum('fhgd,fhnd->fhgn', q, key) / math.sqrt(dim)
+            scores = logits.mean(dim=2)
+            if not torch.isfinite(scores).all():
+                raise ValueError('Nonfinite frame attention scores')
+            return scores
         logits = torch.einsum('fhgd,hnd->hgfn', q, key) / math.sqrt(dim)
         scores = logits.mean(dim=2).mean(dim=1) if headwise else logits.mean(dim=2).mean(dim=(0, 1))
         if not torch.isfinite(scores).all():

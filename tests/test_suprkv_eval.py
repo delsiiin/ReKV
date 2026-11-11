@@ -281,6 +281,7 @@ class SuPrKVEvalTests(unittest.TestCase):
                                   '--min-segment-frames', '2', '--max-segment-frames', '16',
                                   '--scoring-strategy', 'frame_mean_query',
                                   '--compression-granularity', 'head',
+                                  '--frame-score-batch-size', '3', '--scoring-scope', 'frame',
                                   '--summary-max-new-tokens', '128', '--max-new-tokens', '64')
         process = Mock(exitcode=0)
         with patch.object(run_eval.multiprocessing, 'Process', return_value=process) as launch, \
@@ -382,8 +383,8 @@ class SuPrKVEvalTests(unittest.TestCase):
             headwise = self.launcher_args(*extra, '--compression_granularity', 'head')
             original_dir = method.result_dir(original, 'rvs_ego')
             self.assertEqual(method.result_dir(explicit, 'rvs_ego'), original_dir)
-            self.assertEqual(method.result_dir(headwise, 'rvs_ego'),
-                             original_dir.replace('/budget_8192', '/budget_8192/compression_head'))
+            expected_dir = original_dir.replace('/budget_8192', '/budget_8192/compression_head')
+            self.assertEqual(method.result_dir(headwise, 'rvs_ego'), expected_dir)
             self.assertEqual(make_config(self.worker_args(*extra)).compression_granularity, 'layer')
             self.assertEqual(make_config(self.worker_args(*extra, '--compression-granularity', 'head'))
                              .compression_granularity, 'head')

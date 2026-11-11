@@ -337,7 +337,7 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 
 ## KV 压缩前后对照
 
-重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；本模式始终分段，默认 summary 策略生成摘要，不受注意力观察的启用复选框影响。
+重启服务、刷新页面，在左侧「观察输入」选择 **KV 压缩前后对照**。设置 FP16-token 等价 memory budget（默认 1024）、recent 帧数（默认 2）、检索帧数上限（默认 64）和段帧数上限（默认 32），再点击「运行压缩对照」。EMA 和 summary 参数沿用左侧输入；默认 summary 策略分段并生成摘要，不受注意力观察的启用复选框影响。`frame_mean_query + head` 可通过「评分范围」切换原 Segment 分段评分与逐帧独立评分，默认保留 Segment。
 
 「Token 删除粒度」选择压缩后使用的流程：
 
@@ -347,12 +347,21 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 压缩前固定使用未压缩的矩形 KV 基线，所选粒度只作用于压缩后。预算触发、recent 保护、渐进降位和整帧淘汰规则共用原流程。结果缓存按粒度区分；实时进度及最终结果标题显示所选模式。`runs.before/after` 和每个 `timeline` 状态点记录 `compression_enabled`、`compression_granularity`，完整 JSON 可核对实际执行配置。
 
 「Token 评分策略」支持 `summary`（默认）和 `frame_mean_query`。后者使用每帧的 RoPE 前 Q 均值，
-对本段原始 RoPE 前 K 计算缩放点积，保留各帧 Query 和 head，计算后沿 Query 帧维平均；层级共享再聚合全部 heads，逐 KV head 仅聚合同一 GQA 组的 Q heads。
+层级共享模式对本段原始 RoPE 前 K 计算缩放点积，计算后沿 Query 帧维和全部 heads 平均。
+选择「帧均值 Query + 逐 KV head」后显示「评分范围」开关，默认 **Segment 分段评分（原流程）**：
+使用视觉 EMA 和分段帧数确定边界，段内帧 Query 对整段 Key 评分，再平均 Query 帧维和同一 GQA 组的 Q heads。
+切换为 **逐帧独立评分** 后，每帧只对本帧 K 评分，计算后仅聚合同一 GQA 组的 Q heads，不运行分段器。
+此时显示「评分批处理帧数 N」，默认 1，可设为任意正整数：累积 N 帧后统一评分、分区和检查预算，
+帧间评分仍独立；末尾不足 N 帧会在问答前提交。N 越大，临时 Q/K 内存和预算检查间隔越大。
+实时进度和结果标题显示批处理帧数，结果 JSON 的 `config.frame_score_batch_size` 记录配置，
+提交记录的 `scored_frames` 记录实际处理帧数。结果 JSON 的 `config.scoring_scope` 记录 `segment` 或 `frame`。
+Segment 模式及其他评分组合隐藏 N 设置，服务端按默认 1 归一化。
 使用 **softmax 前**分数，按所选粒度逐层逐帧计算 token 均分阈值，等于均分归为高分。
 新策略跳过摘要模型加载、摘要生成和文字 Q 提取，忽略摘要模型配置；对应阶段显示“未启用”。
-分段只使用视觉 EMA 与帧数限制，不受摘要上下文容量约束。帧均值 Q 计入临时工作内存，段提交后释放，
+帧均值 Query 的 Segment 模式只使用视觉 EMA 与帧数限制，不受摘要上下文容量约束；逐帧模式不使用这些分段参数。
+帧均值 Q 计入临时工作内存，提交后释放，
 不计入持久 KV 预算。API `POST /api/jobs` 增加 `scoring_strategy`，配置、提交记录和结果 JSON 记录策略。
-评分异常仍按全段高分保留，OOM 和取消继续传播。新策略热图位于普通观察页。
+评分异常按当前待处理帧全高分保留，OOM 和取消继续传播。新策略热图位于普通观察页。
 
 结果包含：
 
@@ -370,6 +379,9 @@ python -m unittest discover -s tests -p 'test_observation*.py' -v
 计时不含模型加载和视频解码，属于单次、基线先执行的配对测量；首次 kernel 初始化会影响耗时。两侧测量前各自清理 allocator 缓存并重置峰值，避免把第一侧的显存峰值带到第二侧。预算过小会在对应侧显示错误；CUDA OOM 直接终止任务，不触发摘要重试，也不伪造节省值。取消任务不发布完整结果。
 
 API 沿用 `POST /api/jobs`，设置 `mode="compression"` 及 `compression_budget_tokens`、`compression_recent_frames`、`compression_topk`、`compression_max_segment_frames`。结果 `compression_experiment` 包含 `runs.before/after`、`memory`、`stages`、逐帧 `timeline` 和提交记录。JSON 导出包含全部口径和配置。缓存指纹包含压缩算法源码及参数，修改量化或策略代码后自动重新计算。
+`scoring_strategy="frame_mean_query"` 且 `compression_granularity="head"` 时可传
+`scoring_scope="segment"`（默认，原流程）或 `"frame"`（逐帧模式）。逐帧模式可传
+`frame_score_batch_size`（正整数，默认 1）；两种模式以及逐帧模式的不同 N 使用不同结果缓存。
 
 压缩参数区的「摘要模型」提供主模型（默认）、LLaVA-OneVision 0.5B、自定义 OneVision 三种选择。
 自定义路径支持 Hugging Face ID 或本地目录；API 使用 `summarizer_model_path`，默认 `null`。

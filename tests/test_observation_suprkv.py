@@ -17,6 +17,27 @@ from model.suprkv.profiling import StageProfiler
 
 
 class CompressionParameterTests(unittest.TestCase):
+    def test_frame_scoring_batch_validation_and_inactive_modes(self):
+        dataset = SimpleNamespace(get=lambda _: dict(conversations=[dict(question='q')]))
+        raw = dict(sample_id='sample', mode='compression', scoring_strategy='frame_mean_query',
+                   compression_granularity='head', scoring_scope='frame')
+        self.assertEqual(validate_params(raw, dataset)['frame_score_batch_size'], 1)
+        segment = validate_params(dict(raw, scoring_scope='segment', frame_score_batch_size=3), dataset)
+        self.assertEqual(segment['scoring_scope'], 'segment')
+        self.assertEqual(segment['frame_score_batch_size'], 1)
+        self.assertEqual(validate_params(dict(sample_id='sample', mode='compression'), dataset)['scoring_scope'], 'segment')
+        for invalid in ('batch', None, True):
+            with self.assertRaisesRegex(ValueError, 'scoring_scope'):
+                validate_params(dict(raw, scoring_scope=invalid), dataset)
+        for size in (1, 3, 128, 256):
+            self.assertEqual(validate_params(dict(raw, frame_score_batch_size=size), dataset)['frame_score_batch_size'], size)
+        for size in (0, -1, True, 1.5, '3', None):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'frame_score_batch_size'):
+                validate_params(dict(raw, frame_score_batch_size=size), dataset)
+        for mode in (dict(scoring_strategy='summary'), dict(compression_granularity='layer')):
+            self.assertEqual(validate_params(dict(raw, frame_score_batch_size=3, **mode), dataset)['frame_score_batch_size'], 1)
+        self.assertNotIn('frame_score_batch_size', validate_params(dict(raw, mode='video'), dataset))
+
     def test_compression_granularity_validation_and_default(self):
         dataset = SimpleNamespace(get=lambda _: dict(conversations=[dict(question='q')]))
         base = dict(sample_id='sample', mode='compression')
@@ -142,6 +163,9 @@ class CompressionParameterTests(unittest.TestCase):
                 self.assertNotEqual(key, service.cache_key(dict(params, max_frames=1)))
                 self.assertNotEqual(key, service.cache_key(dict(params, compression_budget_tokens=700)))
                 self.assertNotEqual(key, service.cache_key(dict(params, compression_granularity='head')))
+                frame_params = dict(params, scoring_strategy='frame_mean_query', compression_granularity='head')
+                self.assertNotEqual(service.cache_key(frame_params), service.cache_key(dict(frame_params, scoring_scope='frame')))
+                self.assertNotEqual(service.cache_key(frame_params), service.cache_key(dict(frame_params, frame_score_batch_size=3)))
                 self.assertNotEqual(key, service.cache_key(dict(params, custom_questions=['another question'])))
                 external = dict(params, summarizer_model_path='llava-hf/llava-onevision-qwen2-0.5b-ov-hf')
                 self.assertNotEqual(key, service.cache_key(external))
@@ -216,6 +240,24 @@ class CompressionModelTests(unittest.TestCase):
         self.params = dict(compression_budget_tokens=650, compression_topk=4, compression_recent_frames=2,
             compression_max_segment_frames=2, segment_min_frames=1, segment_ema_alpha=.2,
             summary_max_new_tokens=2, max_new_tokens=3, question_index=0)
+
+    def test_frame_scoring_batches_and_flushes_tail_in_observation(self):
+        result = compare(self.observer, list(range(4)), self.frames, self.record,
+            dict(self.params, scoring_strategy='frame_mean_query', compression_granularity='head',
+                 frame_score_batch_size=3, compression_budget_tokens=10000, scoring_scope='frame'),
+            lambda *_: None, lambda: None)['compression_experiment']
+        self.assertEqual(result['status'], 'complete', result['runs'])
+        self.assertEqual(result['config']['frame_score_batch_size'], 3)
+        before, after = result['runs']['before'], result['runs']['after']
+        self.assertEqual(after['model_stats']['frame_score_batch_size'], 3)
+        self.assertEqual([c['scored_frames'] for c in after['commits']], [3, 1])
+        self.assertTrue(all(c['trigger'] == 'frame_batch_commit' for c in after['commits']))
+        self.assertEqual(after['cache']['counts']['scoring_failures'], 0)
+        self.assertEqual(before['cache']['counts']['compressions'], 0)
+        self.assertEqual(len(after['answers']), 1)
+        self.assertTrue(all(p['frame_score_batch_size'] == 3 and p['scoring_scope'] == 'frame'
+                            for p in after['timeline']))
+        self.assertFalse(hasattr(self.llm.model, '_old_forward'))
 
     def test_frame_query_comparison_skips_summary_and_restores_native_forward(self):
         from model.suprkv.summarizer import OneVisionSummarizer
@@ -409,7 +451,8 @@ class CompressionModelTests(unittest.TestCase):
             def publish(side, point):
                 captured[side].append(json.loads(json.dumps(point)))
             result = compare(self.observer, list(range(4)), self.frames, self.record,
-                             dict(self.params, compression_granularity='head', scoring_strategy=strategy),
+                             dict(self.params, compression_granularity='head', scoring_strategy=strategy,
+                                  scoring_scope='frame' if strategy == 'frame_mean_query' else 'segment'),
                              lambda stage, message, fraction: messages.append(message), lambda: None,
                              on_snapshot=publish)['compression_experiment']
             self.assertEqual(result['status'], 'complete', result['runs'])
@@ -424,6 +467,11 @@ class CompressionModelTests(unittest.TestCase):
             self.assertEqual(after['compression_granularity'], 'head')
             self.assertEqual(after['cache']['compression_granularity'], 'head')
             self.assertEqual(after['cache']['counts']['scoring_failures'], 0)
+            if strategy == 'frame_mean_query':
+                self.assertEqual(after['model_stats']['scoring_scope'], 'frame')
+                self.assertEqual(len(after['commits']), len(self.frames))
+                self.assertTrue(all(c['trigger'] == 'frame_batch_commit' for c in after['commits']))
+                self.assertFalse(next(s['enabled'] for s in result['stages'] if s['id'] == 'segmentation'))
             self.assertGreater(after['cache']['counts']['dropped_low_frames'], 0)
             self.assertLessEqual(after['cache']['persistent_bytes'], after['cache']['budget_bytes'])
             self.assertGreater(result['memory']['persistent_kv']['saved_bytes'], 0)

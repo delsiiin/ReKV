@@ -39,7 +39,8 @@ def frame_query_mean(query):
 
 @triton.jit(do_not_specialize=['F', 'N'])
 def _score(Q, K, OUT, ERROR, F, N, H: tl.constexpr, G: tl.constexpr,
-           D: tl.constexpr, BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr):
+           D: tl.constexpr, BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+           FRAME_LOCAL: tl.constexpr):
     block, h, frame = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     t = block * BN + tl.arange(0, BN)
     d = tl.arange(0, BD)
@@ -49,16 +50,21 @@ def _score(Q, K, OUT, ERROR, F, N, H: tl.constexpr, G: tl.constexpr,
     invalid = tl.sum(tl.sum((tl.abs(k) == float('inf')) | (k != k), 0), 0) > 0
     total = tl.full((BN,), 0., tl.float32)
     for g in range(G):
-        frame_sum = tl.full((BN,), 0., tl.float32)
-        for start in range(tl.cdiv(F, BQ)):
-            f = start * BQ + tl.arange(0, BQ)
-            q = tl.load(Q + ((f[:, None] * H + h) * G + g) * D + d[None, :],
-                        (f[:, None] < F) & (d[None, :] < D), 0)
-            invalid |= tl.sum(tl.sum((tl.abs(q) == float('inf')) | (q != q), 0), 0) > 0
-            # Keep every frame query/GQA head separate until AFTER its dot.
-            logits = tl.dot(q, k, input_precision='ieee') / tl.sqrt(float(D))
-            frame_sum += tl.sum(tl.where(f[:, None] < F, logits, 0.), 0)
-        total += frame_sum / F
+        if FRAME_LOCAL:
+            q = tl.load(Q + ((frame * H + h) * G + g) * D + d, d < D, 0)
+            invalid |= tl.sum((tl.abs(q) == float('inf')) | (q != q), 0) > 0
+            total += tl.sum(q[:, None] * k, 0) / tl.sqrt(float(D))
+        else:
+            frame_sum = tl.full((BN,), 0., tl.float32)
+            for start in range(tl.cdiv(F, BQ)):
+                f = start * BQ + tl.arange(0, BQ)
+                q = tl.load(Q + ((f[:, None] * H + h) * G + g) * D + d[None, :],
+                            (f[:, None] < F) & (d[None, :] < D), 0)
+                invalid |= tl.sum(tl.sum((tl.abs(q) == float('inf')) | (q != q), 0), 0) > 0
+                # Keep every frame query/GQA head separate until AFTER its dot.
+                logits = tl.dot(q, k, input_precision='ieee') / tl.sqrt(float(D))
+                frame_sum += tl.sum(tl.where(f[:, None] < F, logits, 0.), 0)
+            total += frame_sum / F
     scores = total / G
     invalid |= tl.sum(((tl.abs(scores) == float('inf')) | (scores != scores)) & (t < N), 0) > 0
     if invalid:
@@ -106,7 +112,7 @@ def _scatter(DESC, RANKS, N, H: tl.constexpr, D: tl.constexpr,
     tl.store(ip + target, ids, valid & (d == 0))
 
 
-def frame_query_scores(query, keys):
+def frame_query_scores(query, keys, *, frame_local=False):
     """Validated, same-shaped keys; return FP32 [frames, heads, tokens]."""
     frames, (heads, tokens, dim) = len(keys), keys[0].shape
     query = query.to(device=keys[0].device, dtype=torch.float32).contiguous()
@@ -117,7 +123,7 @@ def frame_query_scores(query, keys):
     with context:
         _score[(triton.cdiv(tokens, 32), heads, frames)](
             query, keys, scores, error, frames, tokens, heads, query.shape[1] // heads,
-            dim, 32, 32, max(32, triton.next_power_of_2(dim)),
+            dim, 32, 32, max(32, triton.next_power_of_2(dim)), frame_local,
             enable_fp_fusion=False, num_warps=4, num_stages=1)
     if error.item():
         raise ValueError('Nonfinite frame Q/K or attention scores')

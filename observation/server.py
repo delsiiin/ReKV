@@ -30,7 +30,8 @@ def validate_params(raw, dataset, default_dtype='float16'):
                'max_new_tokens', 'video_window_size', 'segment_enabled', 'segment_ema_alpha',
                'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
                'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
-               'question_indices', 'custom_questions', 'summarizer_model_path', 'scoring_strategy', 'compression_granularity'}
+               'question_indices', 'custom_questions', 'summarizer_model_path', 'scoring_strategy', 'compression_granularity',
+               'frame_score_batch_size', 'scoring_scope'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -92,6 +93,14 @@ def validate_params(raw, dataset, default_dtype='float16'):
         if strategy not in ('summary', 'frame_mean_query'):
             raise ValueError('Invalid scoring_strategy')
         compression['scoring_strategy'] = strategy
+        scope = raw.get('scoring_scope', 'segment')
+        if scope not in ('segment', 'frame'):
+            raise ValueError('Invalid scoring_scope')
+        compression['scoring_scope'] = scope if strategy == 'frame_mean_query' and granularity == 'head' else 'segment'
+        batch_size = raw.get('frame_score_batch_size', 1)
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError('frame_score_batch_size must be a positive integer')
+        compression['frame_score_batch_size'] = batch_size if compression['scoring_scope'] == 'frame' else 1
         path = raw.get('summarizer_model_path') if strategy == 'summary' else None
         if path is not None and (not isinstance(path, str) or not path.strip()):
             raise ValueError('summarizer_model_path must be a nonempty string or null')

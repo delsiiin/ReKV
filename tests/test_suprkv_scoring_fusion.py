@@ -14,7 +14,7 @@ from unittest.mock import patch
 import torch
 
 from model.suprkv.cache import LayerFrame, StreamingKVCache, _fused_partition_supported
-from model.suprkv.segments import segment_frame_query_scores, _fused_frame_scores_supported
+from model.suprkv.segments import segment_frame_query_scores, frame_local_query_scores, _fused_frame_scores_supported
 
 
 INTERPRETER = os.environ.get('TRITON_INTERPRET') == '1'
@@ -87,6 +87,27 @@ class ScoringFusionTests(unittest.TestCase):
                     self.assertTrue(torch.equal(actual >= actual.mean(-1, keepdim=True),
                                                 previous >= previous.mean(-1, keepdim=True)))
 
+    def test_frame_local_kernel_matches_single_frame_reference(self):
+        torch.manual_seed(97)
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for frames, heads, group, tokens, dim in ((1, 1, 1, 1, 1), (3, 2, 3, 7, 8),
+                                                      (4, 2, 7, 33, 40), (2, 2, 1, 196, 256)):
+                with self.subTest(dtype=dtype, shape=(frames, heads, group, tokens, dim)):
+                    q = torch.randn(frames, heads*group, dim*2, dtype=dtype, device=self.device)[..., ::2]
+                    keys = list(torch.randn(frames, heads, tokens, dim*2, dtype=dtype, device=self.device)[..., ::2])
+                    expected = torch.cat([dense_reference(q[i:i+1], [keys[i]]) for i in range(frames)])
+                    actual = frame_local_query_scores(q, keys)
+                    torch.testing.assert_close(actual.double(), expected, rtol=1e-5, atol=1e-6)
+                    with patch('model.suprkv.segments._fused_frame_scores_supported', return_value=False):
+                        reference = frame_local_query_scores(q, keys)
+                    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+                    self.assertTrue(torch.equal(actual >= actual.mean(-1, keepdim=True),
+                                                reference >= reference.mean(-1, keepdim=True)))
+        key = torch.tensor([[[-2.], [0.], [2.]]], device=self.device)
+        q = torch.tensor([[[1.]], [[-1.]]], device=self.device)
+        scores = frame_local_query_scores(q, [key, key])
+        torch.testing.assert_close(scores, torch.stack([key[..., 0], -key[..., 0]]), rtol=0, atol=0)
+
     def test_partition_exact_payload_order_ties_and_independent_storage(self):
         torch.manual_seed(17)
         dtypes = (torch.float16, torch.bfloat16, torch.float32)
@@ -157,11 +178,11 @@ class ScoringFusionTests(unittest.TestCase):
             self.assertEqual(entry.high_offsets, (0, 5, 10))
             self.assertEqual(entry.low_indices.numel(), 0)
 
-    def make_cache(self, failure=False):
+    def make_cache(self, failure=False, scoring_scope='segment'):
         torch.manual_seed(62)
         sink = torch.zeros(2, 2, 16, device=self.device)
         cache = StreamingKVCache([(sink, sink)]*2, 100000, 7, dtype=torch.float32,
-                                 recent_frames=1, group_size=8, compression_granularity='head')
+                                 recent_frames=1, group_size=8, compression_granularity='head', scoring_scope=scoring_scope)
         for frame in range(3):
             keys = list(torch.randn(2, 2, 7, 16, device=self.device))
             queries = list(torch.randn(2, 6, 16, device=self.device))
@@ -171,7 +192,12 @@ class ScoringFusionTests(unittest.TestCase):
         return cache
 
     def test_commit_snapshot_budget_and_quantization_match_reference(self):
-        actual, reference = self.make_cache(), self.make_cache()
+        for scope in ('segment', 'frame'):
+            with self.subTest(scoring_scope=scope):
+                self.check_commit_snapshot_budget_and_quantization(scope)
+
+    def check_commit_snapshot_budget_and_quantization(self, scope):
+        actual, reference = self.make_cache(scoring_scope=scope), self.make_cache(scoring_scope=scope)
         snapshot = actual.acquire_snapshot(1)
         original_layers = [f.layers for f in snapshot.frames]
         actual.close_segment(None, scoring_strategy='frame_mean_query')

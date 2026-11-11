@@ -4,14 +4,15 @@ import unittest
 import torch
 
 from model.suprkv.cache import LayerFrame, StreamingKVCache
-from model.suprkv.segments import segment_summary_scores, summary_scores, segment_frame_query_scores
+from model.suprkv.segments import (segment_summary_scores, summary_scores, segment_frame_query_scores,
+                                   frame_local_query_scores)
 
 
 class SegmentScoringTests(unittest.TestCase):
     def test_frame_queries_match_dense_logits_and_working_memory_lifecycle(self):
         torch.manual_seed(77)
         sink = torch.zeros(2, 2, 4)
-        cache = StreamingKVCache([(sink, sink)]*2, 100000, 3, dtype=torch.float32, compression_granularity="head")
+        cache = StreamingKVCache([(sink, sink)]*2, 100000, 3, dtype=torch.float32, compression_granularity="head", scoring_scope="frame")
         queries = torch.randn(2, 3, 4, 4)  # layer, frame, head, dim
         keys = torch.randn(2, 3, 2, 3, 4)
         for frame in range(3):
@@ -28,9 +29,9 @@ class SegmentScoringTests(unittest.TestCase):
             cache._score_queries[frame] = row
         cache.close_segment(None, scoring_strategy='frame_mean_query')
         for layer in range(2):
-            q = queries[layer].double().permute(1, 0, 2)
-            k = keys[layer].double().permute(1, 0, 2, 3).reshape(2, 9, 4).repeat_interleave(2, 0)
-            scores = (q @ k.transpose(-1, -2) / 2).mean(1).reshape(2, 2, 3, 3).mean(1).permute(1, 0, 2)
+            q = queries[layer].double().unsqueeze(-2)
+            k = keys[layer].double().repeat_interleave(2, dim=1)
+            scores = (q @ k.transpose(-1, -2) / 2).reshape(3, 2, 2, 3).mean(2)
             for frame in range(3):
                 entry = cache.frames[frame].layers[layer]
                 for head in range(2):
@@ -41,6 +42,48 @@ class SegmentScoringTests(unittest.TestCase):
         self.assertFalse(cache._score_queries)
         self.assertFalse(cache._score_keys)
         cache.audit_accounting()
+
+    def test_frame_local_scores_are_independent_of_batch_members(self):
+        torch.manual_seed(117)
+        for device in self.devices():
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                queries = torch.randn(4, 6, 8, device=device, dtype=dtype)
+                keys = list(torch.randn(4, 2, 7, 8, device=device, dtype=dtype))
+                with torch.autocast(device_type=device.split(':')[0], dtype=torch.bfloat16):
+                    scores = frame_local_query_scores(queries, keys)
+                q = queries.double().unsqueeze(-2)
+                k = torch.stack(keys).double().repeat_interleave(3, dim=1)
+                expected = (q @ k.transpose(-1, -2) / 8**.5).reshape(4, 2, 3, 7).mean(2)
+                self.assertEqual(scores.dtype, torch.float32)
+                torch.testing.assert_close(scores.double(), expected, rtol=1e-5, atol=1e-6)
+                singles = torch.cat([frame_local_query_scores(queries[i:i+1], [keys[i]]) for i in range(4)])
+                torch.testing.assert_close(scores, singles, rtol=1e-5, atol=1e-6)
+                changed = queries.clone()
+                changed[1:] *= -100
+                keys[1:] = [k * 100 for k in keys[1:]]
+                torch.testing.assert_close(frame_local_query_scores(changed, keys)[0], scores[0], rtol=0, atol=0)
+
+    def test_opposite_frame_queries_do_not_cancel_during_cache_commit(self):
+        # Segment pooling would cancel the queries and mark every token high.
+        key = torch.tensor([[[-2.], [0.], [2.]]])
+        cache = StreamingKVCache([(key[:, :1], key[:, :1])], 100000, 3,
+                                 dtype=torch.float32, compression_granularity='head', scoring_scope='frame')
+        for i, sign in enumerate((1., -1.)):
+            cache.append_frame(i, [(key, key)], score_keys=[key], frame_queries=[torch.tensor([[sign]])])
+        cache.close_segment(None, scoring_strategy='frame_mean_query')
+        self.assertEqual(cache.frames[0].layers[0].high_indices.tolist(), [1, 2])
+        self.assertEqual(cache.frames[1].layers[0].high_indices.tolist(), [0, 1])
+        self.assertEqual(cache.last_event['trigger'], 'frame_batch_commit')
+        # The default must retain the original cross-frame query averaging.
+        segment = StreamingKVCache([(key[:, :1], key[:, :1])], 100000, 3,
+                                   dtype=torch.float32, compression_granularity='head')
+        for i, sign in enumerate((1., -1.)):
+            segment.append_frame(i, [(key, key)], score_keys=[key], frame_queries=[torch.tensor([[sign]])])
+        segment.close_segment(None, scoring_strategy='frame_mean_query')
+        for frame in segment.frames.values():
+            self.assertEqual(frame.layers[0].high_indices.tolist(), [0, 1, 2])
+        self.assertEqual(segment.last_event['trigger'], 'segment_commit')
+        self.assertEqual(segment.memory_stats()['scoring_scope'], 'segment')
 
     def test_frame_query_missing_or_nonfinite_preserves_entire_segment(self):
         key = torch.ones(2, 3, 4)

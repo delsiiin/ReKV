@@ -49,6 +49,16 @@ class OneVisionEngine:
         self.scoring_strategy = config.get('scoring_strategy', 'summary')
         if self.scoring_strategy not in ('summary', 'frame_mean_query'):
             raise ValueError('Invalid scoring_strategy')
+        scope = config.get('scoring_scope', 'segment')
+        if scope not in ('segment', 'frame'):
+            raise ValueError('Invalid scoring_scope')
+        if scope == 'frame' and (self.scoring_strategy != 'frame_mean_query'
+                                or config.get('compression_granularity', 'layer') != 'head'):
+            raise ValueError('scoring_scope=frame requires frame_mean_query + head')
+        self.framewise_scoring = scope == 'frame'
+        self.frame_score_batch_size = config.get('frame_score_batch_size', 1)
+        if type(self.frame_score_batch_size) is not int or self.frame_score_batch_size < 1:
+            raise ValueError('frame_score_batch_size must be a positive integer')
         device = config['device']
         if str(device).startswith('cuda'):
             torch.cuda.set_device(device)
@@ -120,9 +130,11 @@ class OneVisionEngine:
         sink = tuple((k[0], v[0]) for k, v in output.past_key_values)
         self.cache = StreamingKVCache(sink, self.config['budget_tokens'], self.frame_tokens,
                                       self.config['recent_frames'], self.config['group_size'], profiler=self.profiler,
-                                      dtype=self.dtype, compression_granularity=self.config.get('compression_granularity', 'layer'))
-        self.segmenter = OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
-                                         self.config['max_segment_frames'])
+                                      dtype=self.dtype, compression_granularity=self.config.get('compression_granularity', 'layer'),
+                                      scoring_scope=self.config.get('scoring_scope', 'segment'))
+        self.segmenter = (None if self.framewise_scoring else
+                          OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
+                                          self.config['max_segment_frames']))
         self.clear_segment()
         self.summary_counts = dict(summarizer_failures=0, summary_retries=0, summary_failures=0)
         self.last_summary = None
@@ -165,7 +177,7 @@ class OneVisionEngine:
         feature = output.pooler_output.reshape(1, -1, self.decoder.config.hidden_size)
         raw = (selected_vision_features(output, self.model.config.vision_feature_layer,
                                        self.model.config.vision_feature_select_strategy)[0]
-               if self.compression_enabled else None)
+               if self.compression_enabled and not self.framewise_scoring else None)
         return feature, raw
 
     @torch.inference_mode()
@@ -180,7 +192,7 @@ class OneVisionEngine:
                 raise ValueError(f'Expected {self.frame_tokens} frame tokens; got {feature.shape[1]}')
         info = dict(index=self.cache.next_id, timestamp=float(timestamp))
         summary_feature = None
-        if self.compression_enabled:
+        if self.compression_enabled and not self.framewise_scoring:
             reserve = self.config['summary_max_new_tokens']
             with measure(self.profiler, 'segmentation'):
                 boundary = self.segmenter.push(raw)
@@ -243,12 +255,14 @@ class OneVisionEngine:
             self.summarizer_features.append(summary_feature)
         self.frame_info.append(info)
         self.timings['encode_seconds'] += time.monotonic()-began-closed_seconds
-        if self.segmenter.count >= self.segmenter.max_frames:
+        if (len(self.frame_info) >= self.frame_score_batch_size if self.framewise_scoring else
+                self.segmenter.count >= self.segmenter.max_frames):
             self.close_segment()
 
     @torch.inference_mode()
     @stage('segment_commit')
     def close_segment(self, reset_segmenter=True):
+        """Flush pending frames; in framewise mode this commits a scoring batch."""
         self.check_cancel()
         if not self.compression_enabled:
             return self.stats(self.cache.close_uncompressed_segment())
@@ -257,7 +271,8 @@ class OneVisionEngine:
         if self.scoring_strategy == 'frame_mean_query':
             began = time.monotonic()
             record = dict(segment_id=self.cache.segment_id, scoring_strategy=self.scoring_strategy,
-                          summary_enabled=False)
+                          summary_enabled=False, scoring_scope='frame' if self.framewise_scoring else 'segment',
+                          scored_frames=len(self.frame_info))
             try:
                 cache_stats = self.cache.close_segment(None, scoring_strategy=self.scoring_strategy)
             finally:
@@ -267,7 +282,7 @@ class OneVisionEngine:
             if self.cache.last_event is not None:
                 self.cache.last_event.update(record)
                 cache_stats['last_event'] = dict(self.cache.last_event)
-            if reset_segmenter:
+            if reset_segmenter and self.segmenter is not None:
                 self.segmenter.close()
             return self.stats(cache_stats)
         began = time.monotonic()
@@ -372,6 +387,8 @@ class OneVisionEngine:
         result = self.cache.memory_stats() if cache_stats is None else dict(cache_stats)
         result.update(self.timings)
         result['scoring_strategy'] = self.scoring_strategy
+        result['scoring_scope'] = 'frame' if self.framewise_scoring else 'segment'
+        result['frame_score_batch_size'] = self.frame_score_batch_size
         result['inference_pid'] = os.getpid()
         result['model_instances'] = 1 + (self.summarizer is not None)
         extra_bytes = self.summarizer.parameter_bytes if self.summarizer is not None else 0

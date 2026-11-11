@@ -28,6 +28,8 @@ class StreamingConfig:
     scoring_strategy: str = 'summary'
     compression_granularity: str = 'layer'
     model_family: str = 'onevision'
+    frame_score_batch_size: int = 1
+    scoring_scope: str = 'segment'
 
     def __post_init__(self):
         if self.model_family not in ('onevision', 'qwen2_5_vl', 'video_llava'):
@@ -36,6 +38,13 @@ class StreamingConfig:
             raise ValueError('Invalid compression_granularity')
         if self.scoring_strategy not in ('summary', 'frame_mean_query'):
             raise ValueError('Invalid scoring_strategy')
+        if self.scoring_scope not in ('segment', 'frame'):
+            raise ValueError('Invalid scoring_scope')
+        if self.scoring_scope == 'frame' and (self.scoring_strategy != 'frame_mean_query'
+                                             or self.compression_granularity != 'head'):
+            raise ValueError('scoring_scope=frame requires frame_mean_query + head')
+        if type(self.frame_score_batch_size) is not int or self.frame_score_batch_size < 1:
+            raise ValueError('frame_score_batch_size must be a positive integer')
         if self.scoring_strategy == 'frame_mean_query':
             object.__setattr__(self, 'summarizer_model_path', None)
         value = self.summarizer_model_path
@@ -139,6 +148,9 @@ class StreamingRuntime:
         cutoff = self.last_timestamp if cutoff is None else float(cutoff)
         if cutoff < self.last_timestamp:
             raise ValueError('Question cutoff precedes encoded frames; historical snapshots are unavailable')
+        if self.config.scoring_scope == 'frame':
+            # Commit a partial scoring batch before taking the question's view.
+            self._call('close_segment')
         self.question_id += 1
         question_id = self.question_id
         cache = self.model.cache

@@ -11,6 +11,10 @@ def add_suprkv_arguments(parser):
                         default=None, help='layer: original shared-head masks (default); head: per-KV-head masks and compact storage.')
     parser.add_argument('--scoring_strategy', '--scoring-strategy', choices=('summary', 'frame_mean_query'),
                         default=None, help='KV token scoring Query source (default: summary).')
+    parser.add_argument('--frame_score_batch_size', '--frame-score-batch-size', type=int, default=None,
+                        help='Frames per scoring/compression batch with --scoring-scope frame (default: 1).')
+    parser.add_argument('--scoring_scope', '--scoring-scope', choices=('segment', 'frame'), default=None,
+                        help='segment: original segmentation and segment-wide scoring (default); frame: independent frame scoring, requires frame_mean_query + head.')
     # None preserves StreamingConfig defaults; forward only explicitly specified arguments.
     add_option(parser, '--model_path', '--model-path', type=str, default=None,
                         help='Model path or Hugging Face ID, overriding the preset path for --model.')
@@ -40,6 +44,8 @@ def config_overrides(args):
     values = dict(model_path=args.model_path, budget_tokens=args.budget_tokens,
                   scoring_strategy=getattr(args, 'scoring_strategy', None),
                   compression_granularity=getattr(args, 'compression_granularity', None),
+                  frame_score_batch_size=getattr(args, 'frame_score_batch_size', None),
+                  scoring_scope=getattr(args, 'scoring_scope', None),
                   summarizer_model_path=getattr(args, 'summarizer_model_path', None),
                   recent_frames=args.recent_frames, group_size=args.group_size,
                   ema_alpha=args.ema_alpha, min_segment_frames=args.min_segment_frames,
@@ -63,7 +69,7 @@ class SuPrKVMethod(Method):
     name = 'suprkv'
     defaults = dict(retrieve_size=64)
     options = ('retrieve_size', 'model_path', 'summarizer_model_path', 'scoring_strategy', 'compression_granularity', 'device', 'budget_tokens', 'recent_frames',
-               'group_size', 'ema_alpha', 'min_segment_frames', 'max_segment_frames',
+               'group_size', 'ema_alpha', 'min_segment_frames', 'max_segment_frames', 'frame_score_batch_size', 'scoring_scope',
                'summary_max_new_tokens', 'max_new_tokens', 'packed_attention')
 
     def add_arguments(self, parser):
@@ -83,7 +89,11 @@ class SuPrKVMethod(Method):
         if getattr(args, 'compression_granularity', None) == 'head':
             directory += '/compression_head'
         if getattr(args, 'scoring_strategy', None) == 'frame_mean_query':
-            return directory + '/scoring_frame_mean_query'
+            directory += '/scoring_frame_mean_query'
+            if getattr(args, 'compression_granularity', None) == 'head' and getattr(args, 'scoring_scope', None) == 'frame':
+                batch_size = getattr(args, 'frame_score_batch_size', None)
+                directory += f'/per_frame/batch_{1 if batch_size is None else batch_size}'
+            return directory
         path = getattr(args, 'summarizer_model_path', None)
         if path is not None:
             path = path.strip()

@@ -39,20 +39,44 @@ Python 使用 `StreamingConfig(compression_granularity='head')`；默认值为 `
 python -m video_qa.run_eval --method suprkv --dataset rvs_ego --scoring-strategy frame_mean_query
 ```
 
-流式编码时，每层将每帧图片 token 的 RoPE 前 Q 沿 token 维以 FP32 求均值，保留 heads，
-段结束后按帧序组成 `[F, Hq, D]` Query，与本段全部原始 RoPE 前 K 按原生 GQA 对应计算 `QKᵀ / √head_dim`。
-每个帧 Query、每个 head 独立计算与整段全部 Key token 的缩放点积，不做 softmax、不施加因果 mask；
-默认 `layer` 沿 Query 帧维 F 和全部 head 维求均值，得到 `[F, N]` 分数；`head` 只沿 F 和同一 KV head 对应的 Q head 组求均值，得到 `[F, Hkv, N]` 分数。点积前不合并帧或 head。
+流式编码时，每层将每帧图片 token 的 RoPE 前 Q 沿 token 维以 FP32 求均值，保留 heads。
+`--scoring-scope {segment,frame}`（别名 `--scoring_scope`）选择评分范围，默认 `segment`。
+`segment` 保留原流程：视觉 EMA 和最少/最大帧数确定边界，段内每个帧 Query 对整段 Key 评分，
+再沿 Query 帧维平均；`head` 仅聚合同一 KV head 对应的 GQA Query heads，`layer` 聚合全部 heads。
+设置 `--scoring-scope frame` 启用本次新增的逐帧实现，仅支持 `frame_mean_query + head`。
+第 f 帧的平均 Query 只与第 f 帧的原始 RoPE 前 K
+计算 `QKᵀ / √head_dim`，点积后仅平均同一 KV head 对应的 GQA Query heads，得到 `[F, Hkv, N]` 分数。
+不做 softmax，不施加因果 mask，也不聚合其他帧的 Query。逐帧模式不创建或运行视觉分段器，
+`ema_alpha`、`min_segment_frames`、`max_segment_frames` 不参与处理时机选择。
+
+逐帧模式默认每编码一帧立即评分、分区和检查预算。`--frame-score-batch-size N`（别名
+`--frame_score_batch_size`）可累积 N 帧后统一处理；segment 模式忽略此参数：
+
+```bash
+# 原 segment 分段与评分（默认）
+bash run_suprkv.sh --scoring_strategy frame_mean_query --compression-granularity head --scoring-scope segment
+# 新逐帧评分，累积 4 帧提交
+bash run_suprkv.sh --scoring_strategy frame_mean_query --compression-granularity head --scoring-scope frame --frame-score-batch-size 4
+```
+
+Python 使用 `StreamingConfig(scoring_strategy='frame_mean_query', compression_granularity='head',
+scoring_scope='frame', frame_score_batch_size=4)`。批量处理仍逐帧独立评分；N 只控制提交频率，不改变评分公式。视频编码仍逐帧进行。
+N 越大，临时 Q/K 内存与预算检查间隔越大；压缩时机不同也可能影响最终保留的 KV。
+不足 N 帧的尾批通过 `close_segment()` 提交，`StreamingRuntime.ask()` 会在问答快照前自动提交尾批。
+提交事件为 `frame_batch_commit`，`scoring_scope="frame"`；兼容字段 `segment_id` 仅作为批次编号。
+
+`frame_mean_query + layer` 保留原有分段评分：段结束后，每个帧 Query 与整段 Key 计算点积，
+沿 Query 帧维及全部 head 维求均值，得到 `[F, N]` 分数。`summary` 也保留原分段流程。
 实际分类使用 softmax 前分数：`layer` 以每层每帧的 token 均分为阈值，`head` 以每层每帧每个 KV head 自己的 token 均分为阈值；等于均分归为高分。
 量化、预算、recent 保护和问答检索策略保持原有行为。
 
 该策略不加载摘要模型、不生成摘要、不提取文字 Q，忽略 `summarizer_model_path`，
-不检查该路径的 checkpoint。分段保留视觉 EMA 与最少/最大帧数规则，移除摘要上下文容量限制。
-开放段仅保留临时帧 Query 均值和评分 Key，不保留摘要用视觉特征；Query 均值计入工作内存，
-不进入持久 KV 预算或问答 snapshot，段提交、失败或重置后释放。
-评分失败沿用全段高分保留，OOM 和取消传播到调用方。
+不检查该路径的 checkpoint。待处理帧仅保留临时帧 Query 均值和评分 Key，不保留摘要用视觉特征；
+Query 均值计入工作内存，不进入持久 KV 预算或问答 snapshot，提交或重置后释放。
+评分失败沿用当前批次或当前段全高分保留，OOM 和取消传播到调用方。
 
 评测结果在原预算目录下追加 `scoring_frame_mean_query/`，不与默认 summary 策略混用。
+逐帧 `head` 模式进一步追加 `per_frame/batch_N/`，隔离旧版分段评分及不同提交频率的结果。
 普通观察页提供 softmax 前后热图，但其完整视频 prefill 与流式压缩上下文不同，分数可能不同。
 
 ## 独立摘要模型
@@ -263,17 +287,18 @@ python tests/benchmark_suprkv_accounting.py \
 
 ### Head + frame_mean_query 的评分与分区融合
 
-CUDA/Triton 上，`head + frame_mean_query` 自动使用 `scoring_kernels.py`：
+CUDA/Triton 上，`head + frame_mean_query` 自动使用 `scoring_kernels.py`，按 `scoring_scope` 选择段内交叉评分或逐帧独立评分：
 
-- 按目标帧、KV head 和 token tile 计算每个帧 Query/GQA head 的 FP32 点积，
-  块内完成缩放与均值归约，只输出 `[F, Hkv, N]` 分数。不提前平均 Query，
-  不写出 `[Hkv, G, F, F*N]` logits，也不创建整段 FP32 K 副本。
+- 逐帧模式按目标帧、KV head 和 token tile 计算本帧 Query/GQA head 的 FP32 点积，
+  块内完成缩放与 GQA 组均值归约，只输出 `[F, Hkv, N]` 分数。
+  不提前平均 Query，不写出完整 logits，也不创建整批 FP32 K 副本。
+  Segment 模式保留原实现，逐帧 Query 与整段 Key 计算点积并平均 Query 帧维。
 - 每层全部帧/head 批量执行阈值比较、稳定前缀和与计数，计数只回传一次。
   随后一个 scatter kernel 写出高低分 K/V 和原始索引，不调用逐帧 `nonzero`。
   各帧的高低分区仍分别拥有精确大小的独立存储，保留预算释放与快照语义。
 - 评分中的输入/输出有限值检查合并进 kernel，错误标记每层读取一次；
   加上分区计数读取，正常提交每层有两次必要的设备结果回传。
-  任意层评分失败仍整段按原始高分区提交，OOM 继续传播。
+  任意层评分失败仍整批按原始高分区提交，OOM 继续传播。
 
 评分支持 FP16/BF16/FP32 KV、head dimension ≤ 256；批量分区支持每帧
 1–4096 token 的连续原始 KV。CPU、不支持的 dtype/形状或需要梯度的输入

@@ -20,6 +20,11 @@ function renderCompressionResult(result, url, cached) {
   const summarizer = e.config?.summarizer_model_path ?? null;
   const frameQuery = e.config?.scoring_strategy === 'frame_mean_query';
   $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 评分：${frameQuery ? '帧均值 Query' : 'Summary Query'} · 删除粒度：${e.config?.compression_granularity === 'head' ? '逐 KV head' : '层级共享（原流程）'} · 摘要配置：${frameQuery ? '未启用' : (summarizer ?? '主模型')} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
+  const scoringScope = e.config?.scoring_scope ?? afterStats.scoring_scope ?? 'segment';
+  if (frameQuery && e.config?.compression_granularity === 'head') {
+    $('compressionLabel').textContent += scoringScope === 'frame' ?
+      ` · 逐帧独立评分 / 每 ${e.config.frame_score_batch_size ?? 1} 帧批处理` : ' · Segment 分段评分';
+  }
   $('compressionJson').hidden = false; $('compressionJson').href = url;
   const memory = e.memory, saved = memory.persistent_kv;
   const gpu = e.method.cache_device.startsWith('cuda');
@@ -425,6 +430,11 @@ function renderCompressionLive(job) {
   $('compressionStateFollowLabel').hidden=false;
   const mode = update.point.compression_granularity === 'head' ? '逐 KV head' : '层级共享（原流程）';
   $('compressionLabel').textContent=`实时计算 · ${update.side==='after'?`压缩后 · ${mode}`:'原精度 基线（不压缩）'} · 完成帧 ${update.point.frame_index+1}/${job.preview.frames.length}`;
+  if (update.side === 'after' && update.point.scoring_scope === 'frame') {
+    $('compressionLabel').textContent += ` · 每 ${update.point.frame_score_batch_size ?? 1} 帧批处理`;
+  } else if (update.side === 'after' && update.point.scoring_scope === 'segment') {
+    $('compressionLabel').textContent += ' · Segment 分段评分';
+  }
   if($('compressionStateFollow').checked) followLatestCacheState(); else renderCompressionFrameStates();
 }
 function finishCompressionLive(status) {

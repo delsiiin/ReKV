@@ -39,6 +39,15 @@
       <p class="field-note">压缩前固定保留原精度 KV；此选项只作用于压缩后。两侧使用相同帧和问题，对比内存、耗时与回答。</p>
       <label for="compressionScoring">Token 评分策略</label>
       <select id="compressionScoring"><option value="summary">Summary Query（默认）</option><option value="frame_mean_query">帧均值 Query（跳过摘要）</option></select>
+      <div id="compressionScoringScopeControls" hidden>
+        <label for="compressionScoringScope">评分范围</label>
+        <select id="compressionScoringScope"><option value="segment">Segment 分段评分（原流程，默认）</option><option value="frame">逐帧独立评分（支持 N 帧批处理）</option></select>
+        <p class="field-note">Segment 按视觉变化和帧数分段，段内 Query 对整段 Key 评分；逐帧模式不分段，每帧 Query 只评分本帧 Key。</p>
+      </div>
+      <div id="compressionFrameBatchControls" hidden>
+        <label for="compressionFrameBatchSize">评分批处理帧数 N</label><input id="compressionFrameBatchSize" type="number" value="1" min="1" step="1" required disabled>
+        <p class="field-note">每帧 Query 只评分本帧 Key。累积 N 帧后统一评分和检查压缩预算，尾部不足 N 帧也会处理。N 越大，临时内存和预算检查间隔越大；此模式不使用 EMA 或分段帧数。</p>
+      </div>
       <label for="compressionSummarizer">摘要模型</label>
       <select id="compressionSummarizer"><option value="main">主模型（默认）</option><option value="llava-hf/llava-onevision-qwen2-0.5b-ov-hf">LLaVA-OneVision 0.5B</option><option value="custom">自定义 OneVision</option></select>
       <div id="compressionSummarizerCustom" hidden><label for="compressionSummarizerPath">模型 ID 或本地目录</label><input id="compressionSummarizerPath" type="text" disabled placeholder="组织/模型名 或 /path/to/model"></div>
@@ -51,7 +60,7 @@
       <label for="compressionBudget">Memory budget / FP16 token 数</label><input id="compressionBudget" type="number" value="1024" min="1" max="10000000" required>
       <div class="field-pair"><div><label for="compressionRecent">Recent 保护帧数</label><input id="compressionRecent" type="number" value="2" min="1" max="128" required></div><div><label for="compressionTopk">检索帧数上限</label><input id="compressionTopk" type="number" value="64" min="1" max="512" required></div></div>
       <label for="compressionMaxSegment">每段最多帧数</label><input id="compressionMaxSegment" type="number" value="32" min="1" max="128" required>
-      <p class="field-note">同一问答模型顺序运行原精度与压缩缓存；使用上方 EMA 参数，仅 Summary 策略使用摘要参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
+      <p class="field-note">同一问答模型顺序运行原精度与压缩缓存；逐帧独立评分使用评分批处理帧数，Segment 模式使用上方 EMA 和分段帧数。仅 Summary 策略使用摘要参数。问题在最后一帧编码完成后提出，不使用参考答案。</p>
     </div>
     <label class="check-label"><input id="autoRun" type="checkbox" checked> 切换样本后自动计算</label>
     <button id="run" class="primary" type="submit">生成观察数据 <span>↗</span></button>
@@ -67,7 +76,7 @@
   <div id="compressionResults" hidden>
     <div class="result-toolbar"><div><span class="section-label">KV COMPRESSION / PAIRED RUN</span><span id="compressionLabel" class="muted"></span></div><a id="compressionJson" class="text-button" download="kv-compression-comparison.json" hidden>↓ 完整对照 JSON</a></div>
     <div id="compressionCards" class="summary-grid"></div>
-    <section class="panel"><div class="panel-heading"><div><h2>压缩前后显存</h2><p id="compressionMemoryNote" class="muted"></p></div></div><div id="compressionMemoryTable" class="compression-scroll"></div><div id="compressionMemoryChart"></div><label for="compressionFrame">选择输入进度</label><input id="compressionFrame" type="range" min="0" max="0" value="0"><p id="compressionFrameReadout" class="spatial-readout" aria-live="polite"></p><p class="tiny">持久 KV 统计去重后的张量 storage，含量化参数与位置索引；CUDA 分配量包含模型和工作缓冲。峰值单独测量。预算仅在段提交完成后强制满足。</p></section>
+    <section class="panel"><div class="panel-heading"><div><h2>压缩前后显存</h2><p id="compressionMemoryNote" class="muted"></p></div></div><div id="compressionMemoryTable" class="compression-scroll"></div><div id="compressionMemoryChart"></div><label for="compressionFrame">选择输入进度</label><input id="compressionFrame" type="range" min="0" max="0" value="0"><p id="compressionFrameReadout" class="spatial-readout" aria-live="polite"></p><p class="tiny">持久 KV 统计去重后的张量 storage，含量化参数与位置索引；CUDA 分配量包含模型和工作缓冲。峰值单独测量。预算在每个评分批次或段提交完成后强制满足。</p></section>
     <section id="compressionFrameStatesPanel" class="panel">
       <div class="panel-heading"><div><h2>每帧缓存状态</h2><p id="compressionFrameStatesMeta" class="muted"></p></div><button id="compressionFrameStatesCsv" type="button" class="text-button">↓ 当前状态 CSV</button></div>
       <div class="cache-state-controls"><label for="compressionStateSide">缓存版本<select id="compressionStateSide"><option value="after">压缩后</option><option value="before">压缩前 · 原精度</option></select></label><label for="compressionStateLayer">语言模型层<select id="compressionStateLayer"><option value="all">全部层 · 每层平均</option></select></label><button id="compressionStateFinal" class="text-button" type="button">查看最终状态</button></div>
