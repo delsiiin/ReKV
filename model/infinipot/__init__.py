@@ -1,1 +1,1 @@
-"""Source-faithful InfiniPot-V adaptation; model dependencies load on demand."""
+"""InfiniPot-V Qwen adaptation and OneVision extension; lazy model imports."""

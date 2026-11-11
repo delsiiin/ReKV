@@ -1,4 +1,4 @@
-"""Existing annotations/CSV scoring with source Qwen sampling and prompts."""
+"""Existing annotations/CSV scoring with model-specific video preprocessing."""
 import math
 import re
 
@@ -57,9 +57,11 @@ class InfiniPotVQA(BaseVQA):
                 if cutoff != previous_cutoff:
                     self.qa_model.set_video(load_video(
                         video_sample['video_path'], sample_fps=self.sample_fps,
-                        max_frames=self.qa_model.config.max_frames_num, end_time=cutoff))
+                        max_frames=self.qa_model.config.max_frames_num, end_time=cutoff,
+                        **getattr(self.qa_model, 'video_loading_options', {})))
                     previous_cutoff = cutoff
-                # Every question gets a fresh DynamicCache, as in the source.
+                # Each question has isolated generation state. Both runtimes
+                # reuse video prefill while this visible prefix is unchanged.
                 self.record_answer(video_sample, sample)
         finally:
             self.qa_model.reset()

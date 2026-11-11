@@ -3,6 +3,7 @@ from dataclasses import asdict, fields
 import math
 
 from model.infinipot.config import InfiniPotConfig
+from model.video_backbone import model_family
 from video_qa.model_paths import MODEL_PATHS
 from .common import Method, add_option
 
@@ -32,8 +33,8 @@ class InfiniPotMethod(Method):
                    help='Explicit override of the source generation limit (300).')
 
     def validate(self, args):
-        if not args.model.startswith('qwen2_5_vl_'):
-            raise ValueError('infinipot supports qwen2_5_vl_3b, qwen2_5_vl_7b and qwen2_5_vl_72b')
+        if model_family(args.model) not in ('qwen2_5_vl', 'onevision'):
+            raise ValueError('infinipot supports Qwen2.5-VL and LLaVA-OneVision presets')
         self.config(args)
         if not math.isfinite(args.sample_fps) or args.sample_fps <= 0:
             raise ValueError('sample_fps must be finite and positive')
@@ -50,9 +51,12 @@ class InfiniPotMethod(Method):
         return f'results/infinipot/{args.model}/{dataset}/{setting}/fps_{fps:g}'
 
     def load(self, args):
-        from model.infinipot.runtime import InfiniPotRuntime
-        runtime = InfiniPotRuntime.load(args.model_path or MODEL_PATHS[args.model], self.config(args),
-                                       max_new_tokens=getattr(args, 'max_new_tokens', None))
+        if model_family(args.model) == 'onevision':
+            from model.infinipot.onevision import InfiniPotOneVisionRuntime as Runtime
+        else:
+            from model.infinipot.runtime import InfiniPotRuntime as Runtime
+        runtime = Runtime.load(args.model_path or MODEL_PATHS[args.model], self.config(args),
+                               max_new_tokens=getattr(args, 'max_new_tokens', None))
         return runtime, runtime.processor
 
     def analyzer_kwargs(self, args):

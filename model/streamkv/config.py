@@ -17,3 +17,12 @@ class StreamKVConfig:
     retrieve_local: bool = True
     retrieve_local_size: int = 8
     retrieve_chunk_size: int = 1
+    budget_tokens: int | None = None
+
+    def __post_init__(self):
+        if self.budget_tokens is not None and (
+            isinstance(self.budget_tokens, bool)
+            or not isinstance(self.budget_tokens, int)
+            or self.budget_tokens <= 0
+        ):
+            raise ValueError('budget_tokens must be a positive integer')

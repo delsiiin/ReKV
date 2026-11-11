@@ -237,7 +237,7 @@ class RuntimeAndDatasetTests(unittest.TestCase):
                 InfiniPotConfig(**kwargs)
         with self.assertRaisesRegex(ValueError, 'TaR'):
             InfiniPotConfig(compress_frame_num=1).validate_budget(128)
-        for flags in ([], ['--model', 'qwen2_5_vl_7b', '--retrieve_size', '32']):
+        for flags in (['--model', 'video_llava_7b'], ['--model', 'qwen2_5_vl_7b', '--retrieve_size', '32']):
             args = run_eval.build_parser().parse_args(['--method', 'infinipot', '--dataset', 'mlvu', *flags])
             with self.assertRaises(ValueError):
                 validate_arguments(args, get_method('infinipot'))

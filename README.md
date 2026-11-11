@@ -53,14 +53,23 @@ python -m video_qa.run_eval --method streamkv --model llava_ov_7b --dataset mlvu
 ```
 
 `infinipot` adapts the supplied InfiniPot-V implementation to all seven dataset
-routes using the Qwen2.5-VL presets. Its default release profile uses 32 temporal
-grids per block, retains 24, samples up to 768 raw frames at 2 FPS, and generates
-up to 300 tokens. RVS questions replay only their visible video prefix.
+routes using Qwen2.5-VL and LLaVA-OneVision presets. The Python CLI defaults use
+32 temporal units per block and retain 24: Qwen units are temporal grids,
+whereas OneVision units are sampled frames (normally 196 tokens each). Both
+sample up to 768 raw frames at 2 FPS and generate up to 300 tokens. RVS questions
+use only their visible video prefix. Both models reuse video prefill across
+questions sharing that prefix, in block and native video generation paths, and
+clone KV for each answer. One extra video KV snapshot remains on the model
+device; a new prefix rebuilds it. Native decoding retains its generation settings.
+The shell script supplies its own budget
+settings; append explicit overrides when comparing models.
 See [algorithm flow, source parameters, and validation](model/infinipot/README.md).
 
 ```bash
 bash run_infinipot.sh --dataset mlvu --max_samples 5
 bash run_infinipot.sh --dataset rvs_movie --max_samples 1
+# OneVision: 41 * 196 = 8036 visual KV tokens, within an 8192-token budget.
+bash run_infinipot.sh --model llava_ov_7b --block_size 41 --compress_frame_num 31
 ```
 
 ## Preparation

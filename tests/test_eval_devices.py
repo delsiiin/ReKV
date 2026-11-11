@@ -48,8 +48,8 @@ class EvalDeviceTests(unittest.TestCase):
     def test_every_method_and_model_assigns_one_selected_gpu_per_worker(self):
         for method_name, method in METHODS.items():
             for model in MODEL_PATHS:
-                family = {'streamkv': 'onevision', 'infinipot': 'qwen2_5_vl'}.get(method_name)
-                if family and model_family(model) != family:
+                allowed = {'streamkv': ('onevision',), 'infinipot': ('qwen2_5_vl', 'onevision')}.get(method_name)
+                if allowed and model_family(model) not in allowed:
                     continue
                 args = run_eval.build_parser().parse_args([
                     '--method', method_name, '--model', model, '--dataset', 'mlvu',
@@ -104,8 +104,8 @@ class SingleDeviceLoadingTests(unittest.TestCase):
         }
         for method_name, method in METHODS.items():
             for family, (model_class, processor_class, rekv_class) in backbones.items():
-                required = {'streamkv': 'onevision', 'infinipot': 'qwen2_5_vl'}.get(method_name)
-                if required and required != family:
+                allowed = {'streamkv': ('onevision',), 'infinipot': ('qwen2_5_vl', 'onevision')}.get(method_name)
+                if allowed and family not in allowed:
                     continue
                 preset = {'onevision': 'llava_ov_7b', 'video_llava': 'video_llava_7b',
                           'qwen2_5_vl': 'qwen2_5_vl_7b'}[family]

@@ -1,8 +1,9 @@
 # StreamKV 源码执行逻辑移植
 
-`--method streamkv` 按本仓库提供的 `StreamKV/` 源代码执行。之前适配版的精确预算分配、
+`--method streamkv` 默认按提供的 `StreamKV/` 源代码执行。之前适配版的精确预算分配、
 重新计算全部相邻相似度、增量视频缓存和同步 CPU KV 管理器已移除。
 生产推理与源代码一样需要 CUDA；当前模型 API 适配针对 Transformers 5.5.4 的 LLaVA-OneVision。
+新增可选 `--budget_tokens` 历史 KV 总预算模式，具体语义见下文；未设置时仍使用原比例压缩。
 
 ## 源码对应关系
 
@@ -10,9 +11,10 @@
 | --- | --- | --- |
 | `abstract_streamkv.py` | `StreamKV/model/abstract_streamkv.py` | 文件内容原样保留 |
 | `cache.py` | `StreamKV/model/attention/kv_cache_manager.py` | 仅更换注意力工具的导入路径 |
-| `attention.py` | `StreamKV/model/attention/streamkv_attention.py` | 仅更换导入路径 |
+| `attention.py` | `StreamKV/model/attention/streamkv_attention.py` | 更换导入路径，允许注入预算模式缓存类；默认类不变 |
 | `generation.py` | `StreamKV/model/llava_onevision_streamkv.py` | 原样提取 `question_answering` 方法 |
-| `runtime.py` | 原 OneVision 模型/patch 接口 | 适配 Transformers 5 的属性位置、decoder 返回值及引导 embedding 拼接 |
+| `runtime.py` | 原 OneVision 模型/patch 接口 | 模型 API 适配及可选预算模式入口 |
+| `budget.py` | 新增实验变体 | 对全部历史帧块引导评分、按预算保留并重建检索索引 |
 | `video_qa/streamkv_sampling.py` | 原 `StreamKVStreamVQA.load_video` | 原样提取视频/NPY/帧目录采样方法 |
 | `video_qa/streamkv_stream_vqa.py` | 原流式评测 | 保留逐问题重算前缀；记录写入当前 BaseVQA |
 | `video_qa/streamkv_offline_vqa.py` | 原离线评测 | 完整视频一次编码，然后依次回答 |
@@ -55,6 +57,7 @@ Python CLI 默认值与参考 `video_qa/run_eval.py` / `video_qa/base.py` 一致
 | `max_segment_size` | 64 | 64 |
 | `segment_theta` | 0.95 | 0.99 |
 | `compression_ratio` | 1 | 0.6 |
+| `budget_tokens` | None（关闭） | 未设置 |
 | `compress_temp` | 0 | 1 |
 | `retrieve_temp` | 0 | 0.5 |
 | `n_local` | 15000 | 15000 |
@@ -70,6 +73,27 @@ Python CLI 默认值与参考 `video_qa/run_eval.py` / `video_qa/base.py` 一致
 `n_init`、`n_encode` 来自原提示的 token 数；`block_size=exc_block_size=196`、
 `max_cached_block=128`、`fattn=True`、`pin_memory=True`、`async_global_stream=True`。
 不再提前要求 `n_local` 容纳最大段及摘要；保留源码对实际段和执行块的断言。
+
+### 按 budget 压缩
+
+```bash
+bash run_streamkv.sh --budget_tokens 8192
+python -m video_qa.run_eval --method streamkv --dataset mlvu --budget-tokens 8192
+```
+
+Python 接口为 `StreamKVConfig(budget_tokens=8192)`，传给 `StreamKVRuntime.load(..., config)`。
+设置预算后覆盖 `compression_ratio` 和 `compress_temp`，包括脚本中显式给出的值。
+
+预算限制**每层整个视频的历史 KV 归档 token 数**，不是每段配额或检索配额。
+完整帧块为 196 tokens，预算向下取整：8192 最多保留 41 块，即每层 8036 tokens；
+预算至少为一块。段摘要同样占一块并参与评分，不保证永久保留。
+每段完成后，用当前引导提示 Q 对全部历史块和新块统一评分，逐层保留最高分的预算内块，
+再恢复时间顺序并更新 CPU KV、代表向量、GPU 缓存索引与段映射。
+各层都遵守同一个上限，预算模式不使用原比例模式的跨层自适应配额。
+
+这个上限在每段编码结束后成立。初始提示、`n_local` 编码窗口、GPU 工作缓冲区、
+问题生成缓存及编码当前段的临时峰值不计入预算，因此它不是进程总内存或显存上限。
+流式评测仍逐问题重算可见前缀。预算值写入结果元数据和目录的 `_budget<N>` 后缀。
 
 ## 运行
 
@@ -104,11 +128,14 @@ python -m video_qa.run_eval --method streamkv --dataset mlvu --max_samples 5
 
 ```bash
 python -m unittest discover -s tests -p 'test_streamkv.py' -v
+python -m unittest discover -s tests -p 'test_streamkv_budget.py' -v
 ```
 
 测试直接读取 `StreamKV/`：检查核心源码一致性、原函数差分、FP16/FP32 分段、
 视觉编码批次边界、FP16 Q 均值、逐层预算、KV 块、问题生成、前缀重算、
 两套默认参数以及调度/采样。
+`test_streamkv_budget.py` 不依赖上游源码目录，覆盖预算参数传递、连续段压缩、摘要计费、
+帧块取整、全历史评分、缓存索引重映射、压缩后问答以及默认比例路径兼容性。
 小型随机 OneVision 模型测试使用仅存在于测试中的 CPU CUDA-plumbing 替身：
 仅替换设备断言、分配和 stream/event 操作，源算法及缓存逻辑保持不变。
 另有无此替身的 CUDA 对照测试，在无 GPU 时跳过。没有真实权重跨旧版/新版 Transformers

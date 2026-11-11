@@ -1,4 +1,5 @@
 """Qwen2.5-VL runtime retaining the released InfiniPot-V execution flow."""
+import copy
 from dataclasses import asdict
 from types import MethodType
 
@@ -8,6 +9,7 @@ from model.loading import load_pretrained
 from .config import InfiniPotConfig
 from .core import InfiniPotCore
 from .rope import source_rope_index
+from .reuse import cached_generate_inputs, clear_prefill_cache
 
 
 def _reference_rope(self, input_ids, mm_token_type_ids=None, **kwargs):
@@ -40,13 +42,18 @@ class InfiniPotRuntime(InfiniPotCore):
 
     def reset(self):
         self.video = None
+        self._clear_prefill_cache()
         self.model.model.rope_deltas = None
+
+    def _clear_prefill_cache(self):
+        clear_prefill_cache(self)
 
     def close(self):
         self.reset()
         self.model.model.get_rope_index = self._original_rope
 
     def set_video(self, video):
+        self._clear_prefill_cache()
         self.video = video
 
     def get_prompt(self, question, mc=False):
@@ -80,11 +87,35 @@ class InfiniPotRuntime(InfiniPotCore):
     @torch.inference_mode()
     def generate(self, inputs):
         # Fix the source's undefined MAX_GEN_TOKENS global to the class constant.
-        inputs.pop('second_per_grid_ts', None)
-        generated = self.model.generate(**inputs, max_new_tokens=self.MAX_GEN_TOKENS)
+        inputs = {k: v for k, v in inputs.items() if k != 'second_per_grid_ts'}
+        prepared = cached_generate_inputs(self, inputs, self.model.config.video_token_id)
+        generated = self.model.generate(**prepared, max_new_tokens=self.MAX_GEN_TOKENS)
         return self.processor.batch_decode(
             [out[len(ids):] for ids, out in zip(inputs['input_ids'], generated)],
             skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+    def _block_wise_prefill(self, inputs, input_ids, past_key_values, system_size, inst_size,
+                            token_per_frame, vision_length, total_frames):
+        # The suffix changes the source's generation start position. Recompute
+        # full positions per question; only prefix positions and KV are reusable.
+        positions, _ = source_rope_index(
+            self.model.model, input_ids, video_grid_thw=inputs['video_grid_thw'])
+        end = system_size + vision_length
+        prefix_ids, prefix_positions = input_ids[:, :end], positions[..., :end]
+        settings = tuple(getattr(self, name) for name in asdict(self.config))
+        if (self._prefill_mode != 'block' or self._prefill_config != settings
+                or not torch.equal(self._prefill_prefix_ids, prefix_ids)
+                or not torch.equal(self._prefill_positions, prefix_positions)):
+            self._clear_prefill_cache()
+            cache, positions = super()._block_wise_prefill(
+                inputs, input_ids, past_key_values, system_size, inst_size,
+                token_per_frame, vision_length, total_frames)
+            self._prefill_prefix_ids = prefix_ids.clone()
+            self._prefill_positions = prefix_positions.clone()
+            self._prefill_config = settings
+            self._prefill_cache = cache
+            self._prefill_mode = 'block'
+        return copy.deepcopy(self._prefill_cache), positions
 
     @torch.inference_mode()
     def question_answering(self, input_text, max_new_tokens=None):

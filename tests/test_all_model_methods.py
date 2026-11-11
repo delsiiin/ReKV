@@ -44,8 +44,8 @@ class AllModelMethodsTests(unittest.TestCase):
                         '--method', method_name, '--model', name, '--dataset', 'rvs_ego'])
                     worker = base.build_parser(method_name).parse_args([
                         '--model', name, '--anno_path', 'unused', '--save_dir', 'unused'])
-                    required_family = {'streamkv': 'onevision', 'infinipot': 'qwen2_5_vl'}.get(method_name)
-                    if required_family and model_family(name) != required_family:
+                    allowed = {'streamkv': ('onevision',), 'infinipot': ('qwen2_5_vl', 'onevision')}.get(method_name)
+                    if allowed and model_family(name) not in allowed:
                         for parsed in (args, worker):
                             with self.assertRaises(ValueError):
                                 validate_arguments(parsed, method)
