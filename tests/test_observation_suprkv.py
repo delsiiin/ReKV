@@ -393,6 +393,20 @@ class CompressionModelTests(unittest.TestCase):
         torch.testing.assert_close(decoder(torch.tensor([[1, 2, 3]]), use_cache=False).last_hidden_state, native)
 
     @torch.inference_mode()
+    def test_offload_applies_only_to_compressed_pass_and_is_reported(self):
+        result = compare(self.observer, list(range(4)), self.frames, self.record,
+                         dict(self.params, offload_enabled=True), lambda *_: None, lambda: None)['compression_experiment']
+        self.assertEqual(result['status'], 'complete', result['runs'])
+        self.assertTrue(result['config']['offload_enabled'])
+        self.assertTrue(result['method']['offload'])
+        before, after = result['runs']['before'], result['runs']['after']
+        self.assertFalse(before['cache']['offload_enabled'])
+        self.assertTrue(after['cache']['offload_enabled'])
+        self.assertTrue(all(point['offload_enabled'] for point in after['timeline']))
+        self.assertFalse(any(point['offload_enabled'] for point in before['timeline']))
+        self.assertEqual(result['memory']['cpu_offloaded']['after_bytes'], after['cache']['offloaded_tensor_bytes'])
+
+    @torch.inference_mode()
     def test_live_snapshots_preserve_segments_and_match_final_timeline(self):
         captured = {'before': [], 'after': []}
         def publish(side, point):

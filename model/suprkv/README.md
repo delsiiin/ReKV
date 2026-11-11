@@ -2,7 +2,7 @@
 
 Python 包为 `model.suprkv`，数据集评测入口为 `video_qa.run_eval --method suprkv`。`video_qa.suprkv_stream_vqa` 中的 `SuPrKVStreamVQA` 与原 `ReKVStreamVQA` 一样继承 `BaseVQA`，复用 `work()` 加载数据和模型、`analyze()` 遍历视频和保存 CSV。`video_qa.run_eval` 中的 `eval_rvs_ego` 和 `eval_rvs_movie` 分别实现各自的启动、合并和评分流程，并按 `--method` 选择 ReKV 或 SuPr-KV；测试与性能基准文件统一使用 `suprkv` 命名。
 
-采用 ReKV 单进程顺序执行方式的 GPU 常驻压缩后端（默认单模型，可选独立摘要模型），支持 `video_qa/model_paths.py` 的 `MODEL_PATHS` 中全部模型：LLaVA-OneVision、Video-LLaVA 和 Qwen2.5-VL。所有方法共用这一模型列表。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
+采用 ReKV 单进程顺序执行方式的压缩后端（默认 GPU 常驻，可选 CPU 卸载；默认单模型，可选独立摘要模型），支持 `video_qa/model_paths.py` 的 `MODEL_PATHS` 中全部模型：LLaVA-OneVision、Video-LLaVA 和 Qwen2.5-VL。所有方法共用这一模型列表。每个 worker 顺序处理视频和问题；数据集评测可以按 GPU 分片。原有 ReKV 评测命令不变。
 
 Video-LLaVA 通过 `--model video_llava_7b` 选择，复用现有的视觉特征和对话格式。
 原 checkpoint 每帧为 257 个 token；运行时根据视觉配置确定实际帧大小。
@@ -81,6 +81,33 @@ Query 均值计入工作内存，不进入持久 KV 预算或问答 snapshot，�
 评测结果在原预算目录下追加 `scoring_frame_mean_query/`，不与默认 summary 策略混用。
 逐帧 `head` 模式进一步追加 `per_frame/batch_N/`，隔离旧版分段评分及不同提交频率的结果。
 普通观察页提供 softmax 前后热图，但其完整视频 prefill 与流式压缩上下文不同，分数可能不同。
+
+## 整帧淘汰时的 CPU 卸载
+
+`--offload`（别名 `--offload-enabled`、`--offload_enabled`）启用 CPU 存档，默认关闭；
+`--no-offload` 可显式关闭。Python 配置为 `StreamingConfig(offload_enabled=True)`。
+
+```bash
+bash run_suprkv.sh --offload
+# 可与 layer/head、segment/frame 及 packed attention 组合
+bash run_suprkv.sh --offload --compression-granularity layer --scoring-scope frame
+```
+
+预算处理仍按“删除历史帧低分 token → 高分 KV 降一档 → LFU/FIFO 整帧淘汰”的顺序执行。
+开启卸载后，最后一步将该帧**当时剩余的压缩 KV**保存到 CPU，释放设备侧持久记录。
+压缩码、scale/offset、token 索引、head offsets、代表向量、时间戳及 RoPE 起点均保留；
+此前已删除的低分 token 不会恢复。sink、recent 帧仍受保护，不参与卸载。
+
+沿用 ReKV 的 CPU 保存、检索后回载方式：CUDA 模式下 CPU 载荷使用 pinned memory。
+问答快照同时包含常驻帧和 CPU 帧，先用代表向量排名，再仅将命中帧的当前层 KV 搬到设备，
+交给现有 dense/headwise/ragged/packed 检索路径处理。回载只服务当前问答，不将帧重新放入设备侧持久缓存。
+CPU 帧同样累计检索命中次数；reset 或关闭运行时会随缓存释放存档。
+
+`budget_tokens` 继续约束设备侧持久缓存，CPU 存档独立计量，目前没有 CPU 容量上限。
+`offloaded_bytes` 包含 CPU 存档元数据，`offloaded_tensor_bytes` 仅计其张量存储；
+`resident_frames` 与 `offloaded_frames` 分别记录两级帧数，`retained_frames` 为两者之和。
+`counts.evicted_frames` 仅统计永久删除，`counts.offloaded_frames` / `last_event.offloaded` 记录卸载。
+结果目录增加 `offload_cpu/`，观察页面提供同名开关并显示 CPU 占用及 `offloaded` 帧状态。
 
 ## 独立摘要模型
 
@@ -258,15 +285,17 @@ python tests/benchmark_suprkv_accounting.py \
 
 增量登记有写入成本：同次基准中单帧入库从 1.85 ms 增至 2.77 ms；连续重放仍减少约 95% 的总耗时。上述结果只度量合成管理路径，不含真实视频模型推理。
 
-主缓存和问题快照都留在调用方进程中；K/V、低位载荷、scale/offset、位置索引、代表向量、summary Query 和待总结视觉特征均保留在同一 GPU，压缩、检索、反量化不经过 CPU offload。CPU 只处理输入图片、帧 ID、时间、计数和文本等控制信息。降位和删除通过替换不可变记录完成；问答完成逐层检索后立即记录激活并释放快照，答案继续使用其选出的临时 GPU KV。不创建跨进程模型或缓存副本。检索代表向量使用量化前、RoPE 后的整帧 Key 均值，查询 Q 在各帧存储坐标中紧随该帧应用 RoPE 后评分；不使用分区暂存的 RoPE 前 K。删除部分 token 不改写代表向量。recent 占用 `topk` 名额，最终按时间拼接每层存活 token，并通过位置差旋转对齐 ReKV 滑动窗口注意力。
+主缓存和问题快照都留在调用方进程中。默认关闭 offload，K/V、低位载荷、scale/offset、位置索引、代表向量、summary Query 和待总结视觉特征均保留在同一 GPU；开启后，整帧淘汰的剩余 KV 与检索元数据保存在 CPU，命中时按层回载。降位和删除通过替换不可变记录完成；问答完成逐层检索后立即记录激活并释放快照，答案继续使用其选出的临时 GPU KV。不创建跨进程模型或缓存副本。检索代表向量使用量化前、RoPE 后的整帧 Key 均值，查询 Q 在各帧存储坐标中紧随该帧应用 RoPE 后评分；不使用分区暂存的 RoPE 前 K。删除部分 token 不改写代表向量。recent 占用 `topk` 名额，最终按时间拼接每层存活 token，并通过位置差旋转对齐 ReKV 滑动窗口注意力。
 
 输出字段：
 
 | 字段 | 含义 |
 | --- | --- |
 | `commits[].before_bytes/after_bytes` | 段提交时压缩前后的持久缓存字节 |
-| `memory.persistent_bytes` | 当前持久缓存占用 |
-| `memory.cache_device / offload_enabled` | 缓存设备 / 固定为 false |
+| `memory.persistent_bytes` | 设备侧受预算约束的持久缓存占用，不含 CPU 存档 |
+| `memory.cache_device / offload_enabled` | 主缓存设备 / 是否开启 CPU 卸载，默认 false |
+| `memory.offloaded_bytes / offloaded_tensor_bytes` | CPU 存档总字节（含元数据）/ 张量字节 |
+| `memory.resident_frames / offloaded_frames / retained_frames` | 设备常驻帧 / CPU 存档帧 / 两者合计 |
 | `runtime.inference_pid / model_instances / execution_mode` | 当前调用方 PID / 模型实例数（默认 1，独立摘要模式 2）/ sequential |
 | `memory.model_parameter_bytes` | 主模型及独立摘要模型参数的总字节数 |
 | `memory.summarizer_parameter_bytes / summarizer_model_path` | 独立摘要模型权重字节 / 模型路径；默认 0 / null |

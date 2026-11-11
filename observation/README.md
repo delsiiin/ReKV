@@ -372,7 +372,7 @@ Segment 模式及其他评分组合隐藏 N 设置，服务端按默认 1 归一
 
 对照使用**同一份按网页所选 dtype 加载的模型**，先完整运行原精度 缓存基线，再清理缓存并运行压缩路径。两边使用相同帧、初始化提示词、recent 编码窗口、top-k 检索和贪心生成参数。基线不做 summary、评分、量化或淘汰；它不是原注意力观察的完整上下文 prefill。实验在最后一张选中帧处提问，输入范围由采样参数决定，不自动以标注问题结束时间截断。
 
-该模式调用实际 `model/suprkv` 压缩算法：RoPE 后 K 按 channel 量化、V 按 token 量化，首次原精度→INT16→INT8，再按预算降位/删除；不 offload。结束或取消时恢复 observation 原生前向，原注意力及 segment 观察保持可用。相同 dtype 的任务复用模型，切换 dtype 时先释放旧模型再加载；每次对照的两侧共用同一问答模型。计算任务仍由原服务的单工作线程串行执行。
+该模式调用实际 `model/suprkv` 压缩算法：RoPE 后 K 按 channel 量化、V 按 token 量化，首次原精度→INT16→INT8，再按预算降位/删除；默认不 offload。勾选「将淘汰帧卸载到 CPU」（API：`offload_enabled=true`）后，整帧淘汰时将剩余压缩 KV 保存到 CPU，并继续参与检索，命中时按层回载；已删除的低分 token 不恢复。CPU 存档不计入设备侧压缩预算，目前没有容量上限，其张量字节单独展示。帧状态显示「CPU 卸载 · 可检索」，结果 JSON 记录 `offloaded_frames`、`offloaded_tensor_bytes`，缓存指纹区分开关。基线始终关闭卸载。结束或取消时恢复 observation 原生前向，原注意力及 segment 观察保持可用。相同 dtype 的任务复用模型，切换 dtype 时先释放旧模型再加载；每次对照的两侧共用同一问答模型。计算任务仍由原服务的单工作线程串行执行。
 
 首次 INT8 压缩在 CUDA kernel 内完成 INT16 code 计算与整数降位，不再分配中间 INT16 缓存；后续降位同时更新 code 与 scale。量化/降位/反量化的变长 token 数与步长使用运行时参数，避免各帧、各层保留长度不同而反复编译。完整压缩 attention 在本模式中仍默认关闭。本次已复现并修复量化和 KV 读取的变长形状编译回归；固定形状预热基准不能反映这项成本，复现方法见 `model/suprkv/README.md` 的变长回放说明。
 

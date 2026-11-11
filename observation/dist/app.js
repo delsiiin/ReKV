@@ -138,6 +138,7 @@ function parameters() {
     ...($('mode').value === 'compression' ? {
       scoring_strategy: $('compressionScoring').value,
       compression_granularity: $('compressionGranularity').value,
+      offload_enabled: $('compressionOffload').checked,
       ...($('compressionScoring').value === 'frame_mean_query' ?
         {scoring_scope: $('compressionScoringScope').value,
          ...($('compressionScoringScope').value === 'frame' ?
@@ -530,7 +531,7 @@ for (const [id, checked] of [['compressionQuestionsAll', true], ['compressionQue
     invalidate();
   });
 }
-['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionScoring', 'compressionGranularity', 'compressionScoringScope', 'compressionFrameBatchSize', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
+['dtype', 'maxFrames', 'fps', 'startTime', 'mode', 'maxAnswerTokens', 'videoWindowSize', 'segmentEnabled', 'emaAlpha', 'segmentMinFrames', 'summaryMaxTokens', 'compressionBudget', 'compressionRecent', 'compressionTopk', 'compressionMaxSegment', 'compressionScoring', 'compressionGranularity', 'compressionOffload', 'compressionScoringScope', 'compressionFrameBatchSize', 'compressionSummarizer', 'compressionSummarizerPath'].forEach(id => $(id).addEventListener('change', invalidate));
 $('layer').addEventListener('change', renderView);
 $('massScale').addEventListener('change', renderMassDistribution);
 ['showOverlay', 'overlayMode', 'overlayOpacity'].forEach(id => $(id).addEventListener('input', () => { if (state.result) { renderImageOverlay(); activateToken(state.selectedToken); } }));

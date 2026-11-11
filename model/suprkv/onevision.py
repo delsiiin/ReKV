@@ -130,7 +130,8 @@ class OneVisionEngine:
         self.cache = StreamingKVCache(sink, self.config['budget_tokens'], self.frame_tokens,
                                       self.config['recent_frames'], self.config['group_size'], profiler=self.profiler,
                                       dtype=self.dtype, compression_granularity=self.config.get('compression_granularity', 'layer'),
-                                      scoring_scope=self.config.get('scoring_scope', 'segment'))
+                                      scoring_scope=self.config.get('scoring_scope', 'segment'),
+                                      offload_enabled=self.config.get('offload_enabled', False))
         self.segmenter = (None if self.framewise_scoring else
                           OnlineSegmenter(self.config['ema_alpha'], self.config['min_segment_frames'],
                                           self.config['max_segment_frames']))

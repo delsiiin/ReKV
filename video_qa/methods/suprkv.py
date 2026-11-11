@@ -7,6 +7,10 @@ from .common import Method, add_option, add_retrieval_arguments, retrieval_size
 
 
 def add_suprkv_arguments(parser):
+    parser.add_argument('--offload', '--offload-enabled', '--offload_enabled', dest='offload_enabled',
+                        action='store_true', default=None,
+                        help='Keep evicted SuPrKV frames on CPU and reload selected KV for retrieval (default: disabled).')
+    parser.add_argument('--no-offload', dest='offload_enabled', action='store_false')
     parser.add_argument('--compression_granularity', '--compression-granularity', choices=('layer', 'head'),
                         default=None, help='layer: original shared-head masks (default); head: per-KV-head masks and compact storage.')
     parser.add_argument('--scoring_strategy', '--scoring-strategy', choices=('summary', 'frame_mean_query'),
@@ -48,6 +52,7 @@ def config_overrides(args):
                   compression_granularity=getattr(args, 'compression_granularity', None),
                   frame_score_batch_size=getattr(args, 'frame_score_batch_size', None),
                   scoring_scope=getattr(args, 'scoring_scope', None),
+                  offload_enabled=getattr(args, 'offload_enabled', None),
                   summarizer_model_path=getattr(args, 'summarizer_model_path', None),
                   recent_frames=args.recent_frames, group_size=args.group_size,
                   ema_alpha=args.ema_alpha, min_segment_frames=args.min_segment_frames,
@@ -72,7 +77,7 @@ class SuPrKVMethod(Method):
     defaults = dict(retrieve_size=64)
     options = ('retrieve_size', 'model_path', 'summarizer_model_path', 'scoring_strategy', 'compression_granularity', 'device', 'budget_tokens', 'recent_frames',
                'group_size', 'ema_alpha', 'min_segment_frames', 'max_segment_frames', 'frame_score_batch_size', 'scoring_scope',
-               'summary_max_new_tokens', 'max_new_tokens', 'packed_attention')
+               'summary_max_new_tokens', 'max_new_tokens', 'packed_attention', 'offload_enabled')
 
     def add_arguments(self, parser):
         add_retrieval_arguments(parser)
@@ -88,6 +93,8 @@ class SuPrKVMethod(Method):
         budget = 8192 if budget is None else budget
         directory = (f'results/suprkv/{args.model}/{dataset}/'
                      f'{retrieval_size(args)}-{args.sample_fps}/budget_{budget}')
+        if getattr(args, 'offload_enabled', False):
+            directory += '/offload_cpu'
         if getattr(args, 'compression_granularity', None) == 'head':
             directory += '/compression_head'
         if getattr(args, 'scoring_strategy', None) == 'frame_mean_query':

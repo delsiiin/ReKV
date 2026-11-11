@@ -108,6 +108,7 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
     # The selected compression policy belongs only to the after pass. Keep the
     # baseline's cache layout and protected-capacity check independent of it.
     pass_config = dict(config, compression_enabled=compressed,
+                       offload_enabled=config.get('offload_enabled', False) if compressed else False,
                        scoring_scope=config.get('scoring_scope', 'segment') if compressed else 'segment',
                        compression_granularity=config.get('compression_granularity', 'layer') if compressed else 'layer')
     with borrowed_engine(model, processor, pass_config, profiler, check_cancel, summarizer) as engine:
@@ -134,6 +135,10 @@ def _run_pass(model, processor, images, frames, questions, config, compressed, p
                                  persistent_cuda_bytes=stats['persistent_cuda_bytes'],
                                  managed_bytes=stats['persistent_bytes'],
                                  retained_frames=stats['retained_frames'],
+                                 resident_frames=stats['resident_frames'],
+                                 offloaded_frames=stats['offloaded_frames'],
+                                 offloaded_tensor_bytes=stats['offloaded_tensor_bytes'],
+                                 offload_enabled=stats['offload_enabled'],
                                  frame_states=frame_states))
             event = stats['last_event']
             if event and event['version'] != last_commit:
@@ -214,6 +219,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
         compression_granularity=params.get('compression_granularity', 'layer'),
         frame_score_batch_size=params.get('frame_score_batch_size', 1),
         scoring_scope=params.get('scoring_scope', 'segment'),
+        offload_enabled=params.get('offload_enabled', False),
         summarizer_model_path=params.get('summarizer_model_path'),
         budget_tokens=params['compression_budget_tokens'], topk=params['compression_topk'],
         recent_frames=params['compression_recent_frames'], max_segment_frames=params['compression_max_segment_frames'],
@@ -261,6 +267,7 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
     memory = {}
     if complete:
         memory['persistent_kv'] = difference(before['cache']['persistent_tensor_bytes'], after['cache']['persistent_tensor_bytes'])
+        memory['cpu_offloaded'] = difference(before['cache']['offloaded_tensor_bytes'], after['cache']['offloaded_tensor_bytes'])
         memory['cuda_allocated'] = difference(before['cuda_after_encoding']['allocated_bytes'], after['cuda_after_encoding']['allocated_bytes'])
         memory['cuda_peak'] = difference(before['cuda_after_answer']['peak_allocated_bytes'], after['cuda_after_answer']['peak_allocated_bytes'])
     stages = []
@@ -282,10 +289,10 @@ def compare(observation, images, frames, record, params, progress, check_cancel,
             compression_granularity=config['compression_granularity'],
             summarizer_model_path=config['summarizer_model_path'],
             execution='sequential', cache_device=observation.device, dtype=dtype,
-            offload=False, baseline=f'same streaming encoding and top-k retrieval; all {dtype}; no compression or summaries',
+            offload=config['offload_enabled'], baseline=f'same streaming encoding and top-k retrieval; all {dtype}; no compression or summaries',
             timing='exclusive wall time, CUDA synchronized at stage boundaries; excludes model loading and video decoding',
-            memory='unique persistent tensor storage; CUDA allocated/peak include weights and workspaces; reserved allocator memory is not savings',
-            frame_states='each progress point records per-frame, per-layer mean token counts per KV head [model dtype, INT8, INT4, INT2]; head_counts[layer][head] gives individual counts; bit_order 16 denotes unquantized model dtype; evicted frames retain observed segment_id and have counts=null; baseline segment_id=null; no future frames; sink excluded',
+            memory='unique device-resident persistent tensor storage; CPU offloaded KV reported separately; CUDA allocated/peak include weights and workspaces; reserved allocator memory is not savings',
+            frame_states='each progress point records per-frame, per-layer mean token counts per KV head [model dtype, INT8, INT4, INT2]; head_counts[layer][head] gives individual counts; bit_order 16 denotes unquantized model dtype; offloaded frames keep counts and remain retrievable on CPU; evicted frames retain observed segment_id and have counts=null; baseline segment_id=null; no future frames; sink excluded',
             retrieval_hits='once per question per frame across layers, including recent frames; segment hit means any member frame was retrieved; both sides use compressed-run segments; unavailable if compressed run failed',
             sampling='identical selected frames and questions; questions are answered independently in order at the last selected frame using the same video cache; reference answers are not inputs',
             measurement='single paired run, baseline first; first-use kernel initialization can affect timing')))

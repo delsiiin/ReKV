@@ -36,6 +36,8 @@
       <div class="section-label">04 / KV 压缩对照</div>
       <label for="compressionGranularity">Token 删除粒度</label>
       <select id="compressionGranularity"><option value="layer">层级共享（原流程，默认）</option><option value="head">逐 KV head（独立均分、紧凑存储）</option></select>
+      <label class="check-label"><input id="compressionOffload" type="checkbox"> 将淘汰帧卸载到 CPU</label>
+      <p class="field-note">保留淘汰时剩余的压缩 KV，检索命中后加载；已删除的低分 token 不恢复。CPU 缓存单独统计，不占压缩预算。</p>
       <p class="field-note">压缩前固定保留原精度 KV；此选项只作用于压缩后。两侧使用相同帧和问题，对比内存、耗时与回答。</p>
       <label for="compressionScoring">Token 评分策略</label>
       <select id="compressionScoring"><option value="summary">Summary Query（默认）</option><option value="frame_mean_query">帧均值 Query（跳过摘要）</option></select>

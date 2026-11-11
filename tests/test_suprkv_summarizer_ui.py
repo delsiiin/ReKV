@@ -30,10 +30,14 @@ globalThis.document = {querySelector() { return {}; }};
 $('mode').value = 'compression'; $('compressionSummarizer').value = 'main';
 $('compressionGranularity').value = 'layer';
 $('compressionScoringScope').value = 'segment';
+$('compressionOffload').checked = false;
 $('compressionCustomQuestions').value = ''; $('maxFrames').value = '';
 const parameters = load(app, 'parameters'), update = load(app, 'updateWindowLabels');
 assert(parameters().summarizer_model_path === null, 'main default');
 assert(parameters().compression_granularity === 'layer', 'original default');
+assert(parameters().offload_enabled === false, 'offload disabled by default');
+$('compressionOffload').checked = true;
+assert(parameters().offload_enabled === true, 'offload switch reaches payload');
 $('compressionGranularity').value = 'head';
 assert(parameters().compression_granularity === 'head', 'headwise switch');
 $('compressionSummarizer').value = 'llava-hf/llava-onevision-qwen2-0.5b-ov-hf';
@@ -68,6 +72,7 @@ assert(!$('compressionSummarizer').disabled && $('compressionSummarizerPath').re
 $('mode').value = 'video'; update();
 assert(!('summarizer_model_path' in parameters()), 'ordinary observation excludes summarizer');
 assert(!('compression_granularity' in parameters()), 'ordinary observation excludes compression switch');
+assert(!('offload_enabled' in parameters()), 'ordinary observation excludes offload switch');
 assert(!('frame_score_batch_size' in parameters()) && $('compressionFrameBatchSize').disabled, 'ordinary observation excludes frame batch');
 assert($('compressionSummarizerPath').disabled && !$('compressionSummarizerPath').required, 'hidden field must not block submit');
 
@@ -107,6 +112,13 @@ e.stages = [{label: '生成 summary', before_seconds: 0, after_seconds: 0, delta
 render(result, '/result.json', false);
 assert($('compressionLabel').textContent.includes('摘要配置：未启用'), 'summary disabled label');
 assert($('compressionLabel').textContent.includes('每 3 帧批处理'), 'result shows effective batch size');
+e.config.offload_enabled = true;
+e.runs.after.cache.offloaded_frames = 2;
+e.runs.after.cache.offloaded_tensor_bytes = 100;
+render(result, '/result.json', false);
+assert($('compressionLabel').textContent.includes('CPU 卸载开启 / 2 帧'), 'offload result label');
+assert($('compressionMemoryTable').children[0].rows.some(row => row[0].includes('CPU 卸载')), 'CPU memory reported separately');
+assert(load(results, 'cacheStateLabel')({status: 'offloaded'}, {}) === 'CPU 卸载 · 可检索', 'offloaded frame remains retrievable');
 e.config.scoring_scope = 'segment';
 render(result, '/result.json', false);
 assert($('compressionLabel').textContent.includes('Segment 分段评分') && !$('compressionLabel').textContent.includes('每 3 帧'), 'segment result ignores batch size');

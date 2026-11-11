@@ -30,8 +30,11 @@ class StreamingConfig:
     model_family: str = 'onevision'
     frame_score_batch_size: int = 1
     scoring_scope: str = 'segment'
+    offload_enabled: bool = False
 
     def __post_init__(self):
+        if type(self.offload_enabled) is not bool:
+            raise ValueError('offload_enabled must be a boolean')
         if self.model_family not in ('onevision', 'qwen2_5_vl', 'video_llava'):
             raise ValueError('Unsupported SuPr-KV model_family')
         if self.compression_granularity not in ('layer', 'head'):

@@ -1,4 +1,4 @@
-"""Single-writer immutable frame cache. KV stays on its originating device; snapshots never leave the owner process."""
+"""Single-writer immutable frame cache with optional CPU storage for evicted frames."""
 from dataclasses import dataclass, is_dataclass, replace
 import math
 import importlib.util
@@ -175,6 +175,27 @@ class LayerFrame:
                        low_k=None, low_v=None,
                        low_offsets=None if self.low_offsets is None else (0,) * len(self.low_offsets))
 
+    def to(self, device, *, pin_memory=False):
+        """Move compressed payloads intact, including indices and quantizer metadata.
+
+        D2H is blocking so the archive is ready before publication. Pinned CPU
+        payloads can be loaded asynchronously on the retrieval stream.
+        """
+        device = torch.device(device)
+        if self.high_indices.device == device:
+            return self
+
+        def move(value):
+            if isinstance(value, torch.Tensor):
+                result = value.to(device=device, non_blocking=device.type == 'cuda')
+                return result.pin_memory() if pin_memory and device.type == 'cpu' else result
+            if isinstance(value, (PackedKV, CompactPackedKV)):
+                return replace(value, data=move(value.data), scale=move(value.scale), offset=move(value.offset))
+            return value
+
+        return replace(self, **{name: move(getattr(self, name)) for name in
+                       ('high_indices', 'high_k', 'high_v', 'low_indices', 'low_k', 'low_v', 'representative')})
+
     @property
     def heads(self):
         return self.representative.shape[0]
@@ -273,7 +294,15 @@ class CacheSnapshot:
             raise ValueError('Query and resident cache must be on the same device')
         q = query.detach().float().mean(dim=-2).squeeze(0)
         if available:
-            keys = torch.stack([f.layers[layer].representative for f in available]).float()
+            # Transfer only the small retrieval vectors before ranking. Group by
+            # device to avoid one H2D transfer per archived frame.
+            available.sort(key=lambda f: str(f.layers[layer].representative.device))
+            groups = {}
+            for frame in available:
+                representative = frame.layers[layer].representative
+                groups.setdefault(representative.device, []).append(representative)
+            parts = [torch.stack(rows).to(query.device) for rows in groups.values()]
+            keys = (parts[0] if len(parts) == 1 else torch.cat(parts)).float()
             if q.shape[0] % keys.shape[1]:
                 raise ValueError('Invalid GQA heads')
             keys = keys.repeat_interleave(q.shape[0] // keys.shape[1], 1)
@@ -294,6 +323,11 @@ class CacheSnapshot:
         selected.sort(key=lambda f: (f.timestamp, f.frame_id))
         device = query.device
         with measure(profiler, 'cache_materialization'):
+            # Only selected frames and this decoder layer are loaded. The CPU
+            # archive remains authoritative; retrieval does not grow residency.
+            selected = [replace(frame, layers=frame.layers[:layer] +
+                                (frame.layers[layer].to(device),) + frame.layers[layer+1:])
+                        if frame.layers[layer].high_indices.device != device else frame for frame in selected]
             if batched:
                 if position_bias is None or packed:
                     raise ValueError('Batched dense retrieval requires RoPE and packed=False')
@@ -355,8 +389,11 @@ class CacheSnapshot:
 
 class StreamingKVCache:
     def __init__(self, sink, budget_tokens, frame_tokens, recent_frames=2, group_size=128, profiler=None,
-                 dtype=torch.float16, compression_granularity='layer', scoring_scope='segment'):
+                 dtype=torch.float16, compression_granularity='layer', scoring_scope='segment', offload_enabled=False):
         self.profiler = profiler
+        if type(offload_enabled) is not bool:
+            raise ValueError('offload_enabled must be a boolean')
+        self.offload_enabled = offload_enabled
         if compression_granularity not in ('layer', 'head'):
             raise ValueError('Invalid compression_granularity')
         self.compression_granularity = compression_granularity
@@ -379,6 +416,7 @@ class StreamingKVCache:
         self.budget = budget_tokens * 4 * sum(k.shape[0]*k.shape[-1] for k, _ in self.sink)
         self.frame_tokens, self.recent_frames, self.group_size = frame_tokens, recent_frames, group_size
         self._frames = TrackedDict(changed=self._frame_changed)
+        self.offloaded_frames = TrackedDict(changed=self._offloaded_changed)
         # Pre-RoPE scoring keys are transient work memory, never snapshot KV.
         self._score_keys = TrackedDict(changed=self._diagnostics_changed)
         self._score_queries = TrackedDict(changed=self._diagnostics_changed)
@@ -387,7 +425,7 @@ class StreamingKVCache:
         self.last_activation_id = -1
         self.last_snapshot_id = -1
         self.snapshots = {}
-        self.counts = dict(compressions=0, dropped_low_frames=0, evicted_frames=0, scoring_failures=0)
+        self.counts = dict(compressions=0, dropped_low_frames=0, evicted_frames=0, offloaded_frames=0, scoring_failures=0)
         self.last_event = {}
         # Conservative protected-region reserve, including split-frame tensor metadata.
         layers = tuple(LayerFrame.full(torch.zeros(k.shape[0], frame_tokens, k.shape[-1], dtype=dtype),
@@ -454,6 +492,12 @@ class StreamingKVCache:
     def _diagnostics_changed(self, mapping, key, previous, value):
         self._working_ledger.mapping_changed(mapping, key)
 
+    def _offloaded_changed(self, mapping, key, previous, value):
+        self._offload_ledger.mapping_changed(mapping, key)
+        self._working_ledger.mapping_changed(mapping, key)
+        if self.offload_enabled:
+            self._cache_ledger.mapping_changed(mapping, key)
+
     def _reset_accounting(self):
         self._recent_key = None
         recent = set(self.recent_ids)
@@ -469,7 +513,13 @@ class StreamingKVCache:
             self._frame_counts[frame.frame_id] = self._token_counts(frame)
         self._persistent_ledger, self._working_ledger = MemoryLedger(), MemoryLedger()
         self._persistent_root = self._persistent_value()
-        self._working_root = (self._persistent_root, self.frames, self.snapshots, self.counts, self.last_event,
+        self._offload_ledger = MemoryLedger()
+        self._offload_ledger.add(self.offloaded_frames)
+        self._cache_root = (self._persistent_root, self.offloaded_frames) if self.offload_enabled else self._persistent_root
+        self._cache_ledger = MemoryLedger() if self.offload_enabled else self._persistent_ledger
+        if self.offload_enabled:
+            self._cache_ledger.add(self._cache_root)
+        self._working_root = (self._cache_root, self.frames, self.snapshots, self.counts, self.last_event,
                               self._score_keys, self._score_queries)
         self._persistent_ledger.add(self._persistent_root)
         self._working_ledger.add(self._working_root)
@@ -531,6 +581,8 @@ class StreamingKVCache:
                 self._managed.pop(key, None)
             self._persistent_ledger.mapping_changed(self._managed, key)
             self._working_ledger.mapping_changed(self._managed, key)
+            if self.offload_enabled:
+                self._cache_ledger.mapping_changed(self._managed, key)
         self._accounted_recent = recent
         self._accounted_recent_ids = recent_ids
 
@@ -550,15 +602,26 @@ class StreamingKVCache:
         else:
             self._persistent_ledger.add(persistent)
             self._persistent_ledger.remove(id(self._persistent_root))
-        working = (persistent, self.frames, self.snapshots, self.counts, self.last_event, self._score_keys, self._score_queries)
+        base = (persistent, self.offloaded_frames) if self.offload_enabled else persistent
+        if self.offload_enabled:
+            if persistent is self._persistent_root:
+                base = self._cache_root
+            else:
+                self._cache_ledger.add(base)
+                self._cache_ledger.remove(id(self._cache_root))
+        working = (base, self.frames, self.snapshots, self.counts, self.last_event, self._score_keys, self._score_queries)
         if all(a is b for a, b in zip(working, self._working_root)):
             working = self._working_root
         else:
             self._working_ledger.add(working)
             self._working_ledger.remove(id(self._working_root))
         self._persistent_root, self._working_root = persistent, working
+        self._cache_root = base
         self._persistent_ledger.refresh_metadata_sizes()
         self._working_ledger.refresh_metadata_sizes()
+        self._offload_ledger.refresh_metadata_sizes()
+        if self.offload_enabled:
+            self._cache_ledger.refresh_metadata_sizes()
 
     @property
     def recent_ids(self):
@@ -677,6 +740,7 @@ class StreamingKVCache:
         self.segment_id += 1
         self.version += 1
         self.last_event = dict(version=self.version, quantized=0, dropped_low=0, evicted=0,
+                               offloaded=0,
                                before_bytes=0, after_bytes=0, elapsed_seconds=0.0,
                                trigger='frame_batch_commit' if self.scoring_scope == 'frame' else 'segment_commit',
                                score_error=error)
@@ -727,9 +791,17 @@ class StreamingKVCache:
         with measure(self.profiler, 'frame_eviction'):
             # LFU, then FIFO: frame_id is assigned monotonically on insertion.
             for old in sorted(candidates, key=lambda f: (f.hits, f.frame_id)):
+                if self.offload_enabled:
+                    frame = self.frames[old.frame_id]
+                    self.offloaded_frames[frame.frame_id] = replace(frame, layers=tuple(
+                        entry.to('cpu', pin_memory=self.device.type == 'cuda') for entry in frame.layers))
                 del self.frames[old.frame_id]
-                self.counts['evicted_frames'] += 1
-                self.last_event['evicted'] += 1
+                if self.offload_enabled:
+                    self.counts['offloaded_frames'] += 1
+                    self.last_event['offloaded'] = self.last_event.get('offloaded', 0) + 1
+                else:
+                    self.counts['evicted_frames'] += 1
+                    self.last_event['evicted'] += 1
                 if self.persistent_bytes() <= self.budget:
                     return
         if self.persistent_bytes() > self.budget:
@@ -740,7 +812,7 @@ class StreamingKVCache:
             raise ValueError('Only one snapshot is allowed; question IDs must increase')
         if cutoff is not None and self.last_timestamp > cutoff:
             raise ValueError('Historical snapshots unavailable: submit questions in stream order')
-        frames = tuple(self.frames.values())
+        frames = tuple(sorted((*self.frames.values(), *self.offloaded_frames.values()), key=lambda f: f.frame_id))
         snapshot = CacheSnapshot(self.version, question_id, self.sink, frames, self.recent_ids)
         self.snapshots[question_id] = snapshot
         self.last_snapshot_id = question_id
@@ -755,9 +827,10 @@ class StreamingKVCache:
         if question_id > self.last_snapshot_id:
             raise ValueError('Activation for an unknown question')
         for frame_id in set(frame_ids):
-            if frame_id in self.frames:
-                frame = self.frames[frame_id]
-                self.frames[frame_id] = replace(frame, hits=frame.hits+1)
+            table = self.frames if frame_id in self.frames else self.offloaded_frames
+            if frame_id in table:
+                frame = table[frame_id]
+                table[frame_id] = replace(frame, hits=frame.hits+1)
         self.last_activation_id = question_id
 
     def frame_states(self, segment_ids=None):
@@ -770,12 +843,13 @@ class StreamingKVCache:
         recent = set(self.recent_ids)
         result = []
         for frame_id in range(self.next_id):
-            frame = self.frames.get(frame_id)
+            offloaded = frame_id in self.offloaded_frames
+            frame = self.offloaded_frames[frame_id] if offloaded else self.frames.get(frame_id)
             if frame is None:
                 result.append(dict(frame_id=frame_id, segment_id=(segment_ids or {}).get(frame_id),
                                    status='evicted', protected=False, counts=None, head_counts=None))
                 continue
-            counts = [list(row) for row in self._frame_counts[frame_id]]
+            counts = [list(row) for row in (self._token_counts(frame) if offloaded else self._frame_counts[frame_id])]
             head_counts = []
             for layer in frame.layers:
                 rows = []
@@ -788,7 +862,8 @@ class StreamingKVCache:
                     row[{16: 0, 8: 1, 4: 2, 2: 3}[layer.bits]] += high
                     rows.append(row)
                 head_counts.append(rows)
-            result.append(dict(frame_id=frame_id, segment_id=frame.segment_id, status='closed' if frame.closed else 'open',
+            result.append(dict(frame_id=frame_id, segment_id=frame.segment_id,
+                               status='offloaded' if offloaded else 'closed' if frame.closed else 'open',
                                protected=frame_id in recent, counts=counts, head_counts=head_counts))
         return dict(layer_count=len(self.sink), tokens_per_frame=self.frame_tokens,
                     kv_heads=[k.shape[0] for k, _ in self.sink], count_unit='mean_tokens_per_kv_head',
@@ -798,14 +873,17 @@ class StreamingKVCache:
         self._refresh_accounting()
         ledger = self._persistent_ledger
         pbytes = ledger.total
-        working = self._working_ledger.total-pbytes
-        return dict(cache_device=str(self.device), cache_dtype=str(self.dtype).removeprefix('torch.'), offload_enabled=False,
+        working = self._working_ledger.total-self._cache_ledger.total
+        return dict(cache_device=str(self.device), cache_dtype=str(self.dtype).removeprefix('torch.'), offload_enabled=self.offload_enabled,
                     compression_granularity=self.compression_granularity,
                     scoring_scope=self.scoring_scope,
                     budget_bytes=self.budget, persistent_bytes=pbytes,
                     persistent_tensor_bytes=ledger.tensor_bytes,
                     persistent_cuda_bytes=ledger.cuda_bytes,
-                    cache_working_bytes=working, retained_frames=len(self.frames),
+                    cache_working_bytes=working, retained_frames=len(self.frames)+len(self.offloaded_frames),
+                    resident_frames=len(self.frames), offloaded_frames=len(self.offloaded_frames),
+                    offloaded_bytes=self._offload_ledger.total if self.offload_enabled else 0,
+                    offloaded_tensor_bytes=self._offload_ledger.tensor_bytes,
                     open_frames=len(self._open_ids),
                     bits=dict(self._bits), counts=dict(self.counts), last_event=dict(self.last_event))
 
@@ -822,7 +900,11 @@ class StreamingKVCache:
         expected = dict(persistent_bytes=footprint(persistent),
                         persistent_tensor_bytes=tensor_storage_bytes(persistent),
                         persistent_cuda_bytes=tensor_storage_bytes(persistent, 'cuda'),
-                        cache_working_bytes=footprint(self._working_root)-footprint(persistent))
+                        cache_working_bytes=footprint(self._working_root)-footprint(self._cache_root),
+                        offloaded_bytes=footprint(self.offloaded_frames) if self.offload_enabled else 0,
+                        offloaded_tensor_bytes=tensor_storage_bytes(self.offloaded_frames))
+        assert not (self.frames.keys() & self.offloaded_frames.keys())
+        assert self._offload_ledger.cuda_bytes == 0
         for name, value in expected.items():
             if stats[name] != value:
                 raise AssertionError(f'{name}: ledger={stats[name]}, full scan={value}')

@@ -31,7 +31,7 @@ def validate_params(raw, dataset, default_dtype='float16'):
                'segment_threshold_multiplier', 'segment_min_frames', 'summary_max_new_tokens',
                'compression_budget_tokens', 'compression_topk', 'compression_recent_frames', 'compression_max_segment_frames',
                'question_indices', 'custom_questions', 'summarizer_model_path', 'scoring_strategy', 'compression_granularity',
-               'frame_score_batch_size', 'scoring_scope'}
+               'frame_score_batch_size', 'scoring_scope', 'offload_enabled'}
     if set(raw) - allowed:
         raise ValueError('Unknown observation parameter')
     sample_id = raw.get('sample_id')
@@ -85,6 +85,10 @@ def validate_params(raw, dataset, default_dtype='float16'):
     if mode != 'compression' and ('question_indices' in raw or 'custom_questions' in raw):
         raise ValueError('Multiple questions are supported in compression mode')
     if mode == 'compression':
+        offload = raw.get('offload_enabled', False)
+        if type(offload) is not bool:
+            raise ValueError('offload_enabled must be a boolean')
+        compression['offload_enabled'] = offload
         granularity = raw.get('compression_granularity', 'layer')
         if granularity not in ('layer', 'head'):
             raise ValueError('Invalid compression_granularity')

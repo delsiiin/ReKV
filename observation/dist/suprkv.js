@@ -21,9 +21,12 @@ function renderCompressionResult(result, url, cached) {
   const frameQuery = e.config?.scoring_strategy === 'frame_mean_query';
   $('compressionLabel').textContent = `${e.frame_count} 帧 · ${e.method.dtype ?? 'float16'} · ${beforeStats.model_instances ?? 1} → ${afterStats.model_instances ?? e.method.model_instances ?? 1} 个模型 / 顺序执行 · 评分：${frameQuery ? '帧均值 Query' : 'Summary Query'} · 删除粒度：${e.config?.compression_granularity === 'head' ? '逐 KV head' : '层级共享（原流程）'} · 摘要配置：${frameQuery ? '未启用' : (summarizer ?? '主模型')} · 重试 ${afterStats.summary_retries ?? 0} 次 / 最终失败 ${afterStats.summary_failures ?? 0} 次 · ${cached ? '缓存结果' : fmt(result.total_elapsed_seconds, 1) + ' 秒'}`;
   const scoringScope = e.config?.scoring_scope ?? afterStats.scoring_scope ?? 'segment';
-  if (frameQuery && e.config?.compression_granularity === 'head') {
+  if (frameQuery) {
     $('compressionLabel').textContent += scoringScope === 'frame' ?
       ` · 逐帧独立评分 / 每 ${e.config.frame_score_batch_size ?? 1} 帧批处理` : ' · Segment 分段评分';
+  }
+  if (e.config?.offload_enabled) {
+    $('compressionLabel').textContent += ` · CPU 卸载开启 / ${after.cache?.offloaded_frames ?? 0} 帧`;
   }
   $('compressionJson').hidden = false; $('compressionJson').href = url;
   const memory = e.memory, saved = memory.persistent_kv;
@@ -37,6 +40,10 @@ function renderCompressionResult(result, url, cached) {
     ['编码完成时 CUDA 分配量', memory.cuda_allocated],
     ['整个运行的 CUDA 分配峰值', memory.cuda_peak],
   ].map(([label, item]) => [label, mib(item?.before_bytes), mib(item?.after_bytes), mib(item?.saved_bytes), pct(item?.saved_fraction)]);
+  if (e.config?.offload_enabled) {
+    rows.push(['CPU 卸载 KV 张量（单独占用）', mib(before.cache?.offloaded_tensor_bytes ?? 0),
+      mib(after.cache?.offloaded_tensor_bytes), '—', '—']);
+  }
   if (beforeStats.model_parameter_bytes != null && afterStats.model_parameter_bytes != null) {
     rows.push(['模型参数（含摘要模型）', mib(beforeStats.model_parameter_bytes), mib(afterStats.model_parameter_bytes),
       mib(beforeStats.model_parameter_bytes - afterStats.model_parameter_bytes), '—']);
@@ -265,6 +272,7 @@ function frameStateNumbers(snapshot, record, layer) {
 function cacheStateLabel(record, numbers) {
   if (!record) return '未编码';
   if (record.status === 'evicted') return '已整帧淘汰';
+  if (record.status === 'offloaded') return 'CPU 卸载 · 可检索';
   if (record.protected) return record.status === 'open' ? 'Recent 保护 · 未闭段' : 'Recent 保护';
   if (record.status === 'open') return '未闭段 · 原精度';
   if (numbers.counts.slice(1).some(n => n > 0)) return '混合精度';
@@ -434,6 +442,9 @@ function renderCompressionLive(job) {
     $('compressionLabel').textContent += ` · 每 ${update.point.frame_score_batch_size ?? 1} 帧批处理`;
   } else if (update.side === 'after' && update.point.scoring_scope === 'segment') {
     $('compressionLabel').textContent += ' · Segment 分段评分';
+  }
+  if (update.point.offload_enabled) {
+    $('compressionLabel').textContent += ` · CPU 卸载 ${update.point.offloaded_frames ?? 0} 帧 / ${mib(update.point.offloaded_tensor_bytes)}`;
   }
   if($('compressionStateFollow').checked) followLatestCacheState(); else renderCompressionFrameStates();
 }
