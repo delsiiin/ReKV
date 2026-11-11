@@ -34,8 +34,10 @@ class CompressionParameterTests(unittest.TestCase):
         for size in (0, -1, True, 1.5, '3', None):
             with self.subTest(size=size), self.assertRaisesRegex(ValueError, 'frame_score_batch_size'):
                 validate_params(dict(raw, frame_score_batch_size=size), dataset)
-        for mode in (dict(scoring_strategy='summary'), dict(compression_granularity='layer')):
-            self.assertEqual(validate_params(dict(raw, frame_score_batch_size=3, **mode), dataset)['frame_score_batch_size'], 1)
+        layer = validate_params(dict(raw, frame_score_batch_size=3, compression_granularity='layer'), dataset)
+        self.assertEqual(layer['scoring_scope'], 'frame')
+        self.assertEqual(layer['frame_score_batch_size'], 3)
+        self.assertEqual(validate_params(dict(raw, frame_score_batch_size=3, scoring_strategy='summary'), dataset)['frame_score_batch_size'], 1)
         self.assertNotIn('frame_score_batch_size', validate_params(dict(raw, mode='video'), dataset))
 
     def test_compression_granularity_validation_and_default(self):

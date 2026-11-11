@@ -9,6 +9,52 @@ from model.suprkv.segments import (segment_summary_scores, summary_scores, segme
 
 
 class SegmentScoringTests(unittest.TestCase):
+    def test_layer_frame_scores_match_dense_gqa_reference_and_independent_batches(self):
+        torch.manual_seed(118)
+        for device in self.devices():
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                with self.subTest(device=device, dtype=dtype):
+                    queries = torch.randn(4, 6, 8, device=device, dtype=dtype)
+                    keys = list(torch.randn(4, 2, 7, 8, device=device, dtype=dtype))
+                    # Expand GQA explicitly and average all query heads after QK.
+                    logits = (queries.double().unsqueeze(-2) @
+                              torch.stack(keys).double().repeat_interleave(3, dim=1).transpose(-1, -2)) / 8**.5
+                    expected = logits.squeeze(-2).mean(1)
+                    with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16):
+                        scores = frame_local_query_scores(queries, keys, headwise=False)
+                    self.assertEqual(scores.dtype, torch.float32)
+                    torch.testing.assert_close(scores.double(), expected, rtol=1e-5, atol=1e-6)
+                    singles = torch.cat([frame_local_query_scores(queries[i:i+1], [keys[i]], headwise=False)
+                                         for i in range(4)])
+                    torch.testing.assert_close(scores, singles, rtol=1e-5, atol=1e-6)
+                    changed = queries.clone()
+                    changed[1:] *= -100
+                    keys[1:] = [k * 100 for k in keys[1:]]
+                    torch.testing.assert_close(frame_local_query_scores(changed, keys, headwise=False)[0],
+                                               scores[0], rtol=0, atol=0)
+
+    def test_layer_frame_commit_uses_shared_masks_and_preserves_frame_queries(self):
+        # Heads disagree and opposite frame queries cancel only in segment mode.
+        key = torch.tensor([[[-2.], [0.], [2.]], [[4.], [0.], [-4.]]])
+        for scope in ('segment', 'frame'):
+            for batch_size in (1, 2) if scope == 'frame' else (2,):
+                with self.subTest(scope=scope, batch_size=batch_size):
+                    cache = StreamingKVCache([(key[:, :1], key[:, :1])], 100000, 3,
+                                             dtype=torch.float32, compression_granularity='layer', scoring_scope=scope)
+                    for i, sign in enumerate((1., -1.)):
+                        cache.append_frame(i, [(key, key)], score_keys=[key],
+                                           frame_queries=[torch.full((4, 1), sign)])
+                        if (i + 1) % batch_size == 0:
+                            cache.close_segment(None, scoring_strategy='frame_mean_query')
+                    for i in range(2):
+                        entry = cache.frames[i].layers[0]
+                        expected = [0, 1, 2] if scope == 'segment' else ([0, 1] if i == 0 else [1, 2])
+                        self.assertIsNone(entry.high_offsets)
+                        self.assertEqual(entry.high_indices.tolist(), expected)
+                    self.assertEqual(cache.counts['scoring_failures'], 0)
+                    self.assertFalse(cache._score_queries or cache._score_keys)
+                    cache.audit_accounting()
+
     def test_frame_queries_match_dense_logits_and_working_memory_lifecycle(self):
         torch.manual_seed(77)
         sink = torch.zeros(2, 2, 4)

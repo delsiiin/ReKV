@@ -40,9 +40,8 @@ class StreamingConfig:
             raise ValueError('Invalid scoring_strategy')
         if self.scoring_scope not in ('segment', 'frame'):
             raise ValueError('Invalid scoring_scope')
-        if self.scoring_scope == 'frame' and (self.scoring_strategy != 'frame_mean_query'
-                                             or self.compression_granularity != 'head'):
-            raise ValueError('scoring_scope=frame requires frame_mean_query + head')
+        if self.scoring_scope == 'frame' and self.scoring_strategy != 'frame_mean_query':
+            raise ValueError('scoring_scope=frame requires frame_mean_query')
         if type(self.frame_score_batch_size) is not int or self.frame_score_batch_size < 1:
             raise ValueError('frame_score_batch_size must be a positive integer')
         if self.scoring_strategy == 'frame_mean_query':

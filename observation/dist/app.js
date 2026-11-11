@@ -61,7 +61,7 @@ function updateWindowLabels() {
   const compressionMode = $('mode').value === 'compression';
   $('compressionControls').hidden = !compressionMode;
   const frameQueryScoring = $('compressionScoring').value === 'frame_mean_query';
-  const scopeSelectable = compressionMode && frameQueryScoring && $('compressionGranularity').value === 'head';
+  const scopeSelectable = compressionMode && frameQueryScoring;
   $('compressionScoringScopeControls').hidden = !scopeSelectable;
   $('compressionScoringScope').disabled = !scopeSelectable;
   const frameBatchScoring = scopeSelectable && $('compressionScoringScope').value === 'frame';
@@ -138,7 +138,7 @@ function parameters() {
     ...($('mode').value === 'compression' ? {
       scoring_strategy: $('compressionScoring').value,
       compression_granularity: $('compressionGranularity').value,
-      ...($('compressionScoring').value === 'frame_mean_query' && $('compressionGranularity').value === 'head' ?
+      ...($('compressionScoring').value === 'frame_mean_query' ?
         {scoring_scope: $('compressionScoringScope').value,
          ...($('compressionScoringScope').value === 'frame' ?
            {frame_score_batch_size: Number($('compressionFrameBatchSize').value)} : {})} : {}),

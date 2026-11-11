@@ -116,74 +116,80 @@ class SummarizerTests(unittest.TestCase):
             self.assertFalse(engine.frame_info)
             engine.cache.audit_accounting()
 
-    def test_default_head_scoring_retains_segment_boundaries(self):
-        engine = self.engine(scoring_strategy='frame_mean_query', compression_granularity='head',
-                             frame_score_batch_size=1)
-        self.assertIsNotNone(engine.segmenter)
-        for i in range(3):
-            engine.append_frame(self.image, float(i))
-            self.assertFalse(engine.cache.frames[i].closed)
-        engine.append_frame(self.image, 3.)
-        self.assertTrue(all(f.closed for f in engine.cache.frames.values()))
-        self.assertEqual(engine.cache.last_event['trigger'], 'segment_commit')
-        self.assertEqual(engine.cache.last_event['scored_frames'], 4)
-        self.assertEqual(engine.stats()['scoring_scope'], 'segment')
-        engine.reset()
-        self.assertIsNotNone(engine.segmenter)
-        self.assertEqual(engine.cache.scoring_scope, 'segment')
+    def test_default_scoring_retains_segment_boundaries(self):
+        for granularity in ('layer', 'head'):
+            with self.subTest(granularity=granularity):
+                engine = self.engine(scoring_strategy='frame_mean_query', compression_granularity=granularity,
+                                     frame_score_batch_size=1)
+                self.assertIsNotNone(engine.segmenter)
+                for i in range(3):
+                    engine.append_frame(self.image, float(i))
+                    self.assertFalse(engine.cache.frames[i].closed)
+                engine.append_frame(self.image, 3.)
+                self.assertTrue(all(f.closed for f in engine.cache.frames.values()))
+                self.assertEqual(engine.cache.last_event['trigger'], 'segment_commit')
+                self.assertEqual(engine.cache.last_event['scored_frames'], 4)
+                self.assertEqual(engine.stats()['scoring_scope'], 'segment')
+                engine.reset()
+                self.assertIsNotNone(engine.segmenter)
+                self.assertEqual(engine.cache.scoring_scope, 'segment')
 
-    def test_head_frame_scoring_skips_segmenter_and_commits_each_frame(self):
-        with patch('model.suprkv.onevision.OnlineSegmenter', side_effect=AssertionError('no segmentation')):
-            engine = self.engine(scoring_strategy='frame_mean_query', compression_granularity='head', scoring_scope='frame')
-            for i in range(3):
-                engine.append_frame(self.image, float(i))
-                self.assertTrue(all(frame.closed for frame in engine.cache.frames.values()))
-                self.assertEqual(engine.cache.last_event['trigger'], 'frame_batch_commit')
-                self.assertEqual(engine.cache.last_event['scored_frames'], 1)
-                self.assertEqual(engine.cache.last_event['scoring_scope'], 'frame')
-                self.assertFalse(engine.cache._score_queries or engine.cache._score_keys or engine.frame_info)
-            self.assertIsNone(engine.segmenter)
-            version = engine.cache.version
-            engine.close_segment()
-            self.assertEqual(engine.cache.version, version)
-            engine.cache.audit_accounting()
-            engine.reset()
-            self.assertIsNone(engine.segmenter)
-            self.assertEqual(engine.cache.next_id, 0)
+    def test_frame_scoring_skips_segmenter_and_commits_each_frame(self):
+        for granularity in ('layer', 'head'):
+            with self.subTest(granularity=granularity):
+                with patch('model.suprkv.onevision.OnlineSegmenter', side_effect=AssertionError('no segmentation')):
+                    engine = self.engine(scoring_strategy='frame_mean_query', compression_granularity=granularity, scoring_scope='frame')
+                    for i in range(3):
+                        engine.append_frame(self.image, float(i))
+                        self.assertTrue(all(frame.closed for frame in engine.cache.frames.values()))
+                        self.assertEqual(engine.cache.last_event['trigger'], 'frame_batch_commit')
+                        self.assertEqual(engine.cache.last_event['scored_frames'], 1)
+                        self.assertEqual(engine.cache.last_event['scoring_scope'], 'frame')
+                        self.assertFalse(engine.cache._score_queries or engine.cache._score_keys or engine.frame_info)
+                    self.assertIsNone(engine.segmenter)
+                    version = engine.cache.version
+                    engine.close_segment()
+                    self.assertEqual(engine.cache.version, version)
+                    engine.cache.audit_accounting()
+                    engine.reset()
+                    self.assertIsNone(engine.segmenter)
+                    self.assertEqual(engine.cache.next_id, 0)
 
-    def test_head_frame_batch_flushes_tail_before_qa_and_resumes(self):
-        config = StreamingConfig(device='cpu', group_size=8, budget_tokens=10000,
-            recent_frames=1, topk=2, min_segment_frames=1, max_segment_frames=1,
-            scoring_strategy='frame_mean_query', compression_granularity='head',
-            frame_score_batch_size=3, max_new_tokens=2, scoring_scope='frame')
-        factory = lambda cfg: OneVisionEngine(cfg, model=self.model, processor=self.processor)
-        with StreamingRuntime(config, factory) as runtime:
-            engine = runtime.model
-            # A segment cap of one must not affect a scoring batch of three.
-            for i in range(2):
-                runtime.append_frame(self.image, float(i))
-                self.assertFalse(engine.cache.frames[i].closed)
-            runtime.append_frame(self.image, 2.)
-            self.assertTrue(all(frame.closed for frame in engine.cache.frames.values()))
-            self.assertEqual(engine.cache.last_event['scored_frames'], 3)
-            runtime.append_frame(self.image, 3.)
-            self.assertFalse(engine.cache.frames[3].closed)
-            original_snapshot = engine.cache.acquire_snapshot
-            def snapshot(*args):
-                self.assertFalse(engine.frame_info)
-                self.assertTrue(all(frame.closed for frame in engine.cache.frames.values()))
-                return original_snapshot(*args)
-            with patch.object(engine.cache, 'acquire_snapshot', side_effect=snapshot):
-                runtime.ask('what?')
-            self.assertEqual(engine.cache.last_event['scored_frames'], 1)
-            self.assertFalse(engine.cache.snapshots or engine.cache._score_queries or engine.cache._score_keys)
-            runtime.append_frame(self.image, 4.)
-            self.assertFalse(engine.cache.frames[4].closed)
-            runtime.close_segment()
-            self.assertTrue(engine.cache.frames[4].closed)
-            engine.cache.audit_accounting()
-            runtime.reset()
-            self.assertFalse(engine.frame_info or engine.cache.frames)
+    def test_frame_batch_flushes_tail_before_qa_and_resumes(self):
+        for granularity in ('layer', 'head'):
+            with self.subTest(granularity=granularity):
+                config = StreamingConfig(device='cpu', group_size=8, budget_tokens=10000,
+                    recent_frames=1, topk=2, min_segment_frames=1, max_segment_frames=1,
+                    scoring_strategy='frame_mean_query', compression_granularity=granularity,
+                    frame_score_batch_size=3, max_new_tokens=2, scoring_scope='frame')
+                factory = lambda cfg: OneVisionEngine(cfg, model=self.model, processor=self.processor)
+                with StreamingRuntime(config, factory) as runtime:
+                    engine = runtime.model
+                    # A segment cap of one must not affect a scoring batch of three.
+                    for i in range(2):
+                        runtime.append_frame(self.image, float(i))
+                        self.assertFalse(engine.cache.frames[i].closed)
+                    runtime.append_frame(self.image, 2.)
+                    self.assertTrue(all(frame.closed for frame in engine.cache.frames.values()))
+                    self.assertEqual(engine.cache.last_event['scored_frames'], 3)
+                    runtime.append_frame(self.image, 3.)
+                    self.assertFalse(engine.cache.frames[3].closed)
+                    original_snapshot = engine.cache.acquire_snapshot
+                    def snapshot(*args):
+                        self.assertFalse(engine.frame_info)
+                        self.assertTrue(all(frame.closed for frame in engine.cache.frames.values()))
+                        return original_snapshot(*args)
+                    with patch.object(engine.cache, 'acquire_snapshot', side_effect=snapshot):
+                        runtime.ask('what?')
+                    self.assertEqual(engine.cache.last_event['scored_frames'], 1)
+                    self.assertFalse(engine.cache.snapshots or engine.cache._score_queries or engine.cache._score_keys)
+                    runtime.append_frame(self.image, 4.)
+                    self.assertFalse(engine.cache.frames[4].closed)
+                    runtime.close_segment()
+                    self.assertTrue(engine.cache.frames[4].closed)
+                    engine.cache.audit_accounting()
+                    runtime.reset()
+                    self.assertFalse(engine.frame_info or engine.cache.frames)
 
     def test_different_hidden_sizes_bridge_through_main_text_queries(self):
         engine = self.engine()
@@ -414,23 +420,25 @@ class SummarizerConfigTests(unittest.TestCase):
         for value in (None, True, '', 'batch'):
             with self.assertRaisesRegex(ValueError, 'scoring_scope'):
                 StreamingConfig(scoring_scope=value)
-        for strategy, granularity in (('summary', 'head'), ('frame_mean_query', 'layer')):
+        for strategy, granularity in (('summary', 'head'), ('summary', 'layer')):
             with self.assertRaisesRegex(ValueError, 'requires'):
                 StreamingConfig(scoring_scope='frame', scoring_strategy=strategy, compression_granularity=granularity)
         parser = base.build_parser('suprkv')
         method = SuPrKVMethod()
-        base_args = ['--anno_path', 'unused.json', '--save_dir', 'unused',
-                     '--scoring-strategy', 'frame_mean_query', '--compression-granularity', 'head']
-        default_dir = method.result_dir(parser.parse_args(base_args), 'rvs_ego')
-        self.assertTrue(default_dir.endswith('/compression_head/scoring_frame_mean_query'))
-        for flag in ('--scoring_scope', '--scoring-scope'):
-            for scope in ('segment', 'frame'):
-                args = parser.parse_args([*base_args, flag, scope, '--frame-score-batch-size', '3'])
-                forwarded = parser.parse_args(['--anno_path', 'unused.json', '--save_dir', 'unused',
-                                               *method.worker_arguments(args)])
-                self.assertEqual(make_config(forwarded).scoring_scope, scope)
-                self.assertEqual(method.result_dir(args, 'rvs_ego'),
-                                 default_dir + ('/per_frame/batch_3' if scope == 'frame' else ''))
+        for granularity in ('layer', 'head'):
+            base_args = ['--anno_path', 'unused.json', '--save_dir', 'unused',
+                         '--scoring-strategy', 'frame_mean_query', '--compression-granularity', granularity]
+            default_dir = method.result_dir(parser.parse_args(base_args), 'rvs_ego')
+            self.assertTrue(default_dir.endswith('/scoring_frame_mean_query'))
+            self.assertEqual('/compression_head/' in default_dir, granularity == 'head')
+            for flag in ('--scoring_scope', '--scoring-scope'):
+                for scope in ('segment', 'frame'):
+                    args = parser.parse_args([*base_args, flag, scope, '--frame-score-batch-size', '3'])
+                    forwarded = parser.parse_args(['--anno_path', 'unused.json', '--save_dir', 'unused',
+                                                   *method.worker_arguments(args)])
+                    self.assertEqual(make_config(forwarded).scoring_scope, scope)
+                    self.assertEqual(method.result_dir(args, 'rvs_ego'),
+                                     default_dir + ('/per_frame/batch_3' if scope == 'frame' else ''))
 
     def test_frame_batch_configuration_and_result_isolation(self):
         method = SuPrKVMethod()

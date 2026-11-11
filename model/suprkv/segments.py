@@ -119,14 +119,15 @@ def segment_frame_query_scores(query, keys, *, headwise=False):
     return _frame_query_scores(query, keys, headwise=headwise)
 
 
-def frame_local_query_scores(query, keys):
+def frame_local_query_scores(query, keys, *, headwise=True):
     """Score each frame with only its own Query mean, batched across frames.
 
     Q=[frames, query heads, d], K=list of [kv heads, tokens, d].
-    Average only within each GQA group after the dot product; return
-    FP32 [frames, kv heads, tokens], independent of the other batch members.
+    Average within each GQA group after the dot product; return FP32
+    [frames, kv heads, tokens], or average all heads for [frames, tokens]
+    with headwise=False. Scores are independent of the other batch members.
     """
-    return _frame_query_scores(query, keys, headwise=True, frame_local=True)
+    return _frame_query_scores(query, keys, headwise=headwise, frame_local=True)
 
 
 def _frame_query_scores(query, keys, *, headwise, frame_local=False):
@@ -153,6 +154,8 @@ def _frame_query_scores(query, keys, *, headwise, frame_local=False):
         if frame_local:
             logits = torch.einsum('fhgd,fhnd->fhgn', q, key) / math.sqrt(dim)
             scores = logits.mean(dim=2)
+            if not headwise:
+                scores = scores.mean(dim=1)
             if not torch.isfinite(scores).all():
                 raise ValueError('Nonfinite frame attention scores')
             return scores

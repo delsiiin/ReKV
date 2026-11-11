@@ -52,9 +52,8 @@ class OneVisionEngine:
         scope = config.get('scoring_scope', 'segment')
         if scope not in ('segment', 'frame'):
             raise ValueError('Invalid scoring_scope')
-        if scope == 'frame' and (self.scoring_strategy != 'frame_mean_query'
-                                or config.get('compression_granularity', 'layer') != 'head'):
-            raise ValueError('scoring_scope=frame requires frame_mean_query + head')
+        if scope == 'frame' and self.scoring_strategy != 'frame_mean_query':
+            raise ValueError('scoring_scope=frame requires frame_mean_query')
         self.framewise_scoring = scope == 'frame'
         self.frame_score_batch_size = config.get('frame_score_batch_size', 1)
         if type(self.frame_score_batch_size) is not int or self.frame_score_batch_size < 1:

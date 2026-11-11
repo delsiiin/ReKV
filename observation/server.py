@@ -96,7 +96,7 @@ def validate_params(raw, dataset, default_dtype='float16'):
         scope = raw.get('scoring_scope', 'segment')
         if scope not in ('segment', 'frame'):
             raise ValueError('Invalid scoring_scope')
-        compression['scoring_scope'] = scope if strategy == 'frame_mean_query' and granularity == 'head' else 'segment'
+        compression['scoring_scope'] = scope if strategy == 'frame_mean_query' else 'segment'
         batch_size = raw.get('frame_score_batch_size', 1)
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError('frame_score_batch_size must be a positive integer')

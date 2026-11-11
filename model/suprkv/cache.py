@@ -362,8 +362,6 @@ class StreamingKVCache:
         self.compression_granularity = compression_granularity
         if scoring_scope not in ('segment', 'frame'):
             raise ValueError('Invalid scoring_scope')
-        if scoring_scope == 'frame' and compression_granularity != 'head':
-            raise ValueError('scoring_scope=frame requires head compression')
         self.scoring_scope = scoring_scope
         if budget_tokens <= 0 or recent_frames < 1 or frame_tokens < 1:
             raise ValueError('Budget, recent_frames and frame_tokens must be positive')
@@ -635,8 +633,8 @@ class StreamingKVCache:
                 raise ValueError('Scoring key must match the unpartitioned frame')
             scorer = segment_frame_query_scores if scoring_strategy == 'frame_mean_query' else segment_summary_scores
             frame_local = scoring_strategy == 'frame_mean_query' and self.scoring_scope == 'frame'
-            scores = (frame_local_query_scores(query, keys) if frame_local else
-                      scorer(query, keys, headwise=self.compression_granularity == 'head'))
+            scorer = frame_local_query_scores if frame_local else scorer
+            scores = scorer(query, keys, headwise=self.compression_granularity == 'head')
             entries = [frame.layers[layer] for frame in pending]
             if scoring_strategy == 'frame_mean_query' and self.compression_granularity == 'head':
                 partitioned = LayerFrame.classify_batch(entries, scores)

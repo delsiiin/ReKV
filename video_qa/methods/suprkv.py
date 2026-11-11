@@ -14,7 +14,7 @@ def add_suprkv_arguments(parser):
     parser.add_argument('--frame_score_batch_size', '--frame-score-batch-size', type=int, default=None,
                         help='Frames per scoring/compression batch with --scoring-scope frame (default: 1).')
     parser.add_argument('--scoring_scope', '--scoring-scope', choices=('segment', 'frame'), default=None,
-                        help='segment: original segmentation and segment-wide scoring (default); frame: independent frame scoring, requires frame_mean_query + head.')
+                        help='segment: original segmentation and segment-wide scoring (default); frame: independent frame scoring, requires frame_mean_query (layer or head).')
     # None preserves StreamingConfig defaults; forward only explicitly specified arguments.
     add_option(parser, '--model_path', '--model-path', type=str, default=None,
                         help='Model path or Hugging Face ID, overriding the preset path for --model.')
@@ -92,7 +92,7 @@ class SuPrKVMethod(Method):
             directory += '/compression_head'
         if getattr(args, 'scoring_strategy', None) == 'frame_mean_query':
             directory += '/scoring_frame_mean_query'
-            if getattr(args, 'compression_granularity', None) == 'head' and getattr(args, 'scoring_scope', None) == 'frame':
+            if getattr(args, 'scoring_scope', None) == 'frame':
                 batch_size = getattr(args, 'frame_score_batch_size', None)
                 directory += f'/per_frame/batch_{1 if batch_size is None else batch_size}'
             return directory

@@ -54,8 +54,9 @@ assert(parameters().scoring_strategy === 'frame_mean_query', 'strategy in payloa
 assert(parameters().summarizer_model_path === null, 'unused summarizer excluded');
 assert($('compressionSummarizer').disabled && !$('compressionSummarizerPath').required, 'skip summary controls');
 $('compressionGranularity').value = 'layer'; update();
-assert($('compressionFrameBatchControls').hidden && $('compressionFrameBatchSize').disabled, 'layer scoring hides batch control');
-assert(!('frame_score_batch_size' in parameters()), 'layer scoring excludes batch size');
+assert(!$('compressionScoringScopeControls').hidden && !$('compressionScoringScope').disabled, 'layer scoring supports scope selection');
+assert(!$('compressionFrameBatchControls').hidden && !$('compressionFrameBatchSize').disabled, 'layer frame scoring shows batch control');
+assert(parameters().scoring_scope === 'frame' && parameters().frame_score_batch_size === 3, 'layer frame scoring includes batch size');
 $('compressionGranularity').value = 'head'; update();
 assert(parameters().frame_score_batch_size === 3, 'retain batch size after switching back');
 $('compressionScoringScope').value = 'segment'; update();

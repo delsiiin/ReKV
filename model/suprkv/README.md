@@ -43,9 +43,10 @@ python -m video_qa.run_eval --method suprkv --dataset rvs_ego --scoring-strategy
 `--scoring-scope {segment,frame}`（别名 `--scoring_scope`）选择评分范围，默认 `segment`。
 `segment` 保留原流程：视觉 EMA 和最少/最大帧数确定边界，段内每个帧 Query 对整段 Key 评分，
 再沿 Query 帧维平均；`head` 仅聚合同一 KV head 对应的 GQA Query heads，`layer` 聚合全部 heads。
-设置 `--scoring-scope frame` 启用本次新增的逐帧实现，仅支持 `frame_mean_query + head`。
+设置 `--scoring-scope frame` 启用逐帧实现，支持 `frame_mean_query` 的 `layer` 和 `head` 两种粒度。
 第 f 帧的平均 Query 只与第 f 帧的原始 RoPE 前 K
-计算 `QKᵀ / √head_dim`，点积后仅平均同一 KV head 对应的 GQA Query heads，得到 `[F, Hkv, N]` 分数。
+计算 `QKᵀ / √head_dim`。`head` 在点积后平均同一 KV head 对应的 GQA Query heads，得到 `[F, Hkv, N]` 分数；
+`layer` 在点积后平均全部 heads，得到 `[F, N]` 分数，同一层的所有 KV heads 共享 token 分区。
 不做 softmax，不施加因果 mask，也不聚合其他帧的 Query。逐帧模式不创建或运行视觉分段器，
 `ema_alpha`、`min_segment_frames`、`max_segment_frames` 不参与处理时机选择。
 
@@ -55,17 +56,19 @@ python -m video_qa.run_eval --method suprkv --dataset rvs_ego --scoring-strategy
 ```bash
 # 原 segment 分段与评分（默认）
 bash run_suprkv.sh --scoring_strategy frame_mean_query --compression-granularity head --scoring-scope segment
-# 新逐帧评分，累积 4 帧提交
+# head-level 逐帧评分，累积 4 帧提交
 bash run_suprkv.sh --scoring_strategy frame_mean_query --compression-granularity head --scoring-scope frame --frame-score-batch-size 4
+# layer-level 逐帧评分，累积 4 帧提交
+bash run_suprkv.sh --scoring_strategy frame_mean_query --compression-granularity layer --scoring-scope frame --frame-score-batch-size 4
 ```
 
-Python 使用 `StreamingConfig(scoring_strategy='frame_mean_query', compression_granularity='head',
+Python 使用 `StreamingConfig(scoring_strategy='frame_mean_query', compression_granularity='layer',
 scoring_scope='frame', frame_score_batch_size=4)`。批量处理仍逐帧独立评分；N 只控制提交频率，不改变评分公式。视频编码仍逐帧进行。
 N 越大，临时 Q/K 内存与预算检查间隔越大；压缩时机不同也可能影响最终保留的 KV。
 不足 N 帧的尾批通过 `close_segment()` 提交，`StreamingRuntime.ask()` 会在问答快照前自动提交尾批。
 提交事件为 `frame_batch_commit`，`scoring_scope="frame"`；兼容字段 `segment_id` 仅作为批次编号。
 
-`frame_mean_query + layer` 保留原有分段评分：段结束后，每个帧 Query 与整段 Key 计算点积，
+`frame_mean_query + layer` 在默认 `scoring_scope='segment'` 下保留原有分段评分：段结束后，每个帧 Query 与整段 Key 计算点积，
 沿 Query 帧维及全部 head 维求均值，得到 `[F, N]` 分数。`summary` 也保留原分段流程。
 实际分类使用 softmax 前分数：`layer` 以每层每帧的 token 均分为阈值，`head` 以每层每帧每个 KV head 自己的 token 均分为阈值；等于均分归为高分。
 量化、预算、recent 保护和问答检索策略保持原有行为。
