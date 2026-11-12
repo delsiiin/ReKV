@@ -146,12 +146,27 @@ class TrackedDict(dict):
         # A bound callback must not create cache -> table -> cache cycles: reset
         # should release GPU tensors immediately, without waiting for Python GC.
         self._changed = weakref.WeakMethod(changed)
+        self._listeners = []
         self.key_version = 0
+
+    def watch(self, callback):
+        listener = weakref.WeakMethod(callback)
+        self._listeners = [ref for ref in self._listeners if ref() is not None]
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
+    def unwatch(self, callback):
+        listener = weakref.WeakMethod(callback)
+        self._listeners = [ref for ref in self._listeners if ref != listener and ref() is not None]
 
     def _notify(self, key, previous, value):
         changed = self._changed()
         if changed is not None:
             changed(self, key, previous, value)
+        for listener in self._listeners:
+            callback = listener()
+            if callback is not None:
+                callback(self, key, previous, value)
 
     def __setitem__(self, key, value):
         previous = self.get(key, _MISSING)

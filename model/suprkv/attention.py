@@ -7,6 +7,8 @@ from .rotary import rotate_at
 from .packed_attention import PackedRotaryCache, HeadwiseRotaryCache
 from .ragged_cache import RaggedKVCache, supported as ragged_supported
 from .segments import frame_query_mean
+from .encoding_attention import supported as encoding_attention_supported, attend as encoding_attention
+from .encoding_attention import EncodingSegments
 
 
 @dataclass
@@ -59,7 +61,7 @@ class RetrieveLayer:
 
 
 def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=False, **kwargs):
-    Attn, _ = get_multi_stage_dot_production_attention(fattn)
+    Attn, use_fattn = get_multi_stage_dot_production_attention(fattn)
 
     def forward(self, query, key_value, position_bias, use_cache, past_key_value,
                 project_q, project_k, project_v, attention_out, dim_head, num_heads, num_heads_kv):
@@ -87,6 +89,8 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
             attn_type = Attn if dim_head in (16, 32, 64, 128) else get_multi_stage_dot_production_attention(False)[0]
 
             def attend(hq, hk, hv, past):
+                if isinstance(past, EncodingSegments):
+                    past = past.materialize()
                 keys = torch.cat((past.key, hk), -2)
                 values = torch.cat((past.value, hv), -2)
                 attention = attn_type(hq.shape, hq.dtype, hq.device)
@@ -96,9 +100,12 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
             if isinstance(context.past, HeadwiseRotaryCache):
                 if num_heads % num_heads_kv or len(context.past.heads) != num_heads_kv:
                     raise ValueError('Invalid headwise encoding prefix')
-                group = num_heads // num_heads_kv
-                result = torch.cat([attend(q[:, h*group:(h+1)*group], k[:, h:h+1], v[:, h:h+1], past)
-                                    for h, past in enumerate(context.past.heads)], 1)
+                if use_fattn and encoding_attention_supported(q):
+                    result = encoding_attention(q, k, v, context.past.heads)
+                else:
+                    group = num_heads // num_heads_kv
+                    result = torch.cat([attend(q[:, h*group:(h+1)*group], k[:, h:h+1], v[:, h:h+1], past)
+                                        for h, past in enumerate(context.past.heads)], 1)
             elif isinstance(context.past, (RotaryCache, EncodingKV)):
                 result = attend(q, k, v, context.past)
             else:

@@ -781,9 +781,13 @@ class StreamingKVCache:
         if self.persistent_bytes() < self.budget:
             return
         with measure(self.profiler, 'quantization'):
+            from .batch_quantization import supported, lower
+            entries = [x for old in candidates for x in self.frames[old.frame_id].layers]
+            lowered = iter(lower(entries, self.group_size)) if supported(entries, self.group_size) else None
             for old in candidates:
                 frame = self.frames[old.frame_id]
-                layers = tuple(x.shrink(self.group_size) for x in frame.layers)
+                layers = (tuple(next(lowered) for _ in frame.layers) if lowered is not None else
+                          tuple(x.shrink(self.group_size) for x in frame.layers))
                 self.last_event['quantized'] += sum(a is not b for a, b in zip(frame.layers, layers))
                 self.frames[frame.frame_id] = replace(frame, layers=layers)
         if self.persistent_bytes() < self.budget:

@@ -1,11 +1,14 @@
-"""Paired evaluation of an EncodingPrefix optimization using real video frames.
+"""Paired evaluation of encoding prefix/attention changes using real video frames.
 
 Load a saved pre-change encoding.py as the reference; keep the same model,
 attention, compression policy and input frames. Measure three alternating pairs
 by default. Check every frame's decoder output, final cache payload and answers.
 No external answer grading or downloads are performed.
+Alternatively, --compare-headwise-attention toggles only the batched encoding
+dispatch, keeping prefix construction and compression identical.
 """
 import argparse
+from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 import hashlib
 import importlib.util
@@ -23,7 +26,8 @@ from decord import VideoReader, cpu
 
 from observation.engine import ObservationEngine
 from observation.suprkv import borrowed_engine
-from model.suprkv import onevision
+from model.suprkv import onevision, attention
+from model.suprkv.cache import StreamingKVCache
 from model.suprkv.encoding import EncodingPrefix
 from model.suprkv.profiling import StageProfiler
 
@@ -56,20 +60,36 @@ def digest(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-result', required=True)
-    parser.add_argument('--reference-source', required=True)
+    comparison = parser.add_mutually_exclusive_group(required=True)
+    comparison.add_argument('--reference-source')
+    comparison.add_argument('--compare-headwise-attention', action='store_true',
+                            help='Compare per-head encoding attention with the batched variable-length path.')
+    parser.add_argument('--reference-cache-source', help='Also restore the reference budget-enforcement method.')
     parser.add_argument('--output', required=True)
     parser.add_argument('--rounds', type=int, default=3)
     parser.add_argument('--device', default='cuda:0')
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error('--rounds must be positive')
+    if args.reference_cache_source and not args.reference_source:
+        parser.error('--reference-cache-source requires --reference-source')
     torch.set_num_threads(1)
     os.environ['HF_HUB_OFFLINE'] = os.environ['TRANSFORMERS_OFFLINE'] = '1'
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=False)
-    spec = importlib.util.spec_from_file_location('model.suprkv._reference_prefix', args.reference_source)
-    reference_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(reference_module)
+    reference_cls = EncodingPrefix
+    reference_budget = None
+    if args.reference_source:
+        spec = importlib.util.spec_from_file_location('model.suprkv._reference_prefix', args.reference_source)
+        reference_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference_module)
+        reference_cls = reference_module.EncodingPrefix
+    if args.reference_cache_source:
+        spec = importlib.util.spec_from_file_location('model.suprkv._reference_budget', args.reference_cache_source)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        reference_budget = module.StreamingKVCache._enforce_budget
     document = json.loads(Path(args.source_result).read_text())
     experiment = document['compression_experiment']
     config = dict(experiment['config'], device=args.device, compression_enabled=True)
@@ -81,8 +101,13 @@ def main():
     observation = ObservationEngine(config['model_path'], args.device, experiment['method']['dtype'])
     observation.load(lambda *a: None)
     report = dict(source_result=args.source_result, reference_source=args.reference_source,
-        reference_sha256=hashlib.sha256(Path(args.reference_source).read_bytes()).hexdigest(),
+        reference_sha256=hashlib.sha256(Path(args.reference_source).read_bytes()).hexdigest() if args.reference_source else None,
         optimized_sha256=hashlib.sha256(Path(onevision.__file__).with_name('encoding.py').read_bytes()).hexdigest(),
+        comparison='headwise_attention' if args.compare_headwise_attention else 'prefix',
+        reference_cache_source=args.reference_cache_source,
+        reference_cache_sha256=hashlib.sha256(Path(args.reference_cache_source).read_bytes()).hexdigest()
+            if args.reference_cache_source else None,
+        attention_sha256=hashlib.sha256(Path(attention.__file__).read_bytes()).hexdigest(),
         config=config, dtype=experiment['method']['dtype'], frames=len(frames),
         device=torch.cuda.get_device_name(args.device), physical_gpu=os.environ.get('CUDA_VISIBLE_DEVICES'),
         rounds=args.rounds, runs=[], checks={},
@@ -92,7 +117,7 @@ def main():
     save()
     # Warm the model and normal attention path before either measured variant.
     with borrowed_engine(observation.model, observation.processor, config, None, lambda: None) as warm:
-        for frame, image in zip(frames[:8], images[:8]):
+        for frame, image in zip(frames[:9], images[:9]):
             warm.append_frame(image, frame['timestamp'])
     del warm
     reference_hashes = None
@@ -101,8 +126,12 @@ def main():
     for round_index in range(args.rounds):
         order = ('reference', 'optimized') if round_index % 2 == 0 else ('optimized', 'reference')
         for variant in order:
-            cls = reference_module.EncodingPrefix if variant == 'reference' else EncodingPrefix
-            with patch.object(onevision, 'EncodingPrefix', cls), borrowed_engine(
+            cls = reference_cls if variant == 'reference' else EncodingPrefix
+            dispatch = (patch.object(attention, 'encoding_attention_supported', return_value=False)
+                        if args.compare_headwise_attention and variant == 'reference' else nullcontext())
+            budget = (patch.object(StreamingKVCache, '_enforce_budget', reference_budget)
+                      if reference_budget is not None and variant == 'reference' else nullcontext())
+            with dispatch, budget, patch.object(onevision, 'EncodingPrefix', cls), borrowed_engine(
                     observation.model, observation.processor, config, StageProfiler(args.device), lambda: None) as engine:
                 profiler = engine.profiler
                 original_contexts = engine.encoding_prefix.contexts
@@ -119,6 +148,7 @@ def main():
                     return out
                 hashes, timeline = [], []
                 encoding_seconds = 0.
+                torch.cuda.reset_peak_memory_stats(args.device)
                 with patch.object(engine.encoding_prefix, 'contexts', contexts), patch.object(engine.decoder, 'forward', forward):
                     for index, (frame, image) in enumerate(zip(frames, images)):
                         torch.cuda.synchronize(); start = time.perf_counter()
@@ -137,6 +167,7 @@ def main():
                     encoding_seconds += time.perf_counter()-start
                 payload = digest((engine.cache.sink, engine.cache.frames, engine.cache.offloaded_frames))
                 run = dict(round=round_index, variant=variant, encoding_seconds=encoding_seconds,
+                    encoding_peak_allocated_bytes=torch.cuda.max_memory_allocated(args.device),
                     timings=profiler.result(), frame_output_hashes=hashes, final_cache_hash=payload,
                     cache=engine.cache.memory_stats(), encoding_prefix_working_bytes=engine.encoding_prefix.working_bytes,
                     timeline=timeline)

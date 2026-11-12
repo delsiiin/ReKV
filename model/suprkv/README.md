@@ -39,6 +39,9 @@ Qwen2.5-VL 使用 `--model qwen2_5_vl_3b`、`qwen2_5_vl_7b` 或 `qwen2_5_vl_72b`
 
 每层每帧的反量化结果可在后续帧之间复用。分类、降位、删除 token 或整帧卸载会使对应项失效，
 检索命中数变化不会使其失效；reset 释放所有复用项。head 模式允许每个 KV head 具有不同前缀长度。
+前缀通过弱引用订阅帧表变更，将同一帧的多次更新合并为一次失效检查；普通帧不再扫描全部物化项。
+替换帧表时重新绑定并校验，reset 解除订阅。CUDA 下将缺失/失效的帧×层一起反量化，
+通过高低分区有序索引的归并位置恢复原 token 顺序，避免逐 head 的反量化、拼接和排序启动。
 编码保留原始连续视频位置：删除历史 token 后不重编号或再次旋转已存储 K；
 新帧位置为 `sink_tokens + frame_id * frame_tokens`，避免不同 head 的保留长度改变位置。
 编码前缀使用 `EncodingKV(key, value)`，直接读取已完成 RoPE 的历史 K，
@@ -47,6 +50,14 @@ Qwen2.5-VL 使用 `--model qwen2_5_vl_3b`、`qwen2_5_vl_7b` 或 `qwen2_5_vl_72b`
 反量化复用项是额外工作内存，以 `encoding_prefix_working_bytes` 单独报告，不计入压缩载荷预算。
 实际前向还需要拼接前缀及 attention 临时张量，因此 `budget_bytes` 不代表 GPU 峰值显存上限。
 该流程适用于 OneVision、Qwen2.5-VL 和 Video-LLaVA 的共享引擎。
+
+CUDA FP16/BF16 的 head 级编码使用批量变长 attention：前缀仅提供有序帧片段，
+一个 kernel 在使用该层时将各片段和当前帧按实际长度紧凑整理，另一个 kernel 同时处理全部 Q head。
+每个 GQA 分组读取自己的 KV 区间，当前帧使用 `历史长度 + 帧内位置` 作为因果边界，
+不填充到最长 head。Q/K 在进入该路径前已按原始视频位置完成 RoPE，kernel 不重定位。
+该路径复用 ReKV 的 online-softmax 内循环，不新增跨帧常驻缓冲区。
+CPU、FP32、非单样本、非支持 head_dim（16/32/64/128）或关闭 flash attention 时，
+继续使用逐 head 路径。检索/生成的变长缓存有独立的 RoPE 重定位逻辑。
 
 前缀优化的真实视频配对评估使用 `tests/benchmark_suprkv_prefix_optimization.py`。
 修改前保存 `encoding.py`，通过 `--reference-source` 加载；同一个模型交替执行前后版本，
@@ -65,6 +76,58 @@ python tests/benchmark_suprkv_prefix_optimization.py \
 编码总耗时 28.37 → 19.54 秒（减少 31.1%），其中前缀构造 15.37 → 6.61 秒（减少 57.0%）。
 六次运行的逐帧输出和最终缓存逐位一致，首轮前后版本的 9 个问题答案及检索帧一致。
 计时包含同步分阶段 profiler 开销；这是单视频编码评估，不代表完整问答耗时或数据集准确率。
+
+比较 head 级编码的逐 head 与批量路径，可运行：
+
+```bash
+python tests/benchmark_suprkv_prefix_optimization.py --compare-headwise-attention \
+  --source-result results/rvs_observation/1494ceefbb799c5c9da10bd0/result.json \
+  --output /tmp/suprkv-head-batched-evaluation --rounds 3
+python tests/benchmark_suprkv_encoding_attention.py --output /tmp/suprkv-head-batched-attention.json
+```
+
+2026-11-12，同上 RTX PRO 5000 72GB / OneVision 7B BF16 的 150 帧配置，三轮中位数：
+
+| 指标 | 逐 head | 批量变长 |
+| --- | ---: | ---: |
+| 编码总耗时 | 19.56 秒 | 17.73 秒 |
+| LLM 前向（包含 attention 的 K/V 准备） | 7.70 秒 | 5.94 秒 |
+| 编码峰值 allocated 显存（含模型） | 22.71 GiB | 22.76 GiB |
+| 最终前缀工作内存 | 0.80 GiB | 0.80 GiB |
+
+编码总耗时减少 9.3%，LLM 前向减少 22.8%。六次运行的逐帧输出、最终缓存均逐位一致，
+首轮 9 个问题的答案与检索帧一致。显存峰值包含本配对脚本的一致性检查临时分配，
+不与其他脚本或先前轮次的绝对值直接比较。该结果仅覆盖这段视频的编码过程。
+
+独立 attention 微基准（同一 GPU、BF16、28 个 Q head / 4 个 KV head、196 个 query、
+head_dim=128，预热后交替运行 30 次，包含紧凑拼接与同步）：
+四个前缀均为 4096 token 时，0.466 → 0.217 ms（2.15×）；
+前缀分别为 2048/4096/8192/16384 token 时，0.765 → 0.512 ms（1.50×）。
+两组输出与逐 head 路径逐位一致；微基准加速比不能直接作为完整编码加速比。
+
+后续批量量化、失效更新和分片前缀整理的配对评估（相同视频和配置，三轮中位数）：
+
+| 指标 | 上述 head 批量 attention 基线 | 批量缓存处理 |
+| --- | ---: | ---: |
+| 编码总耗时 | 18.17 秒 | 13.73 秒 |
+| 前缀准备 | 6.81 秒 | 2.42 秒 |
+| 量化/降位阶段 | 1.89 秒 | 1.18 秒 |
+| LLM 前向（包含当前层前缀整理） | 5.94 秒 | 6.68 秒 |
+| 编码峰值 allocated 显存（含模型） | 17.05 GiB | 16.44 GiB |
+| 最终前缀工作内存 | 0.80 GiB | 0.80 GiB |
+
+编码总耗时减少 24.4%。前缀整理移入当前层 attention，使 LLM 阶段的计时有所增加，
+同时减少编码前预先拼接全部层前缀的临时显存。六次运行的逐帧输出、最终缓存、
+逐帧受管理字节和压缩触发次数均一致；首轮 9 个问题的答案与检索帧一致。
+结果保存在 `results/diagnostics/suprkv-batch-pipeline-20261112/evaluation/report.json`。
+
+```bash
+python tests/benchmark_suprkv_prefix_optimization.py \
+  --source-result results/rvs_observation/1494ceefbb799c5c9da10bd0/result.json \
+  --reference-source results/diagnostics/suprkv-batch-pipeline-20261112/reference_encoding.py \
+  --reference-cache-source results/diagnostics/suprkv-batch-pipeline-20261112/reference_cache.py \
+  --output /tmp/suprkv-batch-pipeline-evaluation --rounds 3
+```
 
 ## Token 评分策略
 
@@ -299,6 +362,11 @@ q16     = clamp(round((x+offset)/scale16), 0, 65535)
 ```
 
 随后使用 PM-KVQ 原始整数移位公式降位。16→8、8→4、4→2 的 scale 分别乘以 **257、17、5**；offset 不变。反量化为 `x_hat=q*scale-offset`，不保留原精度备份，不重新计算范围。整数编码虽为无符号数值，存储容器为 `torch.int16`，解包时通过掩码恢复无符号值。
+
+预算事件中的 CUDA 量化按设备、输入 dtype 和 group size 批量执行所有候选帧×层的 K/V，
+有限值检查合并为每设备一次回读；已有整数载荷按来源位宽批量降位。继续执行同样的一次降位策略，
+各载荷拥有独立 storage，避免淘汰某帧后仍因其他帧引用而保留整批量化内存。
+批量结果成功后再逐帧发布到缓存账本；CPU、不支持的布局或 group size 使用原路径。
 
 16bit 初始化、scale 截断、整数降位及打包布局与本地 PM-KVQ 对照验证；K 的分组方向改为 KIVI 的 per-channel，并在转置布局上验证逐级编码与反量化。适配 ReKV 时保留 FP32 参数计算/存储，读取时恢复模型 dtype；PM-KVQ 数值对照以其 **FP32 输入量化器**为参考，使用相同输出 dtype 比较反量化结果。没有接入 PM-KVQ 的 SmoothAttention 重参数化或预算分配，也没有改为 KIVI 的直接目标位宽量化或 residual 缓存策略。
 
