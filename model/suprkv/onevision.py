@@ -13,7 +13,8 @@ from model.loading import load_pretrained
 from model.video_backbone import INITIAL_PROMPTS, question_prompt
 from observation.engine import greedy_token_ids
 from observation.segments import selected_vision_features, capture_queries
-from .attention import EncodeLayer, RetrieveLayer, RotaryCache, streaming_attention_forward
+from .attention import RetrieveLayer, streaming_attention_forward
+from .encoding import EncodingPrefix
 from .cache import StreamingKVCache
 from .segments import OnlineSegmenter
 from .profiling import stage, measure
@@ -93,6 +94,7 @@ class OneVisionEngine:
             self.check_cancel()
         self.features, self.frame_info = [], []
         self.cache = None
+        self.encoding_prefix = EncodingPrefix()
         self.timings = dict(summary_seconds=0., score_compress_seconds=0., encode_seconds=0.)
         self.reset()
 
@@ -123,6 +125,7 @@ class OneVisionEngine:
     @torch.inference_mode()
     @stage('cache_init')
     def reset(self):
+        self.encoding_prefix.clear()
         self._set_window('encode')
         # Capture the actual initialization K/V through the same ReKV attention path.
         output = self.decoder(input_ids=self.prefix, use_cache=True, return_dict=True)
@@ -226,17 +229,9 @@ class OneVisionEngine:
                     self.summarizer_error = failure
                     self.summarizer_features = []
                     summary_feature = None
-        contexts = []
-        recent = [self.cache.frames[i] for i in self.cache.recent_ids]
-        for layer, (sink_k, sink_v) in enumerate(self.cache.sink):
-            parts = [frame.layers[layer].materialize() for frame in recent]
-            key = torch.cat([sink_k]+[x[0] for x in parts], 1)[None]
-            value = torch.cat([sink_v]+[x[1] for x in parts], 1)[None]
-            positions = torch.cat([torch.arange(sink_k.shape[1], device=self.device)] +
-                                  [part[2].long()+frame.rope_start for frame, part in zip(recent, parts)])
-            contexts.append(EncodeLayer(RotaryCache(key, value, positions),
-                                        capture_scores=self.compression_enabled,
-                                        capture_frame_query=self.compression_enabled and self.scoring_strategy == 'frame_mean_query'))
+        contexts = self.encoding_prefix.contexts(self.cache,
+            capture_scores=self.compression_enabled,
+            capture_frame_query=self.compression_enabled and self.scoring_strategy == 'frame_mean_query')
         self._set_window('encode')
         self.decoder(inputs_embeds=feature, past_key_values=contexts, use_cache=True, return_dict=True)
         self.cache.append_frame(timestamp, [context.captured for context in contexts],
@@ -255,8 +250,9 @@ class OneVisionEngine:
             self.summarizer_features.append(summary_feature)
         self.frame_info.append(info)
         self.timings['encode_seconds'] += time.monotonic()-began-closed_seconds
-        if (len(self.frame_info) >= self.frame_score_batch_size if self.framewise_scoring else
-                self.segmenter.count >= self.segmenter.max_frames):
+        if (self.cache.persistent_bytes() >= self.cache.budget or
+                (len(self.frame_info) >= self.frame_score_batch_size if self.framewise_scoring else
+                 self.segmenter.count >= self.segmenter.max_frames)):
             self.close_segment()
 
     @torch.inference_mode()
@@ -276,6 +272,7 @@ class OneVisionEngine:
             try:
                 cache_stats = self.cache.close_segment(None, scoring_strategy=self.scoring_strategy)
             finally:
+                self.encoding_prefix.prune(self.cache.frames)
                 self.clear_segment()
             self.timings['score_compress_seconds'] += time.monotonic()-began
             self.last_summary = record
@@ -336,6 +333,7 @@ class OneVisionEngine:
         try:
             cache_stats = self.cache.close_segment(queries, error)
         finally:
+            self.encoding_prefix.prune(self.cache.frames)
             self.clear_segment()
         self.timings['score_compress_seconds'] += time.monotonic()-began
         # Store only the latest record; observation copies each commit into its artifact.
@@ -389,6 +387,7 @@ class OneVisionEngine:
         result['scoring_strategy'] = self.scoring_strategy
         result['scoring_scope'] = 'frame' if self.framewise_scoring else 'segment'
         result['frame_score_batch_size'] = self.frame_score_batch_size
+        result['encoding_prefix_working_bytes'] = self.encoding_prefix.working_bytes
         result['inference_pid'] = os.getpid()
         result['model_instances'] = 1 + (self.summarizer is not None)
         extra_bytes = self.summarizer.parameter_bytes if self.summarizer is not None else 0

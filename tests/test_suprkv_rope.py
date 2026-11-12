@@ -225,7 +225,7 @@ class PostRoPETests(unittest.TestCase):
                     values = torch.cat((values[:, :, :2], values[:, :, -4:]), -2)
 
     @torch.inference_mode()
-    def test_onevision_append_stores_rotated_keys_across_recent_frame_rollover(self):
+    def test_onevision_append_stores_absolute_positions_beyond_recent_frames(self):
         from transformers import Qwen2Config, Qwen2Model
         from model.suprkv.onevision import OneVisionEngine
         from unittest.mock import patch
@@ -250,7 +250,7 @@ class PostRoPETests(unittest.TestCase):
                 lambda module, args, output: observed.append(output.detach().clone()))
             try:
                 with patch('model.suprkv.onevision.selected_vision_features', return_value=torch.zeros(1, 4, 32)):
-                    for i, expected_start in enumerate((2, 198, 392, 392)):
+                    for i, expected_start in enumerate((2, 198, 394, 590)):
                         engine.append_frame(None, float(i))
                         frame = engine.cache.frames[i]
                         raw = observed[-1][0].reshape(196, 2, 8).transpose(0, 1)

@@ -32,6 +32,9 @@ class EncodeLayer:
     capture_scores: bool = True
     capture_frame_query: bool = False
     frame_query: object = None
+    # Absolute position for full-prefix video encoding. None retains the
+    # sliding-window path used by compatibility callers.
+    next_position: int | None = None
 
 
 @dataclass
@@ -55,6 +58,41 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
         v = project_v(key_value).view(batch, -1, num_heads_kv, dim_head).transpose(1, 2).contiguous()
         retrieving = isinstance(past_key_value, RetrieveLayer)
         encoding = isinstance(past_key_value, EncodeLayer)
+        if encoding and past_key_value.next_position is not None:
+            # Every resident token participates, including dequantized history.
+            # Keep original RoPE positions after pruning, even when individual
+            # KV heads retain different numbers of tokens.
+            context = past_key_value
+            if context.capture_scores:
+                context.score_key = k[0].detach().clone()
+            if context.capture_frame_query:
+                context.frame_query = frame_query_mean(q[0])
+            positions = torch.arange(context.next_position, context.next_position + length, device=q.device)
+            q = rotate_at(q, positions, position_bias)
+            k = rotate_at(k, positions, position_bias)
+            context.position_start = context.next_position
+            context.captured = (k[0].detach().clone(), v[0].detach().clone())
+            attn_type = Attn if dim_head in (16, 32, 64, 128) else get_multi_stage_dot_production_attention(False)[0]
+
+            def attend(hq, hk, hv, past):
+                keys = torch.cat((past.key, hk), -2)
+                values = torch.cat((past.value, hv), -2)
+                attention = attn_type(hq.shape, hq.dtype, hq.device)
+                attention.append(hq, keys, values, sliding_window=keys.shape[-2], end=True)
+                return attention.get_result()[0]
+
+            if isinstance(context.past, HeadwiseRotaryCache):
+                if num_heads % num_heads_kv or len(context.past.heads) != num_heads_kv:
+                    raise ValueError('Invalid headwise encoding prefix')
+                group = num_heads // num_heads_kv
+                result = torch.cat([attend(q[:, h*group:(h+1)*group], k[:, h:h+1], v[:, h:h+1], past)
+                                    for h, past in enumerate(context.past.heads)], 1)
+            elif isinstance(context.past, RotaryCache):
+                result = attend(q, k, v, context.past)
+            else:
+                raise ValueError('Full-prefix encoding requires explicit post-RoPE KV')
+            result = result.transpose(1, 2).reshape(batch, length, num_heads*dim_head)
+            return attention_out(result), context
         # Compression produces distinct token sequences per KV head. Each GQA
         # group keeps its own RoPE coordinates and cache length. Batch supported
         # CUDA inference; retain the dense/packed/sliding compatibility paths.

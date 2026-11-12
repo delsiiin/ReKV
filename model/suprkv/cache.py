@@ -503,7 +503,7 @@ class StreamingKVCache:
         recent = set(self.recent_ids)
         self._accounted_recent = recent
         self._accounted_recent_ids = self.recent_ids
-        self._managed = {i: f for i, f in self.frames.items() if f.closed or i in recent}
+        self._managed = dict(self.frames)
         self._open_ids = dict.fromkeys(i for i, f in self.frames.items() if not f.closed)
         self._bits = {str(b): 0 for b in (16, 8, 4, 2, 0)}
         self._frame_counts = {}
@@ -575,7 +575,7 @@ class StreamingKVCache:
             affected.add(changed)
         for key in affected:
             frame = self.frames.get(key)
-            if frame is not None and (frame.closed or key in recent):
+            if frame is not None:
                 self._managed[key] = frame
             else:
                 self._managed.pop(key, None)
@@ -763,7 +763,7 @@ class StreamingKVCache:
         return self.memory_stats() if return_stats else None
 
     def _enforce_budget(self):
-        if self.persistent_bytes() <= self.budget:
+        if self.persistent_bytes() < self.budget:
             return
         self.counts['compressions'] += 1
         recent = set(self.recent_ids)
@@ -778,7 +778,7 @@ class StreamingKVCache:
                 self.frames[frame.frame_id] = replace(frame, layers=tuple(x.drop_low() for x in frame.layers))
                 self.counts['dropped_low_frames'] += 1
                 self.last_event['dropped_low'] += 1
-        if self.persistent_bytes() <= self.budget:
+        if self.persistent_bytes() < self.budget:
             return
         with measure(self.profiler, 'quantization'):
             for old in candidates:
@@ -786,7 +786,7 @@ class StreamingKVCache:
                 layers = tuple(x.shrink(self.group_size) for x in frame.layers)
                 self.last_event['quantized'] += sum(a is not b for a, b in zip(frame.layers, layers))
                 self.frames[frame.frame_id] = replace(frame, layers=layers)
-        if self.persistent_bytes() <= self.budget:
+        if self.persistent_bytes() < self.budget:
             return
         with measure(self.profiler, 'frame_eviction'):
             # LFU, then FIFO: frame_id is assigned monotonically on insertion.
@@ -802,9 +802,9 @@ class StreamingKVCache:
                 else:
                     self.counts['evicted_frames'] += 1
                     self.last_event['evicted'] += 1
-                if self.persistent_bytes() <= self.budget:
+                if self.persistent_bytes() < self.budget:
                     return
-        if self.persistent_bytes() > self.budget:
+        if self.persistent_bytes() >= self.budget:
             raise MemoryError('Budget cannot hold the protected cache')
 
     def acquire_snapshot(self, question_id, cutoff=None):
@@ -892,7 +892,7 @@ class StreamingKVCache:
         stats = self.memory_stats()
         assert self.recent_ids == tuple(sorted(self.frames)[-self.recent_frames:])
         recent = set(self.recent_ids)
-        expected_frames = {i: f for i, f in self.frames.items() if f.closed or i in recent}
+        expected_frames = dict(self.frames)
         assert self._managed.keys() == expected_frames.keys()
         assert all(self._managed[i] is f for i, f in expected_frames.items())
         assert set(self._open_ids) == {i for i, f in self.frames.items() if not f.closed}

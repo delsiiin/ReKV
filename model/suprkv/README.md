@@ -16,6 +16,36 @@ Qwen2.5-VL 使用 `--model qwen2_5_vl_3b`、`qwen2_5_vl_7b` 或 `qwen2_5_vl_72b`
 主模型摘要使用逐帧图像的原生空间 MRoPE。两种评分策略、两种压缩粒度均可使用。
 独立摘要模型仍为 OneVision。完整语义与运行示例见 [主文档](../../README.md#qwen25-vl-with-all-inference-methods)。
 
+## 逐帧编码与字节预算触发
+
+编码使用当前设备驻留缓存的完整前缀，包括初始化提示词和所有保留帧的存活 token。
+第一次达到预算前，逐帧编码并保留完整 KV；每帧编码完成后检查实际缓存字节。
+达到或超过 `budget_bytes` 时立即提交待评分帧并执行压缩，不等待语义段或评分批次满。
+之后用压缩后的缓存作为前缀继续逐帧编码，再次达到预算就再次压缩。
+`recent_frames` 只控制原精度保护及检索配额，不再限制视频编码前缀。
+
+```text
+逐帧编码 → 追加完整帧 KV → 检查字节预算
+                           ├─ 未达到：继续下一帧
+                           └─ 已达到：提交评分 → 删除低分 token → 必要时降位/淘汰
+                                                 ↓
+                                     使用保留 KV 编码下一帧
+```
+
+分段与 `frame_score_batch_size` 仍控制常规评分提交；未达到预算时只评分、划分高低分区，
+不删除 token 或量化。预算压力可以提前结束当前评分段/批次。
+压缩策略保留原来的低分删除、高分降位、整帧淘汰顺序，sink 和 recent 帧仍受保护。
+开启 CPU offload 后，移到 CPU 的帧只参与问答检索，不再作为视频编码前缀。
+
+每层每帧的反量化结果可在后续帧之间复用。分类、降位、删除 token 或整帧卸载会使对应项失效，
+检索命中数变化不会使其失效；reset 释放所有复用项。head 模式允许每个 KV head 具有不同前缀长度。
+编码保留原始连续视频位置：删除历史 token 后不重编号或再次旋转已存储 K；
+新帧位置为 `sink_tokens + frame_id * frame_tokens`，避免不同 head 的保留长度改变位置。
+
+反量化复用项是额外工作内存，以 `encoding_prefix_working_bytes` 单独报告，不计入压缩载荷预算。
+实际前向还需要拼接前缀及 attention 临时张量，因此 `budget_bytes` 不代表 GPU 峰值显存上限。
+该流程适用于 OneVision、Qwen2.5-VL 和 Video-LLaVA 的共享引擎。
+
 ## Token 评分策略
 
 压缩粒度通过 `--compression-granularity {layer,head}`（或 `--compression_granularity`）选择，与评分 Query 来源独立：
@@ -64,7 +94,7 @@ bash run_suprkv.sh --scoring_strategy frame_mean_query --compression-granularity
 
 Python 使用 `StreamingConfig(scoring_strategy='frame_mean_query', compression_granularity='layer',
 scoring_scope='frame', frame_score_batch_size=4)`。批量处理仍逐帧独立评分；N 只控制提交频率，不改变评分公式。视频编码仍逐帧进行。
-N 越大，临时 Q/K 内存与预算检查间隔越大；压缩时机不同也可能影响最终保留的 KV。
+N 越大，常规评分提交间隔越大，临时 Q/K 内存也可能增大；预算仍在每帧后检查，达到预算会提前提交。
 不足 N 帧的尾批通过 `close_segment()` 提交，`StreamingRuntime.ask()` 会在问答快照前自动提交尾批。
 提交事件为 `frame_batch_commit`，`scoring_scope="frame"`；兼容字段 `segment_id` 仅作为批次编号。
 
@@ -215,7 +245,7 @@ if __name__ == '__main__':
 - summary 使用 observation 代码中的提示词，在独立原生上下文生成；重新分词并提取纯文本 prefill 的 RoPE 前 Q。每层按原生 GQA 映射求 summary Q 与暂存的 **RoPE 前 K** 的点积均值，不做 softmax，不跨层平均。默认 `layer` 聚合摘要 token 和全部 heads，以该层帧内均分划分共享高低分区；`head` 只聚合摘要 token 和同组 Q heads，以每个 KV head 自己的帧内均分独立分类。大于或等于均分归为高分，其余归为低分。分区掩码作用于 **RoPE 后 K 和原始 V**，K/V 成对删留；V 不应用 RoPE。summary 为空/计算失败时全帧按高分保留并记录原因。
 - 持久缓存、量化载荷和问题快照中的 K 均为编码时局部 attention 使用的 RoPE 后 K。RoPE 前 K 仅作为分区评分工作内存，段提交成功或评分失败后均释放；不进入快照。未启用压缩的基线也存储 RoPE 后 K，但不保留评分副本。
 - sink 为初始化提示词；最新两帧是 recent，始终使用原始模型精度。未闭合段全精度暂存并可检索。各层的标签在段提交时固定。
-- 每个段提交后若超预算：直接丢弃所有已闭合非保护帧的低分区；若仍超预算，则将这些帧各层的高分区各降一级（16→8→4→2），每次事件最多降一级；仍不足才淘汰 retrieve 频率最低的整帧，频率相同则淘汰更早入库的帧，即按 `(hits, frame_id)` 升序淘汰（LFU，同频时 FIFO）。`hits` 为累计问题检索命中次数，`frame_id` 在入库时单调递增；每淘汰一帧后重新检查预算。
+- 每帧后达到字节预算会立即提交当前段/批次；常规评分提交后也检查预算。达到预算时：直接丢弃所有已闭合非保护帧的低分区；若仍超预算，则将这些帧各层的高分区各降一级（16→8→4→2），每次事件最多降一级；仍不足才淘汰 retrieve 频率最低的整帧，频率相同则淘汰更早入库的帧，即按 `(hits, frame_id)` 升序淘汰（LFU，同频时 FIFO）。`hits` 为累计问题检索命中次数，`frame_id` 在入库时单调递增；每淘汰一帧后重新检查预算。
 - 一个问题在任一层用到某帧，该帧只加一次命中，recent 同样计数；summary 不增加命中。采用单调问题 ID 去重，不积累无限增长的历史 ID 集合。
 - 分组方向参考 KIVI：**K per-channel**，固定 head 和 channel，沿 token 维分组；**V per-token**，固定 head 和 token，沿 channel 维分组。默认 group size=128。首次压缩先生成 16bit 整数编码，再降到 8bit；后续逐次降为 4/2bit。初始化、整数降位和打包仍采用 PM-KVQ 的公式、int16 容器和高位优先顺序。不使用 outlier calibration；sink、recent 始终保留原始模型精度，高分区在预算不足时渐进降位。
 
@@ -259,7 +289,7 @@ q16     = clamp(round((x+offset)/scale16), 0, 65535)
 
 `budget_bytes = budget_tokens × 4 × Σ(layer.kv_heads × layer.head_dim)`，包括 K/V 两份、每个 FP16 元素 2 字节。实际计量覆盖管理器中的持久 K/V、量化参数、填充、位置索引、代表向量与元数据；以唯一 tensor storage 的 `nbytes` 加 Python 对象 `sys.getsizeof` 计量，不把逻辑 token 数当成真实压缩存储。
 
-该指标是**受管理缓存字节**，包含 GPU tensor storage 和少量 CPU Python 元数据，不是进程 RSS 或 CUDA allocator 的全部占用。模型权重、summary/问答临时张量、未闭合段非 recent 部分、被问题固定的旧版本属于工作内存。RoPE 前评分 K 由缓存账本单独计入 `cache_working_bytes`，不计入持久预算，段提交后释放。预算保证发生在段提交处理完毕时；中间帧到来后可暂时超过预算。启动时会保守检查 sink/recent 的最低容量。
+该指标是**受管理缓存字节**，包含 GPU tensor storage 和少量 CPU Python 元数据，不是进程 RSS 或 CUDA allocator 的全部占用。所有设备驻留帧（包括未闭合段、非 recent 帧）的规范 KV 均计入预算。模型权重、summary/问答临时张量、编码反量化复用项、被问题固定的旧版本属于工作内存。RoPE 前评分 K 由缓存账本单独计入 `cache_working_bytes`，不计入持久预算，段提交后释放。每帧编码完成后检查预算，达到阈值立即评分和压缩，使返回时受管理缓存低于预算；当前帧前向及压缩处理过程中仍可暂时超过预算。启动时会保守检查 sink/recent 的最低容量。
 
 预算和报告使用 `accounting.py` 的增量引用计数账本：帧新增、分类、降位、删除以及快照获取/释放时更新变化的对象与存储。Python 对象身份和底层 tensor storage 分别去重；张量 view、跨层共享对象和旧快照均不会重复计费。正常预算查询与 `memory_stats()` 不扫描全部帧或访问全部 tensor storage，开销不随保留帧数增长；新记录的登记成本在帧更新时支付。仅修改命中数或关闭标记时，复用原有层与张量的登记记录。
 
@@ -302,7 +332,8 @@ python tests/benchmark_suprkv_accounting.py \
 | `memory.summarizer_failures / summary_retries / summary_failures` | 本视频小模型失败段数 / 主模型重试次数 / 最终摘要或 Query 失败次数 |
 | `memory.last_summary` | 最近提交的摘要、实际来源、原始错误及重试结果 |
 | `memory.summarizer_vision_seconds` | 小模型视觉编码累计耗时，包含在 encode_seconds 中 |
-| `memory.cache_working_bytes` | 开放段、旧快照等额外缓存占用（当前值） |
+| `memory.cache_working_bytes` | 评分暂存、旧快照等额外缓存占用（当前值） |
+| `memory.encoding_prefix_working_bytes` | 编码前缀复用的物化/反量化张量，不含原 KV 的直接引用及当前前向临时拼接 |
 | `memory.feature_working_bytes` | 待总结段的两套视觉语言特征总占用（默认只有主模型） |
 | `gpu_peak_bytes` | 对应进程 PyTorch 分配显存峰值，包含模型权重 |
 | `process_peak_rss_bytes` | 对应进程 RSS 高水位，包含模型加载 |

@@ -67,11 +67,11 @@ class AccountingTests(unittest.TestCase):
         for i in range(12):
             append(cache, i)
             self.check(cache)
-        self.assertEqual(set(cache._managed), {10, 11})
+        self.assertEqual(set(cache._managed), set(range(12)))
         cache.recent_frames = 4
         self.assertEqual(cache.recent_ids, (8, 9, 10, 11))
         self.check(cache)
-        self.assertEqual(set(cache._managed), {8, 9, 10, 11})
+        self.assertEqual(set(cache._managed), set(range(12)))
         result = cache.close_segment([torch.ones(2, 4, 16)]*2)
         self.assertEqual(result['last_event']['after_bytes'], self.check(cache)['persistent_bytes'])
         self.assertEqual(len(cache._managed), 12)

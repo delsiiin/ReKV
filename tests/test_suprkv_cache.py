@@ -368,7 +368,7 @@ class CacheTests(unittest.TestCase):
     def test_budget_noop_open_frames_and_recent_transition(self):
         cache, queries = make_cache()
         original = dict(cache.frames)
-        cache.budget = cache.persistent_bytes()
+        cache.budget = cache.persistent_bytes()+1
         cache._enforce_budget()
         self.assertTrue(all(cache.frames[i] is frame for i, frame in original.items()))
         for i in range(6, 9):
