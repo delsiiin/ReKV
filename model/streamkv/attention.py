@@ -13,7 +13,6 @@ def streamkv_attention_forward(
     retrieve_local, retrieve_local_size,
     async_global_stream=True,
     pin_memory=False,
-    context_manager_cls=ContextManager,
     *args, **kwargs
 ):
     Attn, _ = get_multi_stage_dot_production_attention(fattn)
@@ -50,7 +49,7 @@ def streamkv_attention_forward(
                 position_bias._sin_cached = position_bias._sin_cached.to(h_q.device)
 
         if past_key_value is None:
-            past_key_value = context_manager_cls(
+            past_key_value = ContextManager(
                 position_bias,
                 n_init, n_local, use_segment_summary,
                 block_size, max_cached_block, retrieve_size, chunk_size, exc_block_size,
@@ -62,8 +61,8 @@ def streamkv_attention_forward(
 
         local_q, local_k, local_v = h_q, h_k, h_v
         global_q, global_k, global_v = h_q, h_k, h_v
-        if type(past_key_value) is not context_manager_cls or past_key_value.to_retrieve:
-            if type(past_key_value) is context_manager_cls:
+        if type(past_key_value) is not ContextManager or past_key_value.to_retrieve:
+            if type(past_key_value) is ContextManager:
                 past_k, past_v = past_key_value.get_retrieved_kv(global_q)
                 update_kv_cache = False
             else:

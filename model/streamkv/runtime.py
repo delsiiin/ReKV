@@ -1,8 +1,4 @@
-"""Source StreamKV algorithm with a Transformers 5 OneVision API bridge.
-
-The default path preserves the reference algorithm. Optional budget mode caps
-the historical video archive with guidance-ranked frame blocks.
-"""
+"""Source StreamKV algorithm with a Transformers 5 OneVision API bridge."""
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -59,8 +55,6 @@ class StreamKVRuntime(StreamKVGeneration, Abstract_StreamKV):
         init_ids = self.tokenizer(INITIAL_PROMPT, return_tensors='pt').input_ids.to(self.device)
         encode_ids = self.tokenizer(GUIDANCE_PROMPT, return_tensors='pt').input_ids.to(self.device)
         c = self.config
-        if c.budget_tokens is not None and c.budget_tokens < n_frame_tokens:
-            raise ValueError(f'budget_tokens must fit one frame block ({n_frame_tokens} tokens)')
         Abstract_StreamKV.__init__(
             self, _ProcessorBridge(processor), n_frame_tokens, init_ids, None, encode_ids,
             c.compression_ratio, c.compress_temp, c.retrieve_temp, c.max_segment_size,
@@ -70,41 +64,19 @@ class StreamKVRuntime(StreamKVGeneration, Abstract_StreamKV):
             n_init=init_ids.shape[1] if n_init is None else n_init,
             n_encode=encode_ids.shape[1] if n_encode is None else n_encode,
             use_segment_summary=str(c.use_segment_summary), n_local=c.n_local,
-            compression_ratio=c.compression_ratio if c.budget_tokens is None else 0.5,
+            compression_ratio=c.compression_ratio,
             retrieve_local=str(c.retrieve_local),
             retrieve_local_size=c.retrieve_local_size, fattn=fattn,
             block_size=n_frame_tokens, retrieve_size=c.retrieve_size,
             chunk_size=c.retrieve_chunk_size, max_cached_block=128,
             exc_block_size=n_frame_tokens, pin_memory=pin_memory,
             async_global_stream=async_global_stream)
-        if c.budget_tokens is not None:
-            from .budget import BudgetContextManager
-            # The reference attention uses ratio < 1 to enable guidance scoring.
-            # The actual retention count is set by the token budget below.
-            self.attention_settings['context_manager_cls'] = BudgetContextManager
         # The reference rebuilds unscaled ESM frequencies from rope_theta. Pass
         # base explicitly so the shared bridge does not copy scaled HF inv_freq.
         patch_hf(self.decoder, attention_factory=streamkv_attention_forward,
                  base=self.decoder.config.rope_parameters['rope_theta'], distance_scale=1.,
                  **self.attention_settings)
         self.kv_cache = None
-
-    @torch.inference_mode()
-    def _encode_video_chunk(self, video_features):
-        if self.config.budget_tokens is None:
-            return super()._encode_video_chunk(video_features)
-        assert self.n_local >= video_features.shape[1], (
-            f'n_local: {self.n_local}, video_features: {video_features.shape[1]}')
-        if self.config.use_segment_summary:
-            batch, _, hidden = video_features.shape
-            summary = video_features.reshape(batch, -1, self.n_frame_tokens, hidden).mean(dim=1)
-            video_features = torch.cat((video_features, summary), dim=1)
-        output = self.language_model(
-            input_ids=self.encode_prompt_ids, inputs_embeds=video_features,
-            past_key_values=self.kv_cache, use_cache=True, return_dict=True)
-        self.kv_cache = output.past_key_values
-        for layer in self.kv_cache:
-            layer.compress_to_budget(self.config.budget_tokens)
 
     @classmethod
     def load(cls, model_path, config=None):

@@ -27,11 +27,7 @@ class StreamKVMethod(Method):
 
     def add_arguments(self, parser):
         for field in fields(StreamKVConfig):
-            arg_type = int if field.name == 'budget_tokens' else field.type
-            kwargs = dict(type=boolean if arg_type is bool else arg_type, default=None)
-            if field.name == 'budget_tokens':
-                kwargs['help'] = ('Historical video KV token budget per layer, including summaries; '
-                                  'overrides compression_ratio and compress_temp. Rounded down to frame blocks.')
+            kwargs = dict(type=boolean if field.type is bool else field.type, default=None)
             if field.name == 'segment_mode':
                 kwargs['choices'] = ('semantic', 'uniform')
             add_option(parser, '--' + field.name, '--' + field.name.replace('_', '-'), **kwargs)
@@ -41,8 +37,6 @@ class StreamKVMethod(Method):
         if model_family(args.model) != 'onevision':
             raise ValueError('streamkv currently supports only llava_ov_0.5b, llava_ov_7b and llava_ov_72b')
         config = self.config(args)
-        if config.budget_tokens is not None and config.budget_tokens < 196:
-            raise ValueError('budget_tokens must fit at least one frame block (196 tokens)')
         if config.retrieve_chunk_size > config.retrieve_size:
             raise ValueError('retrieve_chunk_size must be <= retrieve_size')
 
@@ -65,8 +59,6 @@ class StreamKVMethod(Method):
                    f'_retrieve{c.retrieve_size}-{c.retrieve_temp:g}'
                    f'_recent{int(c.retrieve_local)}-{c.retrieve_local_size}_local{c.n_local}'
                    f'_chunk{c.retrieve_chunk_size}')
-        if c.budget_tokens is not None:
-            setting += f'_budget{c.budget_tokens}'
         return f'results/streamkv/source/{args.model}/{dataset}/{setting}/fps_{args.sample_fps:g}'
 
     def load(self, args):

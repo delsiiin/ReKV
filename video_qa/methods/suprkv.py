@@ -25,9 +25,7 @@ def add_suprkv_arguments(parser):
     parser.add_argument('--summarizer_model_path', '--summarizer-model-path', default=None,
                         help='Independent OneVision summary model ID or directory; default: use the main model.')
     parser.add_argument('--budget_tokens', '--budget-tokens', type=int, default=None,
-                        help='SuPrKV: persistent KV budget in FP16-equivalent tokens (default: 8192). '
-                             'StreamKV: historical video KV tokens per layer, including summaries; '
-                             'overrides compression_ratio and compress_temp (default: disabled).')
+                        help='SuPrKV: persistent KV budget in FP16-equivalent tokens (default: 8192).')
     parser.add_argument('--recent_frames', '--recent-frames', type=int, default=None,
                         help='Number of recent sampled frames kept at original precision, also counted toward the retrieval quota (default: 2).')
     parser.add_argument('--group_size', '--group-size', type=int, default=None,

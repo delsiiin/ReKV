@@ -10,7 +10,7 @@ from transformers import LlavaOnevisionVideoProcessor
 
 from model.streamkv.config import StreamKVConfig
 from video_qa.streamkv_stream_vqa import StreamKVStreamVQA
-from test_streamkv_budget import cpu_cache_execution, tiny_runtime
+from test_streamkv_runtime import cpu_cache_execution, tiny_runtime
 
 
 class StreamKVPrefixReuseTests(unittest.TestCase):
@@ -71,7 +71,7 @@ class StreamKVPrefixReuseTests(unittest.TestCase):
             for failed_call in (1, 2, 3):
                 with self.subTest(failed_call=failed_call):
                     runtime = tiny_runtime(StreamKVConfig(n_local=24, retrieve_size=3,
-                        retrieve_local_size=1, budget_tokens=12, min_segment_size=2, max_segment_size=4))
+                        retrieve_local_size=1, compression_ratio=.6, min_segment_size=2, max_segment_size=4))
                     runtime.model.config.vision_feature_select_strategy = 'full'
                     runtime.model.config.vision_feature_layer = -1
                     runtime.processor._processor.video_processor = LlavaOnevisionVideoProcessor(
@@ -109,11 +109,11 @@ class StreamKVPrefixReuseTests(unittest.TestCase):
         sample = self.sample((4, 8, 8, 8, 2, 2, 8))
         with cpu_cache_execution():
             for mode in ('uniform', 'semantic'):
-                for ratio, budget in ((1., None), (.6, None), (.6, 12)):
+                for ratio in (1., .6):
                     for summary in (False, True):
-                        with self.subTest(mode=mode, ratio=ratio, budget=budget, summary=summary):
+                        with self.subTest(mode=mode, ratio=ratio, summary=summary):
                             config = StreamKVConfig(n_local=24, retrieve_size=3, retrieve_local_size=1,
-                                compression_ratio=ratio, compress_temp=1, budget_tokens=budget,
+                                compression_ratio=ratio, compress_temp=1,
                                 segment_mode=mode, min_segment_size=2, max_segment_size=4,
                                 segment_theta=.99, use_segment_summary=summary)
                             results = []

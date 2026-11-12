@@ -83,9 +83,6 @@ reference_attention = reference_attention_scope['streamkv_attention_forward']
 def normalize_imports(text):
     text = text.replace('from .kv_cache_manager import', 'from .cache import')
     text = text.replace('from .dot_production_attention import', 'from model.rekv.attention.dot_production_attention import')
-    # The optional cache-class injection defaults to the original ContextManager.
-    text = text.replace('    context_manager_cls=ContextManager,\n', '')
-    text = text.replace('context_manager_cls', 'ContextManager')
     return ast.dump(ast.parse(text), include_attributes=False)
 
 
@@ -130,9 +127,7 @@ class SourceParityTests(unittest.TestCase):
                 parser.add_argument(*flags,**kwargs)
         defaults = vars(parser.parse_args([]))
         for name, value in asdict(StreamKVConfig()).items():
-            if name == 'budget_tokens':
-                self.assertIsNone(value)
-            elif name == 'retrieve_chunk_size':
+            if name == 'retrieve_chunk_size':
                 self.assertEqual(value,1)
             else:
                 self.assertEqual(str(value) if isinstance(value,bool) else value, defaults[name])
