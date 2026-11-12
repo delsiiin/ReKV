@@ -123,6 +123,28 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
 
 ## Evaluation
 
+Run multiple methods sequentially with the unified launcher:
+
+```bash
+# Default order: ReKV -> SuPr-KV -> StreamKV -> InfiniPot.
+bash run_methods.sh
+# Select methods and their execution order.
+bash run_methods.sh suprkv rekv
+# Preview commands without loading models.
+bash run_methods.sh --dry-run
+# Apply CLI overrides to every selected method.
+bash run_methods.sh rekv streamkv -- --max_samples 5 --gpus 0
+```
+
+Edit `default_methods` in [run_methods.sh](run_methods.sh) to change the default
+order. Configure each method independently in its `rekv_args`, `suprkv_args`,
+`streamkv_args`, or `infinipot_args` array, including GPU selection, model,
+dataset, sample limit, and method-specific parameters. Arguments after `--`
+override the configured values for all selected methods. Each evaluation
+(including merging and scoring) finishes before the next starts; a failure stops
+the sequence and returns its exit code. The four original `run_<method>.sh`
+scripts remain single-method shortcuts and accept their existing CLI overrides.
+
 ReKV and SuPr-KV share the original ReKV sampling rules in
 `video_qa/sampling.py`: regular videos use a fixed stride of
 `int(round(source_fps) / sample_fps)`, and 1-FPS NPY videos use
@@ -188,7 +210,8 @@ start. GPU UUIDs and MIG identifiers are also accepted. Eval uses local `cuda:0`
 select physical GPUs with the GPU list, not `--device cuda:N`. All model sizes,
 including 72B, must fit on one GPU per worker; there is no automatic model sharding
 or weight offload. Model-specific precision and attention implementations remain
-unchanged. The scripts expose a `gpus` variable and accept CLI overrides.
+unchanged. Set `--gpus` in each method's configuration array in `run_methods.sh`,
+or pass a CLI override.
 
 ## Citation
 
