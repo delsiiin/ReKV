@@ -41,10 +41,30 @@ Qwen2.5-VL 使用 `--model qwen2_5_vl_3b`、`qwen2_5_vl_7b` 或 `qwen2_5_vl_72b`
 检索命中数变化不会使其失效；reset 释放所有复用项。head 模式允许每个 KV head 具有不同前缀长度。
 编码保留原始连续视频位置：删除历史 token 后不重编号或再次旋转已存储 K；
 新帧位置为 `sink_tokens + frame_id * frame_tokens`，避免不同 head 的保留长度改变位置。
+编码前缀使用 `EncodingKV(key, value)`，直接读取已完成 RoPE 的历史 K，
+不再逐帧、逐层、逐 head 构造历史位置张量。检索重定位仍保留源位置元数据。
 
 反量化复用项是额外工作内存，以 `encoding_prefix_working_bytes` 单独报告，不计入压缩载荷预算。
 实际前向还需要拼接前缀及 attention 临时张量，因此 `budget_bytes` 不代表 GPU 峰值显存上限。
 该流程适用于 OneVision、Qwen2.5-VL 和 Video-LLaVA 的共享引擎。
+
+前缀优化的真实视频配对评估使用 `tests/benchmark_suprkv_prefix_optimization.py`。
+修改前保存 `encoding.py`，通过 `--reference-source` 加载；同一个模型交替执行前后版本，
+逐帧比较 decoder 输出、最终缓存载荷，并在首轮比较全部问题的答案和检索帧。
+输入从 observation 结果中记录的原视频及源帧索引恢复，计时排除视频解码、模型加载、问答和一致性校验。
+
+```bash
+python tests/benchmark_suprkv_prefix_optimization.py \
+  --source-result results/rvs_observation/1494ceefbb799c5c9da10bd0/result.json \
+  --reference-source results/diagnostics/suprkv-prefix-optimization-20261112/reference_encoding.py \
+  --output /tmp/suprkv-prefix-evaluation --rounds 3
+```
+
+2026-11-12，RTX PRO 5000 72GB、OneVision 7B BF16、150 帧、8192-token 字节预算、
+`recent_frames=2`、head 分区、`frame_mean_query`、评分批次 8，三轮中位数：
+编码总耗时 28.37 → 19.54 秒（减少 31.1%），其中前缀构造 15.37 → 6.61 秒（减少 57.0%）。
+六次运行的逐帧输出和最终缓存逐位一致，首轮前后版本的 9 个问题答案及检索帧一致。
+计时包含同步分阶段 profiler 开销；这是单视频编码评估，不代表完整问答耗时或数据集准确率。
 
 ## Token 评分策略
 
@@ -266,7 +286,7 @@ K 的分组按高分 token 的原始顺序进行，不跨 head、帧或层拼组
 
 这里的 K 是 RoPE 后 K。每帧记录编码时的旋转起点 `rope_start`，存活 token 的源位置为 `rope_start + 原始帧内索引`。检索拼接、删 token 或滑窗移动后，读取的 K 只施加位置差旋转 `R(目标位置−源位置)`，不对已旋转 K 再施加完整 RoPE。该处理保留 ReKV 的局部重排位置语义；sink 补充 attention 阶段单独变换到原有零位置语义。量化发生在源位置旋转之后，位置差旋转不会重新量化或改写持久缓存。
 
-底层 `StreamingKVCache.append_frame(timestamp, layers, score_keys=..., rope_start=...)` 的 `layers` 接收 RoPE 后 K/V，`score_keys` 接收逐层 RoPE 前 K；缺少评分 K 时分区会明确记录错误并按全高分保留，不会误用 RoPE 后 K 评分。编码使用 `RotaryCache(key, value, positions)`；`head` 模式的逐 head 检索与解码使用 `HeadwiseRotaryCache(heads)`，每个 head 持有独立的长度和位置，各自映射到原生 GQA 的 Q head 组。CPU/普通路径按 head 读取，CUDA packed 路径复用单组融合 kernel；滑窗溢出时每个 head 独立切换到原有 dense 路径。两种路径均不填充到最长 head。
+底层 `StreamingKVCache.append_frame(timestamp, layers, score_keys=..., rope_start=...)` 的 `layers` 接收 RoPE 后 K/V，`score_keys` 接收逐层 RoPE 前 K；缺少评分 K 时分区会明确记录错误并按全高分保留，不会误用 RoPE 后 K 评分。完整前缀编码使用 `EncodingKV(key, value)`，兼容滑窗路径使用 `RotaryCache(key, value, positions)`；`head` 模式的逐 head 检索与解码使用 `HeadwiseRotaryCache(heads)`，每个 head 持有独立的长度和位置，各自映射到原生 GQA 的 Q head 组。CPU/普通路径按 head 读取，CUDA packed 路径复用单组融合 kernel；滑窗溢出时每个 head 独立切换到原有 dense 路径。两种路径均不填充到最长 head。
 
 `retrieve_layer(..., headwise=True)` 返回 `(HeadwiseRotaryCache, frame_ids)`。矩形兼容接口只适用于总长度相同的 heads；源索引不同但长度相同时，位置数组为 `[Hkv, N]`。`LayerFrame.materialize_head(h)` 可读取单个 head；`materialize()` 只允许等长 heads，recent 帧因保留完整高低分区仍可使用此接口。
 

@@ -1,7 +1,7 @@
 """Reusable materializations of the resident, compressed video prefix."""
 import torch
 
-from .attention import EncodeLayer, RotaryCache
+from .attention import EncodeLayer, EncodingKV
 from .packed_attention import HeadwiseRotaryCache
 
 
@@ -53,24 +53,22 @@ class EncodingPrefix:
         contexts = []
         for layer, (sink_k, sink_v) in enumerate(cache.sink):
             materialized = [self._materialize(frame, layer) for frame in frames]
-            sink_positions = torch.arange(sink_k.shape[1], device=sink_k.device)
             headwise = any(frame.layers[layer].high_offsets is not None for frame in frames)
 
             def assemble(head=None):
                 parts = []
                 for frame, row in zip(frames, materialized):
                     if frame.layers[layer].high_offsets is None:
-                        k, v, ids = row[0]
+                        k, v, _ = row[0]
                         if head is not None:
                             k, v = k[head:head+1], v[head:head+1]
                     else:
-                        k, v, ids = row[head]
-                    parts.append((k, v, ids.long() + frame.rope_start))
+                        k, v, _ = row[head]
+                    parts.append((k, v))
                 sk = sink_k if head is None else sink_k[head:head+1]
                 sv = sink_v if head is None else sink_v[head:head+1]
-                return RotaryCache(torch.cat([sk] + [p[0] for p in parts], 1)[None],
-                                   torch.cat([sv] + [p[1] for p in parts], 1)[None],
-                                   torch.cat([sink_positions] + [p[2] for p in parts]))
+                return EncodingKV(torch.cat([sk] + [p[0] for p in parts], 1)[None],
+                                  torch.cat([sv] + [p[1] for p in parts], 1)[None])
 
             past = (HeadwiseRotaryCache(tuple(assemble(h) for h in range(sink_k.shape[0])))
                     if headwise else assemble())

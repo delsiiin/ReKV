@@ -24,8 +24,20 @@ class RotaryCache:
 
 
 @dataclass
+class EncodingKV:
+    """Post-RoPE prefix used only by absolute-position video encoding.
+
+    Cached keys already carry their original rotations. Unlike retrieval and
+    sliding-window caches, this path never rebases them and needs no position
+    tensor for the historical prefix.
+    """
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass
 class EncodeLayer:
-    past: RotaryCache
+    past: RotaryCache | EncodingKV | HeadwiseRotaryCache
     captured: object = None
     score_key: object = None
     position_start: int = 0
@@ -87,7 +99,7 @@ def streaming_attention_forward(n_local, n_init, fattn=True, packed_attention=Fa
                 group = num_heads // num_heads_kv
                 result = torch.cat([attend(q[:, h*group:(h+1)*group], k[:, h:h+1], v[:, h:h+1], past)
                                     for h, past in enumerate(context.past.heads)], 1)
-            elif isinstance(context.past, RotaryCache):
+            elif isinstance(context.past, (RotaryCache, EncodingKV)):
                 result = attend(q, k, v, context.past)
             else:
                 raise ValueError('Full-prefix encoding requires explicit post-RoPE KV')
