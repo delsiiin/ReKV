@@ -12,7 +12,7 @@ rekv_args=(
     --num_chunks 1
     --max_samples 0
     --model llava_ov_7b
-    --dataset rvs_movie
+    --dataset rvs_ego
     --sample_fps 0.5
     --n_local 15000
     --retrieve_size 64
@@ -41,7 +41,7 @@ suprkv_args=(
 streamkv_args=(
     --gpus "${CUDA_VISIBLE_DEVICES:-1}"
     --model llava_ov_7b
-    --dataset rvs_movie
+    --dataset rvs_ego
     --num_chunks 1
     --sample_fps 0.5
     --segment_mode semantic
@@ -62,7 +62,7 @@ streamkv_args=(
 infinipot_args=(
     --gpus "${CUDA_VISIBLE_DEVICES:-1}"
     --model llava_ov_7b
-    --dataset rvs_movie
+    --dataset rvs_ego
     --num_chunks 1
     --sample_fps 2
     --block_size 41
